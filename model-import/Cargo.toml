@@ -21,4 +21,4 @@ prompt-prepare = { path = "../prompt-prepare" }
 # Host-side only, and only for `f32_to_act`: the embedding scale must land on the
 # exact same Q16.16 bits the reference uses, and the conversion has rounding and
 # saturation rules worth not re-deriving. Not linked into any guest.
-raster-inference = { path = "../../casettek/raster-inference" }
+raster-inference = { path = "../../../raster-inference" }

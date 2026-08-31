@@ -21,7 +21,7 @@ edition = "2021"
 default = []
 
 [dependencies]
-fixed = { version = "1.30.0", default-features = false }
+fixed = { version = "=1.30.0", default-features = false }
 
 [dev-dependencies]
 # The upstream this was vendored from, for the equivalence test only.

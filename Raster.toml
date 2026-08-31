@@ -6,7 +6,7 @@ version = "0.1.0"
 name = "prompt_prepare"
 project = "prompt-prepare"
 inputs.tokenizer = { external = { path = "prompt-prepare/tokenizer.rastered", index_path = "prompt-prepare/tokenizer.rindex", commitment = "aa9b15cfd910f92b91638a8af385aef31f5166466d7871652946f32575812718" } }
-inputs.initial_pieces = { external = { path = "prompt-prepare/initial_pieces.rastered", index_path = "prompt-prepare/initial_pieces.rindex", commitment = "7900ddd18ea891084c9c6396e3ea72870d46006967f6e0365f5cab0d8ca4109b" } }
+inputs.initial_pieces = { external = { path = "prompt-prepare/initial_pieces.rastered", index_path = "prompt-prepare/initial_pieces.rindex", commitment = "06d581356d7a32bc4fe8b1be3520de2f42096e580c31bf3c421b61c285c6dbc1" } }
 
 [[chain.stage]]
 name = "input_embedding"
