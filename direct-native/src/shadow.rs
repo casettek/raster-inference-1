@@ -49,12 +49,27 @@ pub struct ChainExecutionTimes {
     pub version: u32,
     pub stages: Vec<StageExecutionTime>,
     pub total_exec_duration_ns: u128,
+    #[serde(default)]
+    pub total_wall_duration_ns: Option<u128>,
+    #[serde(default)]
+    pub aux_waves: Vec<AuxWaveExecutionTime>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct StageExecutionTime {
     pub name: String,
     pub exec_duration_ns: u128,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct AuxWaveExecutionTime {
+    pub name: String,
+    pub first_stage: String,
+    pub last_stage: String,
+    pub stage_count: usize,
+    pub parallelism: usize,
+    pub wall_duration_ns: u128,
+    pub stage_duration_sum_ns: u128,
 }
 
 pub fn run_hidden_stage_compare(stage_dir: &Path) -> Result<ShadowReport> {
@@ -362,7 +377,7 @@ pub fn read_chain_execution_times(chain_dir: &Path) -> Result<ChainExecutionTime
         &fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?,
     )
     .with_context(|| format!("failed to decode {}", path.display()))?;
-    if timings.version != 1 {
+    if !matches!(timings.version, 1 | 2) {
         bail!(
             "unsupported chain execution-times version {} in {}",
             timings.version,
@@ -440,9 +455,30 @@ pub fn render_timing_summary(
     writeln!(
         output,
         "{:<stage_width$}  {:>12}",
-        "total",
+        "stage sum",
         format_duration_ns(timings.total_exec_duration_ns)
     )?;
+    if let Some(wall_duration_ns) = timings.total_wall_duration_ns {
+        writeln!(
+            output,
+            "{:<stage_width$}  {:>12}",
+            "wall time",
+            format_duration_ns(wall_duration_ns)
+        )?;
+    }
+    for wave in &timings.aux_waves {
+        writeln!(
+            output,
+            "aux wave {} ({}..{}): wall={} stage-sum={} parallelism={} effective={}",
+            wave.name,
+            wave.first_stage,
+            wave.last_stage,
+            format_duration_ns(wave.wall_duration_ns),
+            format_duration_ns(wave.stage_duration_sum_ns),
+            wave.parallelism,
+            format_speedup(wave.stage_duration_sum_ns, wave.wall_duration_ns),
+        )?;
+    }
     writeln!(
         output,
         "direct-native shadow overhead: {}",
@@ -456,6 +492,14 @@ fn format_saved(raster_ns: u128, direct_ns: u128) -> String {
         format_duration_ns(raster_ns - direct_ns)
     } else {
         format!("-{}", format_duration_ns(direct_ns - raster_ns))
+    }
+}
+
+fn format_speedup(numerator_ns: u128, denominator_ns: u128) -> String {
+    if denominator_ns == 0 {
+        String::from("—")
+    } else {
+        format!("{:.2}x", numerator_ns as f64 / denominator_ns as f64)
     }
 }
 

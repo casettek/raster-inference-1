@@ -113,7 +113,7 @@ fn prefill_prepare_aux_publishes_one_row() {
                     projection_scalar: ONE,
                     input_scale: ONE,
                     norm_eps: 0,
-                    norm_weights: norm,
+                    norm_weights: norm.clone(),
                 },
                 embeddings: paged(&[ONE, 0]),
                 projection: paged(&[ONE, 0, 0, ONE]),
@@ -124,6 +124,57 @@ fn prefill_prepare_aux_publishes_one_row() {
     assert_eq!(output.layer_idx, 7);
     assert_eq!(output.rows.len(), 1);
     assert!(output.errors.is_empty());
+}
+
+#[test]
+fn prefill_prepare_aux_preserves_prompt_row_order() {
+    let norm = prefill_prepare_aux::input::pack_i32s(&[ONE, ONE]);
+    let row = |token_id, values: &[i32]| prefill_prepare_aux::input::ActivationRow {
+        token_id,
+        values: prefill_prepare_aux::input::pack_i32s(values),
+    };
+    let layer = || PleLayer {
+        params: PleLayerParams {
+            layer_idx: 7,
+            hidden_size: 2,
+            ple_width: 2,
+            embedding_scale: ONE,
+            projection_scalar: ONE,
+            input_scale: ONE,
+            norm_eps: 0,
+            norm_weights: norm.clone(),
+        },
+        embeddings: paged(&[0, 0, ONE, 0, 0, ONE]),
+        projection: paged(&[ONE, 0, 0, ONE]),
+    };
+    let run = |rows| {
+        routines::prefill_prepare_aux::run_direct(&routines::prefill_prepare_aux::Inputs {
+            embedded: prefill_prepare_aux::input::ActivationSequence {
+                rows: List::from(rows),
+                errors: List::new(),
+                kv: List::new(),
+            },
+            layer: layer(),
+        })
+        .unwrap()
+    };
+
+    let output = run(vec![
+        row(2, &[ONE, 0]),
+        row(0, &[0, ONE]),
+        row(1, &[ONE, ONE]),
+    ]);
+    let expected = [
+        run(vec![row(2, &[ONE, 0])]).rows[0].values.clone(),
+        run(vec![row(0, &[0, ONE])]).rows[0].values.clone(),
+        run(vec![row(1, &[ONE, ONE])]).rows[0].values.clone(),
+    ];
+
+    assert_eq!(output.rows.len(), 3);
+    assert!(output.errors.is_empty());
+    assert_eq!(output.rows[0].values, expected[0]);
+    assert_eq!(output.rows[1].values, expected[1]);
+    assert_eq!(output.rows[2].values, expected[2]);
 }
 
 #[test]

@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use raster_core::input::payload_structural_root;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -38,14 +40,14 @@ struct StageSpec {
     inputs: BTreeMap<String, InputBinding>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum InputBinding {
     External(ExternalRef),
     From(String),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 struct ExternalRef {
     path: String,
     #[serde(default)]
@@ -76,17 +78,61 @@ struct DirectStageRun {
     output: Option<CachedStageValue>,
 }
 
+struct ChainRunState {
+    output_commitments: Vec<Option<Vec<u8>>>,
+    execution_times: Vec<Option<Duration>>,
+    aux_waves: Vec<AuxWaveExecutionTime>,
+    output_cache: StageOutputCache,
+    selected_stage_dir: Option<PathBuf>,
+}
+
+struct AuxStageJob {
+    idx: usize,
+    name: String,
+    kind: StageKind,
+    input_json_path: PathBuf,
+    input_manifest_path: PathBuf,
+    stage_dir: PathBuf,
+}
+
+struct AuxStageResult {
+    idx: usize,
+    name: String,
+    duration: Duration,
+    output: StageOutput,
+}
+
+struct AuxStageBatch {
+    results: Vec<AuxStageResult>,
+    wall_duration: Duration,
+    parallelism: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct ExecutionTimesDocument {
     version: u32,
     stages: Vec<StageExecutionTime>,
     total_exec_duration_ns: u128,
+    total_wall_duration_ns: u128,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    aux_waves: Vec<AuxWaveExecutionTime>,
 }
 
 #[derive(Debug, Serialize)]
 struct StageExecutionTime {
     name: String,
     exec_duration_ns: u128,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AuxWaveExecutionTime {
+    name: String,
+    first_stage: String,
+    last_stage: String,
+    stage_count: usize,
+    parallelism: usize,
+    wall_duration_ns: u128,
+    stage_duration_sum_ns: u128,
 }
 
 pub fn run(
@@ -116,95 +162,63 @@ pub fn run(
     }
     println!();
 
-    let mut output_commitments: Vec<Vec<u8>> = Vec::new();
-    let mut stage_index: BTreeMap<String, usize> = BTreeMap::new();
-    let mut execution_times: Vec<(String, Duration)> = Vec::new();
-    let mut output_cache = StageOutputCache::default();
-    let mut selected_stage_dir = None;
+    let chain_started = Instant::now();
+    let stage_index = build_stage_index(&manifest.chain.stage)?;
+    let mut state = ChainRunState {
+        output_commitments: vec![None; manifest.chain.stage.len()],
+        execution_times: vec![None; manifest.chain.stage.len()],
+        aux_waves: Vec::new(),
+        output_cache: StageOutputCache::default(),
+        selected_stage_dir: None,
+    };
 
-    for (idx, stage) in manifest.chain.stage.iter().enumerate() {
-        println!(
-            "▸ stage {}/{}  {}   ({})",
-            idx + 1,
-            manifest.chain.stage.len(),
-            stage.name,
-            stage.project
-        );
+    let mut idx = 0;
+    while idx < manifest.chain.stage.len() {
+        if let Some(aux_range) = aux_wave_range(&manifest.chain.stage, idx) {
+            run_aux_wave(
+                aux_range.clone(),
+                &manifest.chain.stage,
+                &base_dir,
+                &chain_dir,
+                &stage_index,
+                current_exe,
+                direct_backend,
+                raster_stage,
+                &mut state,
+            )?;
+            idx = aux_range.end;
+            continue;
+        }
 
-        let stage_dir = chain_dir.join(&stage.name);
-        fs::create_dir_all(&stage_dir)
-            .with_context(|| format!("failed to create {}", stage_dir.display()))?;
-
-        let (input_json_path, input_manifest_path) = synthesize_inputs(
-            stage,
-            &stage_dir,
+        run_one_stage(
+            idx,
+            &manifest.chain.stage,
             &base_dir,
             &chain_dir,
-            &output_commitments,
             &stage_index,
+            current_exe,
+            direct_backend,
+            raster_stage,
+            &mut state,
         )?;
-
-        let dispatch = dispatch_for_stage(stage, raster_stage)?;
-        let stage_run = match dispatch {
-            StageDispatch::DirectNative => {
-                let kind = StageKind::from_stage_spec(&stage.project, &stage.name)?;
-                println!("    direct-native {} …", kind.routine());
-                let cached_inputs = cached_inputs_for_stage(
-                    stage,
-                    &stage_index,
-                    &output_commitments,
-                    &output_cache,
-                )?;
-                run_direct_native_stage(
-                    direct_backend,
-                    current_exe,
-                    &kind,
-                    &stage.name,
-                    &input_json_path,
-                    &input_manifest_path,
-                    &stage_dir,
-                    &cached_inputs,
-                )?
-            }
-            StageDispatch::RasterReference => {
-                let kind = StageKind::from_stage_spec(&stage.project, &stage.name)?;
-                println!("    raster reference {} …", kind.routine());
-                let duration = run_raster_stage(
-                    stage,
-                    &base_dir,
-                    &input_json_path,
-                    &input_manifest_path,
-                    &stage_dir,
-                )?;
-                println!("    direct-native parity check …");
-                run_compare_stage(current_exe, &stage_dir)?;
-                selected_stage_dir = Some(stage_dir.clone());
-                DirectStageRun {
-                    duration,
-                    output: None,
-                }
-            }
-        };
-
-        execution_times.push((stage.name.clone(), stage_run.duration));
-        let output = collect_output(&stage_dir)?;
-        if let Some(value) = stage_run.output {
-            output_cache.insert(&stage.name, output.structural_commitment.clone(), value);
-        }
-        println!(
-            "    output.bin  payload={}  structural={}",
-            short_hex(&output.payload_commitment),
-            short_hex(&output.structural_commitment)
-        );
-        println!("    (no trace, no commitment - hybrid --no-auth)");
-        println!();
-
-        output_commitments.push(output.structural_commitment);
-        stage_index.insert(stage.name.clone(), idx);
+        idx += 1;
     }
 
-    write_execution_times(&chain_dir, &execution_times)?;
-    if raster_stage.is_some() && selected_stage_dir.is_none() {
+    let chain_wall_duration = chain_started.elapsed();
+    write_execution_times(
+        &chain_dir,
+        &manifest.chain.stage,
+        &state.execution_times,
+        chain_wall_duration,
+        &state.aux_waves,
+    )?;
+    print_direct_timing_summary(
+        &manifest.chain.stage,
+        &state.execution_times,
+        chain_wall_duration,
+        &state.aux_waves,
+    )?;
+    if raster_stage.is_some() && state.selected_stage_dir.is_none() {
         bail!("selected Raster reference stage did not run");
     }
     println!("no chain-commitment written (hybrid --no-auth)");
@@ -214,7 +228,7 @@ pub fn run(
 
     Ok(HybridRun {
         chain_dir,
-        selected_stage_dir,
+        selected_stage_dir: state.selected_stage_dir,
     })
 }
 
@@ -231,6 +245,16 @@ fn validate_supported_stages(stages: &[StageSpec]) -> Result<()> {
         StageKind::from_stage_spec(&stage.project, &stage.name)?;
     }
     Ok(())
+}
+
+fn build_stage_index(stages: &[StageSpec]) -> Result<BTreeMap<String, usize>> {
+    let mut stage_index = BTreeMap::new();
+    for (idx, stage) in stages.iter().enumerate() {
+        if stage_index.insert(stage.name.clone(), idx).is_some() {
+            bail!("chain contains duplicate stage name `{}`", stage.name);
+        }
+    }
+    Ok(stage_index)
 }
 
 fn validate_reference_stage(stages: &[StageSpec], raster_stage: &str) -> Result<()> {
@@ -258,10 +282,392 @@ fn dispatch_for_stage(stage: &StageSpec, raster_stage: Option<&str>) -> Result<S
     }
 }
 
+fn run_one_stage(
+    idx: usize,
+    stages: &[StageSpec],
+    base_dir: &Path,
+    chain_dir: &Path,
+    stage_index: &BTreeMap<String, usize>,
+    current_exe: &Path,
+    direct_backend: DirectStageBackend,
+    raster_stage: Option<&str>,
+    state: &mut ChainRunState,
+) -> Result<()> {
+    let stage = &stages[idx];
+    println!(
+        "▸ stage {}/{}  {}   ({})",
+        idx + 1,
+        stages.len(),
+        stage.name,
+        stage.project
+    );
+
+    let stage_dir = chain_dir.join(&stage.name);
+    fs::create_dir_all(&stage_dir)
+        .with_context(|| format!("failed to create {}", stage_dir.display()))?;
+
+    let (input_json_path, input_manifest_path) = synthesize_inputs(
+        stage,
+        &stage_dir,
+        base_dir,
+        chain_dir,
+        &state.output_commitments,
+        stage_index,
+    )?;
+
+    let stage_run = run_prepared_stage(
+        stage,
+        base_dir,
+        current_exe,
+        direct_backend,
+        raster_stage,
+        &input_json_path,
+        &input_manifest_path,
+        &stage_dir,
+        stage_index,
+        state,
+    )?;
+
+    finish_stage(idx, stage, stage_run, stage_dir, state)
+}
+
+fn run_prepared_stage(
+    stage: &StageSpec,
+    base_dir: &Path,
+    current_exe: &Path,
+    direct_backend: DirectStageBackend,
+    raster_stage: Option<&str>,
+    input_json_path: &Path,
+    input_manifest_path: &Path,
+    stage_dir: &Path,
+    stage_index: &BTreeMap<String, usize>,
+    state: &mut ChainRunState,
+) -> Result<DirectStageRun> {
+    let dispatch = dispatch_for_stage(stage, raster_stage)?;
+    match dispatch {
+        StageDispatch::DirectNative => {
+            let kind = StageKind::from_stage_spec(&stage.project, &stage.name)?;
+            println!("    direct-native {} …", kind.routine());
+            let cached_inputs = cached_inputs_for_stage(
+                stage,
+                stage_index,
+                &state.output_commitments,
+                &state.output_cache,
+            )?;
+            run_direct_native_stage(
+                direct_backend,
+                current_exe,
+                &kind,
+                &stage.name,
+                input_json_path,
+                input_manifest_path,
+                stage_dir,
+                &cached_inputs,
+            )
+        }
+        StageDispatch::RasterReference => {
+            let kind = StageKind::from_stage_spec(&stage.project, &stage.name)?;
+            println!("    raster reference {} …", kind.routine());
+            let duration = run_raster_stage(
+                stage,
+                base_dir,
+                input_json_path,
+                input_manifest_path,
+                stage_dir,
+            )?;
+            println!("    direct-native parity check …");
+            run_compare_stage(current_exe, stage_dir)?;
+            state.selected_stage_dir = Some(stage_dir.to_path_buf());
+            Ok(DirectStageRun {
+                duration,
+                output: None,
+            })
+        }
+    }
+}
+
+fn finish_stage(
+    idx: usize,
+    stage: &StageSpec,
+    stage_run: DirectStageRun,
+    stage_dir: PathBuf,
+    state: &mut ChainRunState,
+) -> Result<()> {
+    state.execution_times[idx] = Some(stage_run.duration);
+    let output = collect_output(&stage_dir)?;
+    if let Some(value) = stage_run.output {
+        output_cache_insert(
+            &mut state.output_cache,
+            &stage.name,
+            &output.structural_commitment,
+            value,
+        );
+    }
+    print_stage_output(&output);
+    state.output_commitments[idx] = Some(output.structural_commitment);
+    Ok(())
+}
+
+fn output_cache_insert(
+    output_cache: &mut StageOutputCache,
+    stage_name: &str,
+    structural_commitment: &[u8],
+    value: CachedStageValue,
+) {
+    output_cache.insert(stage_name, structural_commitment.to_vec(), value);
+}
+
+fn aux_wave_range(stages: &[StageSpec], start: usize) -> Option<Range<usize>> {
+    let stage = stages.get(start)?;
+    if !is_prefill_prepare_aux_stage(stage) {
+        return None;
+    }
+    let end = stages[start..]
+        .iter()
+        .position(|stage| !is_prefill_prepare_aux_stage(stage))
+        .map(|offset| start + offset)
+        .unwrap_or(stages.len());
+    (end - start > 1).then_some(start..end)
+}
+
+fn is_prefill_prepare_aux_stage(stage: &StageSpec) -> bool {
+    matches!(
+        StageKind::from_stage_spec(&stage.project, &stage.name),
+        Ok(StageKind::PrefillPrepareAux { .. })
+    )
+}
+
+fn run_aux_wave(
+    range: Range<usize>,
+    stages: &[StageSpec],
+    base_dir: &Path,
+    chain_dir: &Path,
+    stage_index: &BTreeMap<String, usize>,
+    current_exe: &Path,
+    direct_backend: DirectStageBackend,
+    raster_stage: Option<&str>,
+    state: &mut ChainRunState,
+) -> Result<()> {
+    println!(
+        "▸ stages {}-{}  prefill_prepare_aux wave   ({} stages)",
+        range.start + 1,
+        range.end,
+        range.end - range.start
+    );
+
+    let mut jobs = Vec::new();
+    let mut reference_idx = None;
+    for idx in range.clone() {
+        let stage = &stages[idx];
+        ensure_stage_inputs_ready(stage, &state.output_commitments, stage_index)?;
+        match dispatch_for_stage(stage, raster_stage)? {
+            StageDispatch::RasterReference => {
+                if reference_idx.replace(idx).is_some() {
+                    bail!("aux wave cannot contain more than one Raster reference stage");
+                }
+            }
+            StageDispatch::DirectNative => jobs.push(prepare_aux_stage_job(
+                idx,
+                stages,
+                base_dir,
+                chain_dir,
+                stage_index,
+                state,
+            )?),
+        }
+    }
+
+    if let Some(idx) = reference_idx {
+        run_one_stage(
+            idx,
+            stages,
+            base_dir,
+            chain_dir,
+            stage_index,
+            current_exe,
+            direct_backend,
+            raster_stage,
+            state,
+        )?;
+    }
+
+    let batch = run_aux_stage_jobs(current_exe, jobs)?;
+    let stage_duration_sum = batch
+        .results
+        .iter()
+        .map(|result| result.duration.as_nanos())
+        .sum();
+    if let (Some(first), Some(last)) = (batch.results.first(), batch.results.last()) {
+        state.aux_waves.push(AuxWaveExecutionTime {
+            name: String::from("prefill_prepare_aux"),
+            first_stage: first.name.clone(),
+            last_stage: last.name.clone(),
+            stage_count: batch.results.len(),
+            parallelism: batch.parallelism,
+            wall_duration_ns: batch.wall_duration.as_nanos(),
+            stage_duration_sum_ns: stage_duration_sum,
+        });
+    }
+    for result in batch.results {
+        println!("  completed {}", result.name);
+        state.execution_times[result.idx] = Some(result.duration);
+        print_stage_output(&result.output);
+        state.output_commitments[result.idx] = Some(result.output.structural_commitment);
+    }
+
+    for idx in range {
+        if state.output_commitments[idx].is_none() {
+            bail!(
+                "aux wave did not produce output for stage `{}`",
+                stages[idx].name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn prepare_aux_stage_job(
+    idx: usize,
+    stages: &[StageSpec],
+    base_dir: &Path,
+    chain_dir: &Path,
+    stage_index: &BTreeMap<String, usize>,
+    state: &ChainRunState,
+) -> Result<AuxStageJob> {
+    let stage = &stages[idx];
+    println!(
+        "  queued stage {}/{}  {}   ({})",
+        idx + 1,
+        stages.len(),
+        stage.name,
+        stage.project
+    );
+    let stage_dir = chain_dir.join(&stage.name);
+    fs::create_dir_all(&stage_dir)
+        .with_context(|| format!("failed to create {}", stage_dir.display()))?;
+    let (input_json_path, input_manifest_path) = synthesize_inputs(
+        stage,
+        &stage_dir,
+        base_dir,
+        chain_dir,
+        &state.output_commitments,
+        stage_index,
+    )?;
+    Ok(AuxStageJob {
+        idx,
+        name: stage.name.clone(),
+        kind: StageKind::from_stage_spec(&stage.project, &stage.name)?,
+        input_json_path,
+        input_manifest_path,
+        stage_dir,
+    })
+}
+
+fn run_aux_stage_jobs(current_exe: &Path, jobs: Vec<AuxStageJob>) -> Result<AuxStageBatch> {
+    if jobs.is_empty() {
+        return Ok(AuxStageBatch {
+            results: Vec::new(),
+            wall_duration: Duration::default(),
+            parallelism: 0,
+        });
+    }
+    let parallelism = aux_parallelism(jobs.len());
+    println!(
+        "  aux wave: running {} direct-native stages with up to {} subprocesses",
+        jobs.len(),
+        parallelism
+    );
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(parallelism)
+        .build()
+        .context("failed to build aux stage worker pool")?;
+    let started = Instant::now();
+    let mut results = pool.install(|| {
+        jobs.into_par_iter()
+            .map(|job| run_aux_stage_job(current_exe, job))
+            .collect::<Result<Vec<_>>>()
+    })?;
+    let wall_duration = started.elapsed();
+    results.sort_by_key(|result| result.idx);
+    Ok(AuxStageBatch {
+        results,
+        wall_duration,
+        parallelism,
+    })
+}
+
+fn run_aux_stage_job(current_exe: &Path, job: AuxStageJob) -> Result<AuxStageResult> {
+    let stage_run = run_direct_native_stage_subprocess(
+        current_exe,
+        &job.kind,
+        &job.input_json_path,
+        &job.input_manifest_path,
+        &job.stage_dir,
+    )
+    .with_context(|| format!("failed to run parallel aux stage `{}`", job.name))?;
+    let output = collect_output(&job.stage_dir)
+        .with_context(|| format!("failed to collect parallel aux stage `{}`", job.name))?;
+    Ok(AuxStageResult {
+        idx: job.idx,
+        name: job.name,
+        duration: stage_run.duration,
+        output,
+    })
+}
+
+fn ensure_stage_inputs_ready(
+    stage: &StageSpec,
+    outputs: &[Option<Vec<u8>>],
+    stage_index: &BTreeMap<String, usize>,
+) -> Result<()> {
+    for (param, binding) in &stage.inputs {
+        let InputBinding::From(producer) = binding else {
+            continue;
+        };
+        let producer_idx = *stage_index.get(producer).ok_or_else(|| {
+            anyhow::anyhow!(
+                "stage '{}': parameter '{param}' is fed from unknown stage '{producer}'",
+                stage.name
+            )
+        })?;
+        if outputs.get(producer_idx).and_then(Option::as_ref).is_none() {
+            bail!(
+                "stage '{}': parameter '{param}' is fed from '{producer}', which has not run",
+                stage.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn aux_parallelism(job_count: usize) -> usize {
+    let requested = std::env::var("DIRECT_NATIVE_AUX_PARALLELISM")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4);
+    aux_parallelism_from(job_count, requested, available)
+}
+
+fn aux_parallelism_from(
+    job_count: usize,
+    requested: Option<usize>,
+    available_parallelism: usize,
+) -> usize {
+    if job_count == 0 {
+        return 0;
+    }
+    requested
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| available_parallelism.clamp(1, 4))
+        .clamp(1, job_count)
+}
+
 fn cached_inputs_for_stage(
     stage: &StageSpec,
     stage_index: &BTreeMap<String, usize>,
-    outputs: &[Vec<u8>],
+    outputs: &[Option<Vec<u8>>],
     output_cache: &StageOutputCache,
 ) -> Result<CachedInputs> {
     let mut cached_inputs = CachedInputs::new();
@@ -272,7 +678,7 @@ fn cached_inputs_for_stage(
         let Some(producer_idx) = stage_index.get(producer).copied() else {
             continue;
         };
-        let Some(expected_commitment) = outputs.get(producer_idx) else {
+        let Some(expected_commitment) = outputs.get(producer_idx).and_then(Option::as_ref) else {
             continue;
         };
         if let Some(value) = output_cache.get(producer, expected_commitment)? {
@@ -287,7 +693,7 @@ fn synthesize_inputs(
     stage_dir: &Path,
     base_dir: &Path,
     chain_dir: &Path,
-    outputs: &[Vec<u8>],
+    outputs: &[Option<Vec<u8>>],
     stage_index: &BTreeMap<String, usize>,
 ) -> Result<(PathBuf, PathBuf)> {
     let mut input_entries: Vec<(String, serde_json::Value)> = Vec::new();
@@ -311,9 +717,9 @@ fn synthesize_inputs(
                         stage.name
                     )
                 })?;
-                let structural = outputs.get(producer_idx).ok_or_else(|| {
+                let structural = outputs.get(producer_idx).and_then(Option::as_ref).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "stage '{}': parameter '{param}' refers to missing output for stage '{producer}'",
+                        "stage '{}': parameter '{param}' is fed from stage '{producer}', which has not run",
                         stage.name
                     )
                 })?;
@@ -583,28 +989,95 @@ fn read_output_manifest_commitment(stage_dir: &Path) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{} has no output.commitment", path.display()))
 }
 
-fn write_execution_times(chain_dir: &Path, execution_times: &[(String, Duration)]) -> Result<()> {
+fn write_execution_times(
+    chain_dir: &Path,
+    stages: &[StageSpec],
+    execution_times: &[Option<Duration>],
+    total_wall_duration: Duration,
+    aux_waves: &[AuxWaveExecutionTime],
+) -> Result<()> {
     let path = chain_dir.join(EXECUTION_TIMES_JSON);
-    let total_exec_duration_ns = execution_times
-        .iter()
-        .map(|(_, duration)| duration.as_nanos())
-        .sum();
+    if execution_times.len() != stages.len() {
+        bail!(
+            "execution timing slot count {} does not match stage count {}",
+            execution_times.len(),
+            stages.len()
+        );
+    }
+    let mut total_exec_duration_ns = 0;
+    let mut timing_stages = Vec::with_capacity(stages.len());
+    for (idx, (stage, duration)) in stages.iter().zip(execution_times).enumerate() {
+        let duration = (*duration).ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing execution timing for stage {} `{}`",
+                idx + 1,
+                stage.name
+            )
+        })?;
+        total_exec_duration_ns += duration.as_nanos();
+        timing_stages.push(StageExecutionTime {
+            name: stage.name.clone(),
+            exec_duration_ns: duration.as_nanos(),
+        });
+    }
     let document = ExecutionTimesDocument {
-        version: 1,
-        stages: execution_times
-            .iter()
-            .map(|(name, duration)| StageExecutionTime {
-                name: name.clone(),
-                exec_duration_ns: duration.as_nanos(),
-            })
-            .collect(),
+        version: 2,
+        stages: timing_stages,
         total_exec_duration_ns,
+        total_wall_duration_ns: total_wall_duration.as_nanos(),
+        aux_waves: aux_waves.to_vec(),
     };
     fs::write(
         &path,
         serde_json::to_vec_pretty(&document).context("failed to encode execution-times.json")?,
     )
     .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn print_direct_timing_summary(
+    stages: &[StageSpec],
+    execution_times: &[Option<Duration>],
+    total_wall_duration: Duration,
+    aux_waves: &[AuxWaveExecutionTime],
+) -> Result<()> {
+    let stage_duration_sum = execution_times
+        .iter()
+        .enumerate()
+        .map(|(idx, duration)| {
+            duration.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing execution timing for stage {} `{}`",
+                    idx + 1,
+                    stages[idx].name
+                )
+            })
+        })
+        .try_fold(Duration::default(), |sum, duration| {
+            duration.map(|duration| sum + duration)
+        })?;
+
+    println!("direct-native timing:");
+    println!(
+        "  elapsed wall time: {}",
+        format_duration(total_wall_duration)
+    );
+    println!(
+        "  stage duration sum: {}",
+        format_duration(stage_duration_sum)
+    );
+    for wave in aux_waves {
+        println!(
+            "  aux wave {} ({}..{}): wall={} stage-sum={} parallelism={} effective={}",
+            wave.name,
+            wave.first_stage,
+            wave.last_stage,
+            format_duration_ns(wave.wall_duration_ns),
+            format_duration_ns(wave.stage_duration_sum_ns),
+            wave.parallelism,
+            format_speedup(wave.stage_duration_sum_ns, wave.wall_duration_ns)
+        );
+    }
+    Ok(())
 }
 
 fn create_chain_dir(base_dir: &Path) -> Result<PathBuf> {
@@ -710,8 +1183,21 @@ fn short_hex(bytes: &[u8]) -> String {
     full.chars().take(12).collect::<String>() + "..."
 }
 
+fn print_stage_output(output: &StageOutput) {
+    println!(
+        "    output.bin  payload={}  structural={}",
+        short_hex(&output.payload_commitment),
+        short_hex(&output.structural_commitment)
+    );
+    println!("    (no trace, no commitment - hybrid --no-auth)");
+    println!();
+}
+
 fn format_duration(duration: Duration) -> String {
-    let ns = duration.as_nanos();
+    format_duration_ns(duration.as_nanos())
+}
+
+fn format_duration_ns(ns: u128) -> String {
     if ns < 1_000 {
         format!("{ns}ns")
     } else if ns < 1_000_000 {
@@ -723,9 +1209,28 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+fn format_speedup(numerator_ns: u128, denominator_ns: u128) -> String {
+    if denominator_ns == 0 {
+        String::from("—")
+    } else {
+        format!("{:.2}x", numerator_ns as f64 / denominator_ns as f64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_base_dir() -> PathBuf {
+        let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "direct-native-hybrid-test-{}-{id}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn real_manifest_dispatches_one_reference_and_remaining_stages_native() {
@@ -773,8 +1278,7 @@ mod tests {
 
     #[test]
     fn synthesized_inputs_cover_external_and_chained_bindings() {
-        let base =
-            std::env::temp_dir().join(format!("direct-native-hybrid-test-{}", std::process::id()));
+        let base = test_base_dir();
         let chain_dir = base.join("run");
         let producer_dir = chain_dir.join("producer");
         let stage_dir = chain_dir.join("consumer");
@@ -797,7 +1301,7 @@ mod tests {
             ]),
         };
         let stage_index = BTreeMap::from([("producer".into(), 0usize)]);
-        let outputs = vec![vec![0xde, 0xad, 0xbe, 0xef]];
+        let outputs = vec![Some(vec![0xde, 0xad, 0xbe, 0xef])];
 
         let (input_json, input_manifest) = synthesize_inputs(
             &stage,
@@ -849,7 +1353,7 @@ mod tests {
             inputs: BTreeMap::from([("prompt".into(), InputBinding::From("producer".into()))]),
         };
         let stage_index = BTreeMap::from([("producer".into(), 0usize)]);
-        let outputs = vec![vec![0xaa, 0xbb]];
+        let outputs = vec![Some(vec![0xaa, 0xbb])];
         let mut output_cache = StageOutputCache::default();
         output_cache.insert(
             "producer",
@@ -863,5 +1367,120 @@ mod tests {
             cached_inputs_for_stage(&stage, &stage_index, &outputs, &output_cache).unwrap();
 
         assert!(inputs.contains_key("prompt"));
+    }
+
+    #[test]
+    fn real_manifest_identifies_prefill_prepare_aux_wave() {
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Raster.toml");
+        let manifest = read_manifest(&manifest_path).unwrap();
+
+        let range = aux_wave_range(&manifest.chain.stage, 2).unwrap();
+
+        assert_eq!(range, 2..37);
+        assert!(aux_wave_range(&manifest.chain.stage, 0).is_none());
+        assert!(aux_wave_range(&manifest.chain.stage, 37).is_none());
+        for stage in &manifest.chain.stage[range] {
+            assert!(is_prefill_prepare_aux_stage(stage));
+            assert_eq!(
+                stage.inputs.get("embedded"),
+                Some(&InputBinding::From(String::from("input_embedding")))
+            );
+        }
+    }
+
+    #[test]
+    fn raster_reference_inside_aux_wave_dispatches_once() {
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Raster.toml");
+        let manifest = read_manifest(&manifest_path).unwrap();
+        let range = aux_wave_range(&manifest.chain.stage, 2).unwrap();
+        let mut direct = 0usize;
+        let mut reference = Vec::new();
+
+        for stage in &manifest.chain.stage[range] {
+            match dispatch_for_stage(stage, Some("prefill_prepare_aux_l5")).unwrap() {
+                StageDispatch::DirectNative => direct += 1,
+                StageDispatch::RasterReference => reference.push(stage.name.as_str()),
+            }
+        }
+
+        assert_eq!(direct, 34);
+        assert_eq!(reference, ["prefill_prepare_aux_l5"]);
+    }
+
+    #[test]
+    fn synthesized_inputs_require_manifest_indexed_producer_output() {
+        let base = test_base_dir();
+        let chain_dir = base.join("run");
+        let stage_dir = chain_dir.join("consumer");
+        fs::create_dir_all(&stage_dir).unwrap();
+
+        let stage = StageSpec {
+            name: "consumer".into(),
+            project: "input-embedding".into(),
+            inputs: BTreeMap::from([("prompt".into(), InputBinding::From("producer".into()))]),
+        };
+        let stage_index = BTreeMap::from([("producer".into(), 3usize)]);
+        let outputs = vec![None, None, None, Some(vec![0xaa, 0xbb])];
+
+        let (_input_json, input_manifest) = synthesize_inputs(
+            &stage,
+            &stage_dir,
+            &base,
+            &chain_dir,
+            &outputs,
+            &stage_index,
+        )
+        .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(input_manifest).unwrap()).unwrap();
+
+        assert_eq!(manifest["prompt"]["commitment"], "aabb");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn synthesized_inputs_reject_missing_producer_output() {
+        let base = test_base_dir();
+        let chain_dir = base.join("run");
+        let stage_dir = chain_dir.join("consumer");
+        fs::create_dir_all(&stage_dir).unwrap();
+
+        let stage = StageSpec {
+            name: "consumer".into(),
+            project: "input-embedding".into(),
+            inputs: BTreeMap::from([("prompt".into(), InputBinding::From("producer".into()))]),
+        };
+        let stage_index = BTreeMap::from([("producer".into(), 0usize)]);
+        let outputs = vec![None];
+
+        let error = synthesize_inputs(
+            &stage,
+            &stage_dir,
+            &base,
+            &chain_dir,
+            &outputs,
+            &stage_index,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("has not run"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn aux_parallelism_is_bounded_and_overridable() {
+        assert_eq!(aux_parallelism_from(0, None, 8), 0);
+        assert_eq!(aux_parallelism_from(35, None, 16), 4);
+        assert_eq!(aux_parallelism_from(2, None, 16), 2);
+        assert_eq!(aux_parallelism_from(35, Some(6), 16), 6);
+        assert_eq!(aux_parallelism_from(35, Some(0), 16), 4);
     }
 }
