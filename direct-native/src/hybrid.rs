@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,7 +10,8 @@ use raster_core::input::payload_structural_root;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::routines::StageKind;
+use crate::cache::{CachedInputs, CachedStageValue, StageOutputCache};
+use crate::routines::{self, StageKind};
 use crate::shadow::{parity_dir, EXECUTION_TIMES_JSON};
 
 #[derive(Debug)]
@@ -57,10 +59,21 @@ enum StageDispatch {
     RasterReference,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectStageBackend {
+    InProcess,
+    Subprocess,
+}
+
 #[derive(Debug)]
 struct StageOutput {
     payload_commitment: Vec<u8>,
     structural_commitment: Vec<u8>,
+}
+
+struct DirectStageRun {
+    duration: Duration,
+    output: Option<CachedStageValue>,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,7 +89,11 @@ struct StageExecutionTime {
     exec_duration_ns: u128,
 }
 
-pub fn run(raster_stage: Option<&str>, current_exe: &Path) -> Result<HybridRun> {
+pub fn run(
+    raster_stage: Option<&str>,
+    current_exe: &Path,
+    direct_backend: DirectStageBackend,
+) -> Result<HybridRun> {
     let base_dir = std::env::current_dir().context("failed to read current directory")?;
     let manifest = read_manifest(&base_dir.join("Raster.toml"))?;
     validate_supported_stages(&manifest.chain.stage)?;
@@ -102,6 +119,7 @@ pub fn run(raster_stage: Option<&str>, current_exe: &Path) -> Result<HybridRun> 
     let mut output_commitments: Vec<Vec<u8>> = Vec::new();
     let mut stage_index: BTreeMap<String, usize> = BTreeMap::new();
     let mut execution_times: Vec<(String, Duration)> = Vec::new();
+    let mut output_cache = StageOutputCache::default();
     let mut selected_stage_dir = None;
 
     for (idx, stage) in manifest.chain.stage.iter().enumerate() {
@@ -127,16 +145,25 @@ pub fn run(raster_stage: Option<&str>, current_exe: &Path) -> Result<HybridRun> 
         )?;
 
         let dispatch = dispatch_for_stage(stage, raster_stage)?;
-        let duration = match dispatch {
+        let stage_run = match dispatch {
             StageDispatch::DirectNative => {
                 let kind = StageKind::from_stage_spec(&stage.project, &stage.name)?;
                 println!("    direct-native {} …", kind.routine());
+                let cached_inputs = cached_inputs_for_stage(
+                    stage,
+                    &stage_index,
+                    &output_commitments,
+                    &output_cache,
+                )?;
                 run_direct_native_stage(
+                    direct_backend,
                     current_exe,
                     &kind,
+                    &stage.name,
                     &input_json_path,
                     &input_manifest_path,
                     &stage_dir,
+                    &cached_inputs,
                 )?
             }
             StageDispatch::RasterReference => {
@@ -152,12 +179,18 @@ pub fn run(raster_stage: Option<&str>, current_exe: &Path) -> Result<HybridRun> 
                 println!("    direct-native parity check …");
                 run_compare_stage(current_exe, &stage_dir)?;
                 selected_stage_dir = Some(stage_dir.clone());
-                duration
+                DirectStageRun {
+                    duration,
+                    output: None,
+                }
             }
         };
 
-        execution_times.push((stage.name.clone(), duration));
+        execution_times.push((stage.name.clone(), stage_run.duration));
         let output = collect_output(&stage_dir)?;
+        if let Some(value) = stage_run.output {
+            output_cache.insert(&stage.name, output.structural_commitment.clone(), value);
+        }
         println!(
             "    output.bin  payload={}  structural={}",
             short_hex(&output.payload_commitment),
@@ -225,6 +258,30 @@ fn dispatch_for_stage(stage: &StageSpec, raster_stage: Option<&str>) -> Result<S
     }
 }
 
+fn cached_inputs_for_stage(
+    stage: &StageSpec,
+    stage_index: &BTreeMap<String, usize>,
+    outputs: &[Vec<u8>],
+    output_cache: &StageOutputCache,
+) -> Result<CachedInputs> {
+    let mut cached_inputs = CachedInputs::new();
+    for (param, binding) in &stage.inputs {
+        let InputBinding::From(producer) = binding else {
+            continue;
+        };
+        let Some(producer_idx) = stage_index.get(producer).copied() else {
+            continue;
+        };
+        let Some(expected_commitment) = outputs.get(producer_idx) else {
+            continue;
+        };
+        if let Some(value) = output_cache.get(producer, expected_commitment)? {
+            cached_inputs.insert(param.clone(), value);
+        }
+    }
+    Ok(cached_inputs)
+}
+
 fn synthesize_inputs(
     stage: &StageSpec,
     stage_dir: &Path,
@@ -280,7 +337,7 @@ fn synthesize_inputs(
             serde_json::json!({
                 "path": path.to_string_lossy(),
                 "index_path": index_path.to_string_lossy(),
-                "load_preference": "read",
+                "load_preference": load_preference_for_binding(binding),
             }),
         ));
         manifest_entries.push((
@@ -309,6 +366,13 @@ fn synthesize_inputs(
     .with_context(|| format!("failed to write {}", input_manifest_path.display()))?;
 
     Ok((input_json_path, input_manifest_path))
+}
+
+fn load_preference_for_binding(binding: &InputBinding) -> &'static str {
+    match binding {
+        InputBinding::External(_) => "mmap",
+        InputBinding::From(_) => "read",
+    }
 }
 
 fn run_raster_stage(
@@ -344,12 +408,41 @@ fn run_raster_stage(
 }
 
 fn run_direct_native_stage(
+    backend: DirectStageBackend,
+    current_exe: &Path,
+    kind: &StageKind,
+    stage_name: &str,
+    input_json_path: &Path,
+    input_manifest_path: &Path,
+    stage_dir: &Path,
+    cached_inputs: &CachedInputs,
+) -> Result<DirectStageRun> {
+    match backend {
+        DirectStageBackend::InProcess => run_direct_native_stage_in_process(
+            kind,
+            stage_name,
+            input_json_path,
+            input_manifest_path,
+            stage_dir,
+            cached_inputs,
+        ),
+        DirectStageBackend::Subprocess => run_direct_native_stage_subprocess(
+            current_exe,
+            kind,
+            input_json_path,
+            input_manifest_path,
+            stage_dir,
+        ),
+    }
+}
+
+fn run_direct_native_stage_subprocess(
     current_exe: &Path,
     kind: &StageKind,
     input_json_path: &Path,
     input_manifest_path: &Path,
     stage_dir: &Path,
-) -> Result<Duration> {
+) -> Result<DirectStageRun> {
     let mut command = Command::new(current_exe);
     command
         .arg("--run-stage")
@@ -362,7 +455,39 @@ fn run_direct_native_stage(
         .stderr(Stdio::inherit());
     apply_stage_env(&mut command, stage_dir);
 
-    run_timed_command(command, &format!("direct-native {} stage", kind.routine()))
+    Ok(DirectStageRun {
+        duration: run_timed_command(command, &format!("direct-native {} stage", kind.routine()))?,
+        output: None,
+    })
+}
+
+fn run_direct_native_stage_in_process(
+    kind: &StageKind,
+    stage_name: &str,
+    input_json_path: &Path,
+    input_manifest_path: &Path,
+    stage_dir: &Path,
+    cached_inputs: &CachedInputs,
+) -> Result<DirectStageRun> {
+    let _env = StageEnvGuard::apply(stage_dir);
+    let started = Instant::now();
+    let direct = routines::run_and_publish_from_paths(
+        kind,
+        input_json_path,
+        input_manifest_path,
+        cached_inputs,
+    )?;
+    let duration = started.elapsed();
+    println!(
+        "direct-native {stage_name}: output {} structural={} stage={}",
+        direct.artifact.data_path.display(),
+        direct.artifact.commitment,
+        format_duration(duration),
+    );
+    Ok(DirectStageRun {
+        duration,
+        output: Some(direct.output),
+    })
 }
 
 fn run_compare_stage(current_exe: &Path, stage_dir: &Path) -> Result<()> {
@@ -530,9 +655,72 @@ fn apply_stage_env(command: &mut Command, stage_dir: &Path) {
         .env_remove(raster_runtime::PROFILE_RUN_ID_ENV);
 }
 
+struct StageEnvGuard {
+    saved: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl StageEnvGuard {
+    fn apply(stage_dir: &Path) -> Self {
+        let guard = Self::capture(&[
+            raster_runtime::auth::AUTH_ENV,
+            raster_runtime::OUTPUT_DIR_ENV,
+            raster_runtime::TRACE_PATH_ENV,
+            raster_runtime::TRACE_FORMAT_ENV,
+            raster_runtime::PROFILE_PATH_ENV,
+            raster_runtime::PROFILE_STREAM_PATH_ENV,
+            raster_runtime::PROFILE_RUN_ID_ENV,
+        ]);
+        std::env::set_var(raster_runtime::auth::AUTH_ENV, "0");
+        std::env::set_var(raster_runtime::OUTPUT_DIR_ENV, stage_dir);
+        for name in [
+            raster_runtime::TRACE_PATH_ENV,
+            raster_runtime::TRACE_FORMAT_ENV,
+            raster_runtime::PROFILE_PATH_ENV,
+            raster_runtime::PROFILE_STREAM_PATH_ENV,
+            raster_runtime::PROFILE_RUN_ID_ENV,
+        ] {
+            std::env::remove_var(name);
+        }
+        guard
+    }
+
+    fn capture(names: &[&'static str]) -> Self {
+        Self {
+            saved: names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        }
+    }
+}
+
+impl Drop for StageEnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.saved.drain(..).rev() {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
 fn short_hex(bytes: &[u8]) -> String {
     let full = hex::encode(bytes);
     full.chars().take(12).collect::<String>() + "..."
+}
+
+fn format_duration(duration: Duration) -> String {
+    let ns = duration.as_nanos();
+    if ns < 1_000 {
+        format!("{ns}ns")
+    } else if ns < 1_000_000 {
+        format!("{:.2}µs", ns as f64 / 1_000.0)
+    } else if ns < 1_000_000_000 {
+        format!("{:.2}ms", ns as f64 / 1_000_000.0)
+    } else {
+        format!("{:.2}s", ns as f64 / 1_000_000_000.0)
+    }
 }
 
 #[cfg(test)]
@@ -645,9 +833,35 @@ mod tests {
             input["chained_arg"]["path"].as_str(),
             Some(producer_dir.join("output.bin").to_string_lossy().as_ref())
         );
+        assert_eq!(input["external_arg"]["load_preference"], "mmap");
+        assert_eq!(input["chained_arg"]["load_preference"], "read");
         assert_eq!(manifest["external_arg"]["commitment"], "abc123");
         assert_eq!(manifest["chained_arg"]["commitment"], "deadbeef");
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn cached_inputs_follow_from_bindings_by_commitment() {
+        let stage = StageSpec {
+            name: "consumer".into(),
+            project: "input-embedding".into(),
+            inputs: BTreeMap::from([("prompt".into(), InputBinding::From("producer".into()))]),
+        };
+        let stage_index = BTreeMap::from([("producer".into(), 0usize)]);
+        let outputs = vec![vec![0xaa, 0xbb]];
+        let mut output_cache = StageOutputCache::default();
+        output_cache.insert(
+            "producer",
+            vec![0xaa, 0xbb],
+            CachedStageValue::PromptTokenization(prompt_prepare::input::PromptTokenization {
+                token_ids: raster::List::from(vec![1, 2]),
+            }),
+        );
+
+        let inputs =
+            cached_inputs_for_stage(&stage, &stage_index, &outputs, &output_cache).unwrap();
+
+        assert!(inputs.contains_key("prompt"));
     }
 }

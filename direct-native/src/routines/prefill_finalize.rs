@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{bail, Result};
 use prefill_finalize::input::{
     rms_norm, softcap, unpack_i32s, ActivationSequence, FinalHead, FinalHeadParams, LogitEntry,
@@ -6,7 +8,8 @@ use prefill_finalize::input::{
 use raster::List;
 use rayon::prelude::*;
 
-use crate::artifact_io::with_main_sequence_scope;
+use crate::artifact_io::{with_main_sequence_scope, with_stage_sequence_scope};
+use crate::cache::CachedInputs;
 use crate::tensor::{self, Matrix};
 
 pub struct Inputs {
@@ -15,7 +18,17 @@ pub struct Inputs {
 }
 
 pub fn load_inputs_from_args() -> Result<Inputs> {
-    with_main_sequence_scope(load_inputs_from_initialized_runtime)
+    with_main_sequence_scope(|| load_inputs_from_initialized_runtime(&CachedInputs::new()))
+}
+
+pub fn load_inputs_from_paths(
+    input: &Path,
+    input_manifest: &Path,
+    cached_inputs: &CachedInputs,
+) -> Result<Inputs> {
+    with_stage_sequence_scope(input, input_manifest, || {
+        load_inputs_from_initialized_runtime(cached_inputs)
+    })
 }
 
 pub fn run_direct(inputs: &Inputs) -> Result<PrefillLogits> {
@@ -102,16 +115,17 @@ fn projection_matrix(head: &FinalHead, params: &FinalHeadParams) -> Result<Matri
     )
 }
 
-fn load_inputs_from_initialized_runtime() -> Result<Inputs> {
+fn load_inputs_from_initialized_runtime(cached_inputs: &CachedInputs) -> Result<Inputs> {
     let binding = raster::start_program(&[
         raster::entry_argument_spec::<ActivationSequence>("activations"),
         raster::entry_argument_spec::<FinalHead>("head"),
     ])?;
-    let activations = raster::materialize_auth_return(raster::entry_argument_auth_ref::<
-        ActivationSequence,
-    >(
-        binding.reference.clone(), "activations"
-    ));
+    let activations = match cached_inputs.get("activations") {
+        Some(value) => value.as_finalize_activation_sequence()?,
+        None => raster::materialize_auth_return(raster::entry_argument_auth_ref::<
+            ActivationSequence,
+        >(binding.reference.clone(), "activations")),
+    };
     let head = raster::materialize_auth_return(raster::entry_argument_auth_ref::<FinalHead>(
         binding.reference,
         "head",

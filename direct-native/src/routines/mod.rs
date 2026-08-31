@@ -6,6 +6,7 @@ use raster_runtime::OutputArtifact;
 use serde::Serialize;
 
 use crate::artifact_io::{encode_output, write_output, EncodedArtifact};
+use crate::cache::{CachedInputs, CachedStageValue};
 
 pub mod decode_select_token;
 pub mod input_embedding;
@@ -33,6 +34,7 @@ pub struct DirectCompareOutput {
 pub struct DirectPublishOutput {
     pub artifact: OutputArtifact,
     pub timings: DirectTimings,
+    pub output: CachedStageValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,31 +156,119 @@ pub fn run_and_publish(kind: &StageKind) -> Result<DirectPublishOutput> {
             prompt_prepare::load_inputs_from_args,
             prompt_prepare::run_direct,
             "prompt_prepare",
+            CachedStageValue::PromptTokenization,
         ),
         StageKind::InputEmbedding => publish(
             input_embedding::load_inputs_from_args,
             input_embedding::run_direct,
             "input_embedding",
+            CachedStageValue::EmbeddedActivations,
         ),
         StageKind::PrefillPrepareAux { .. } => publish(
             prefill_prepare_aux::load_inputs_from_args,
             prefill_prepare_aux::run_direct,
             "prefill_prepare_aux",
+            CachedStageValue::PleLayerInputs,
         ),
         StageKind::PrefillRange { .. } => publish(
             prefill_range::load_inputs_from_args,
             prefill_range::run_direct,
             "prefill_range",
+            CachedStageValue::RangeActivations,
         ),
         StageKind::PrefillFinalize => publish(
             prefill_finalize::load_inputs_from_args,
             prefill_finalize::run_direct,
             "prefill_finalize",
+            CachedStageValue::PrefillLogits,
         ),
         StageKind::DecodeSelectToken => publish(
             decode_select_token::load_inputs_from_args,
             decode_select_token::run_direct,
             "decode_select_token",
+            CachedStageValue::SelectedToken,
+        ),
+    }
+}
+
+pub fn run_and_publish_from_paths(
+    kind: &StageKind,
+    input_path: &Path,
+    input_manifest_path: &Path,
+    cached_inputs: &CachedInputs,
+) -> Result<DirectPublishOutput> {
+    match kind {
+        StageKind::PromptPrepare => publish(
+            || {
+                prompt_prepare::load_inputs_from_paths(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                )
+            },
+            prompt_prepare::run_direct,
+            "prompt_prepare",
+            CachedStageValue::PromptTokenization,
+        ),
+        StageKind::InputEmbedding => publish(
+            || {
+                input_embedding::load_inputs_from_paths(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                )
+            },
+            input_embedding::run_direct,
+            "input_embedding",
+            CachedStageValue::EmbeddedActivations,
+        ),
+        StageKind::PrefillPrepareAux { .. } => publish(
+            || {
+                prefill_prepare_aux::load_inputs_from_paths(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                )
+            },
+            prefill_prepare_aux::run_direct,
+            "prefill_prepare_aux",
+            CachedStageValue::PleLayerInputs,
+        ),
+        StageKind::PrefillRange { .. } => publish(
+            || {
+                prefill_range::load_inputs_from_paths(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                )
+            },
+            prefill_range::run_direct,
+            "prefill_range",
+            CachedStageValue::RangeActivations,
+        ),
+        StageKind::PrefillFinalize => publish(
+            || {
+                prefill_finalize::load_inputs_from_paths(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                )
+            },
+            prefill_finalize::run_direct,
+            "prefill_finalize",
+            CachedStageValue::PrefillLogits,
+        ),
+        StageKind::DecodeSelectToken => publish(
+            || {
+                decode_select_token::load_inputs_from_paths(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                )
+            },
+            decode_select_token::run_direct,
+            "decode_select_token",
+            CachedStageValue::SelectedToken,
         ),
     }
 }
@@ -220,6 +310,7 @@ fn publish<I, O>(
     load: impl FnOnce() -> Result<I>,
     run: impl FnOnce(&I) -> Result<O>,
     label: &str,
+    cache_value: impl FnOnce(O) -> CachedStageValue,
 ) -> Result<DirectPublishOutput>
 where
     O: Serialize,
@@ -237,6 +328,7 @@ where
     let artifact = write_output(&output)
         .with_context(|| format!("failed to write direct-native {label} output"))?;
     let encode_write_duration = encode_write_started.elapsed();
+    let output = cache_value(output);
 
     Ok(DirectPublishOutput {
         artifact,
@@ -246,6 +338,7 @@ where
             encode_write_duration,
             direct_stage_duration: direct_stage_started.elapsed(),
         },
+        output,
     })
 }
 

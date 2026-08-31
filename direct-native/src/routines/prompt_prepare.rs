@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{bail, Result};
 use prompt_prepare::input::{
     merge_bucket_of, vocab_bucket_of, BpePieces, MergeMatch, MergeStep, PromptTokenization,
@@ -5,7 +7,8 @@ use prompt_prepare::input::{
 };
 use raster::List;
 
-use crate::artifact_io::with_main_sequence_scope;
+use crate::artifact_io::{with_main_sequence_scope, with_stage_sequence_scope};
+use crate::cache::CachedInputs;
 
 const MERGE_ROUNDS: usize = 8;
 const TERMINATOR: &str = "</w>";
@@ -17,6 +20,14 @@ pub struct Inputs {
 
 pub fn load_inputs_from_args() -> Result<Inputs> {
     with_main_sequence_scope(load_inputs_from_initialized_runtime)
+}
+
+pub fn load_inputs_from_paths(
+    input: &Path,
+    input_manifest: &Path,
+    _cached_inputs: &CachedInputs,
+) -> Result<Inputs> {
+    with_stage_sequence_scope(input, input_manifest, load_inputs_from_initialized_runtime)
 }
 
 pub fn run_direct(inputs: &Inputs) -> Result<PromptTokenization> {

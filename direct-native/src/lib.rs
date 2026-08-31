@@ -1,4 +1,5 @@
 pub mod artifact_io;
+pub mod cache;
 pub mod hybrid;
 pub mod prefill_range;
 pub mod routines;

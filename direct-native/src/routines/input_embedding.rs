@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{bail, Result};
 use det_num::ops::mul_sat;
 use det_num::Act;
@@ -7,7 +9,8 @@ use input_embedding::input::{
 };
 use raster::List;
 
-use crate::artifact_io::with_main_sequence_scope;
+use crate::artifact_io::{with_main_sequence_scope, with_stage_sequence_scope};
+use crate::cache::CachedInputs;
 
 pub struct Inputs {
     pub prompt: PromptTokenization,
@@ -15,7 +18,17 @@ pub struct Inputs {
 }
 
 pub fn load_inputs_from_args() -> Result<Inputs> {
-    with_main_sequence_scope(load_inputs_from_initialized_runtime)
+    with_main_sequence_scope(|| load_inputs_from_initialized_runtime(&CachedInputs::new()))
+}
+
+pub fn load_inputs_from_paths(
+    input: &Path,
+    input_manifest: &Path,
+    cached_inputs: &CachedInputs,
+) -> Result<Inputs> {
+    with_stage_sequence_scope(input, input_manifest, || {
+        load_inputs_from_initialized_runtime(cached_inputs)
+    })
 }
 
 pub fn run_direct(inputs: &Inputs) -> Result<ActivationSequence> {
@@ -61,14 +74,17 @@ pub fn run_direct(inputs: &Inputs) -> Result<ActivationSequence> {
     })
 }
 
-fn load_inputs_from_initialized_runtime() -> Result<Inputs> {
+fn load_inputs_from_initialized_runtime(cached_inputs: &CachedInputs) -> Result<Inputs> {
     let binding = raster::start_program(&[
         raster::entry_argument_spec::<PromptTokenization>("prompt"),
         raster::entry_argument_spec::<EmbeddingTable>("embedding"),
     ])?;
-    let prompt = raster::materialize_auth_return(raster::entry_argument_auth_ref::<
-        PromptTokenization,
-    >(binding.reference.clone(), "prompt"));
+    let prompt = match cached_inputs.get("prompt") {
+        Some(value) => value.as_embedding_prompt()?,
+        None => raster::materialize_auth_return(raster::entry_argument_auth_ref::<
+            PromptTokenization,
+        >(binding.reference.clone(), "prompt")),
+    };
     let embedding = raster::materialize_auth_return(raster::entry_argument_auth_ref::<
         EmbeddingTable,
     >(binding.reference, "embedding"));

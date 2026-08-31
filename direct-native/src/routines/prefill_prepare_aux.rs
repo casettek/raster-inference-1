@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{bail, Result};
 use prefill_prepare_aux::input::{
     add_sat, pack_i32s, rms_norm, scale_row, unpack_i32s, unpack_i32s_at, ActivationSequence,
@@ -6,7 +8,8 @@ use prefill_prepare_aux::input::{
 use raster::List;
 use rayon::prelude::*;
 
-use crate::artifact_io::with_main_sequence_scope;
+use crate::artifact_io::{with_main_sequence_scope, with_stage_sequence_scope};
+use crate::cache::CachedInputs;
 use crate::tensor::{self, Matrix};
 
 pub struct Inputs {
@@ -15,7 +18,17 @@ pub struct Inputs {
 }
 
 pub fn load_inputs_from_args() -> Result<Inputs> {
-    with_main_sequence_scope(load_inputs_from_initialized_runtime)
+    with_main_sequence_scope(|| load_inputs_from_initialized_runtime(&CachedInputs::new()))
+}
+
+pub fn load_inputs_from_paths(
+    input: &Path,
+    input_manifest: &Path,
+    cached_inputs: &CachedInputs,
+) -> Result<Inputs> {
+    with_stage_sequence_scope(input, input_manifest, || {
+        load_inputs_from_initialized_runtime(cached_inputs)
+    })
 }
 
 pub fn run_direct(inputs: &Inputs) -> Result<PleLayerInputs> {
@@ -123,14 +136,17 @@ fn ple_embedding(token_id: u32, layer: &PleLayer, params: &PleLayerParams) -> Re
         .map_err(|_| anyhow::anyhow!("PLE row width mismatch for token {token_id}: missing row"))
 }
 
-fn load_inputs_from_initialized_runtime() -> Result<Inputs> {
+fn load_inputs_from_initialized_runtime(cached_inputs: &CachedInputs) -> Result<Inputs> {
     let binding = raster::start_program(&[
         raster::entry_argument_spec::<ActivationSequence>("embedded"),
         raster::entry_argument_spec::<PleLayer>("layer"),
     ])?;
-    let embedded = raster::materialize_auth_return(raster::entry_argument_auth_ref::<
-        ActivationSequence,
-    >(binding.reference.clone(), "embedded"));
+    let embedded = match cached_inputs.get("embedded") {
+        Some(value) => value.as_aux_activation_sequence()?,
+        None => raster::materialize_auth_return(raster::entry_argument_auth_ref::<
+            ActivationSequence,
+        >(binding.reference.clone(), "embedded")),
+    };
     let layer = raster::materialize_auth_return(raster::entry_argument_auth_ref::<PleLayer>(
         binding.reference,
         "layer",

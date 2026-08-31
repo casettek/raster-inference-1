@@ -42,6 +42,10 @@ enum ChainCommand {
         /// Omit this to run every stage direct-native.
         #[arg(long = "raster-stage")]
         raster_stage: Option<String>,
+
+        /// Use the previous per-stage child-process direct-native runner.
+        #[arg(long = "direct-subprocess", hide = true)]
+        direct_subprocess: bool,
     },
 }
 
@@ -81,10 +85,19 @@ fn execute(cli: Cli) -> Result<ExitCode> {
 
     match cli.command {
         Some(Commands::Chain {
-            command: ChainCommand::Run { raster_stage },
+            command:
+                ChainCommand::Run {
+                    raster_stage,
+                    direct_subprocess,
+                },
         }) => {
             let exe = std::env::current_exe().context("failed to locate current executable")?;
-            let run = direct_native::hybrid::run(raster_stage.as_deref(), &exe)?;
+            let direct_backend = if direct_subprocess {
+                direct_native::hybrid::DirectStageBackend::Subprocess
+            } else {
+                direct_native::hybrid::DirectStageBackend::InProcess
+            };
+            let run = direct_native::hybrid::run(raster_stage.as_deref(), &exe, direct_backend)?;
             if let Some(selected_stage_dir) = run.selected_stage_dir.as_ref() {
                 let report = direct_native::shadow::read_shadow_report(selected_stage_dir)?;
                 print!(
