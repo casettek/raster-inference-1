@@ -60,7 +60,8 @@ pub struct StageExecutionTime {
     pub exec_duration_ns: u128,
 }
 
-pub fn run_hidden_stage_compare(stage_dir: &Path, index: usize) -> Result<ShadowReport> {
+pub fn run_hidden_stage_compare(stage_dir: &Path) -> Result<ShadowReport> {
+    let index = prefill_stage_index(stage_dir)?;
     validate_stage_artifacts(stage_dir, index)?;
 
     let direct_stage_started = Instant::now();
@@ -136,7 +137,8 @@ pub fn run_hidden_stage_compare(stage_dir: &Path, index: usize) -> Result<Shadow
     Ok(result)
 }
 
-pub fn run_hidden_stage_direct(stage_dir: &Path, index: usize) -> Result<()> {
+pub fn run_hidden_stage_direct(stage_dir: &Path) -> Result<()> {
+    let index = prefill_stage_index(stage_dir)?;
     validate_stage_input_artifacts(stage_dir, index)?;
 
     let direct_stage_started = Instant::now();
@@ -159,6 +161,21 @@ pub fn run_hidden_stage_direct(stage_dir: &Path, index: usize) -> Result<()> {
     );
 
     Ok(())
+}
+
+pub fn prefill_stage_index(stage_dir: &Path) -> Result<usize> {
+    let name = stage_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("selected stage has no valid UTF-8 directory name"))?;
+    let raw = name.strip_prefix("prefill_range_l").ok_or_else(|| {
+        anyhow::anyhow!(
+            "selected stage directory must end in `prefill_range_lN`: {}",
+            stage_dir.display()
+        )
+    })?;
+    raw.parse::<usize>()
+        .with_context(|| format!("failed to parse prefill stage index from `{name}`"))
 }
 
 fn validate_stage_artifacts(stage_dir: &Path, index: usize) -> Result<()> {

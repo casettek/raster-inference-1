@@ -1,15 +1,14 @@
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, ExitStatus};
+use std::process::{Command as ProcessCommand, ExitCode, ExitStatus};
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(name = "direct-native")]
 struct Cli {
-    /// Run the hybrid chain with this prefill-range stage left on Raster and shadow-compared.
-    #[arg(long = "raster-prefill-range-index")]
-    raster_prefill_range_index: Option<usize>,
+    #[command(subcommand)]
+    command: Option<Commands>,
 
     /// Compare one already-completed no-auth stage without rerunning the chain.
     #[arg(long = "compare-prefill-range-stage")]
@@ -24,6 +23,25 @@ struct Cli {
 
     #[arg(long = "input-manifest", hide = true)]
     input_manifest: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Run direct-native chain commands.
+    Chain {
+        #[command(subcommand)]
+        command: ChainCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ChainCommand {
+    /// Run the hybrid chain, leaving one stage on Raster as the reference.
+    Run {
+        /// Stage to run on Raster while direct-native owns supported stages around it.
+        #[arg(long = "raster-stage")]
+        raster_stage: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -42,23 +60,17 @@ fn try_main() -> Result<ExitCode> {
 
 fn execute(cli: Cli) -> Result<ExitCode> {
     if let Some(stage_dir) = cli.run_prefill_range_stage.as_ref() {
-        let index = cli
-            .raster_prefill_range_index
-            .ok_or_else(|| anyhow::anyhow!("direct stage mode requires selected index"))?;
         require_input_args(&cli)?;
-        direct_native::shadow::run_hidden_stage_direct(stage_dir, index)?;
+        direct_native::shadow::run_hidden_stage_direct(stage_dir)?;
         return Ok(ExitCode::SUCCESS);
     }
 
     if let Some(stage_dir) = cli.compare_prefill_range_stage {
-        let index = cli
-            .raster_prefill_range_index
-            .ok_or_else(|| anyhow::anyhow!("comparison mode requires selected index"))?;
         if cli.input.is_none() || cli.input_manifest.is_none() {
-            let status = run_hidden_compare(index, &stage_dir)?;
+            let status = run_hidden_compare(&stage_dir)?;
             return finish_shadow_run(status, &stage_dir);
         }
-        let report = direct_native::shadow::run_hidden_stage_compare(&stage_dir, index)?;
+        let report = direct_native::shadow::run_hidden_stage_compare(&stage_dir)?;
         return Ok(if report.matched {
             ExitCode::SUCCESS
         } else {
@@ -66,22 +78,25 @@ fn execute(cli: Cli) -> Result<ExitCode> {
         });
     }
 
-    if let Some(index) = cli.raster_prefill_range_index {
-        let exe = std::env::current_exe().context("failed to locate current executable")?;
-        let run = direct_native::hybrid::run(index, &exe)?;
-        if let Ok(report) = direct_native::shadow::read_shadow_report(&run.selected_stage_dir) {
-            print!(
-                "{}",
-                render_timing_summary_or_warning(&run.chain_dir, &report)
-            );
+    match cli.command {
+        Some(Commands::Chain {
+            command: ChainCommand::Run { raster_stage },
+        }) => {
+            let exe = std::env::current_exe().context("failed to locate current executable")?;
+            let run = direct_native::hybrid::run(&raster_stage, &exe)?;
+            if let Ok(report) = direct_native::shadow::read_shadow_report(&run.selected_stage_dir) {
+                print!(
+                    "{}",
+                    render_timing_summary_or_warning(&run.chain_dir, &report)
+                );
+            }
+            Ok(ExitCode::SUCCESS)
         }
-        return Ok(ExitCode::SUCCESS);
+        None => bail!(
+            "direct-native requires `chain run --raster-stage <stage-name>`; \
+             use the Raster CLI directly for Raster-only execution"
+        ),
     }
-
-    bail!(
-        "direct-native requires --raster-prefill-range-index; \
-         use the Raster CLI directly for Raster-only execution"
-    )
 }
 
 fn finish_shadow_run(status: ExitStatus, stage_dir: &Path) -> Result<ExitCode> {
@@ -114,7 +129,7 @@ fn render_timing_summary_or_warning(
         .unwrap_or_else(|error| format!("\ntiming summary unavailable: {error:#}\n"))
 }
 
-fn run_hidden_compare(index: usize, stage_dir: &Path) -> Result<ExitStatus> {
+fn run_hidden_compare(stage_dir: &Path) -> Result<ExitStatus> {
     let input = stage_dir.join("input.json");
     let input_manifest = stage_dir.join("input_manifest.json");
     let prior_report = direct_native::shadow::parity_dir(stage_dir).join("report.json");
@@ -125,7 +140,7 @@ fn run_hidden_compare(index: usize, stage_dir: &Path) -> Result<ExitStatus> {
         }
     }
     let exe = std::env::current_exe().context("failed to locate current executable")?;
-    let status = comparison_command(&exe, index, stage_dir, &input, &input_manifest)
+    let status = comparison_command(&exe, stage_dir, &input, &input_manifest)
         .status()
         .context("failed to start direct-native comparison child")?;
     Ok(status)
@@ -133,17 +148,14 @@ fn run_hidden_compare(index: usize, stage_dir: &Path) -> Result<ExitStatus> {
 
 fn comparison_command(
     exe: &Path,
-    index: usize,
     stage_dir: &Path,
     input: &Path,
     input_manifest: &Path,
-) -> Command {
-    let mut command = Command::new(exe);
+) -> ProcessCommand {
+    let mut command = ProcessCommand::new(exe);
     command
         .arg("--compare-prefill-range-stage")
         .arg(stage_dir)
-        .arg("--raster-prefill-range-index")
-        .arg(index.to_string())
         .arg("--input")
         .arg(input)
         .arg("--input-manifest")
@@ -175,7 +187,7 @@ mod tests {
     #[test]
     fn bare_invocation_is_rejected() {
         let error = execute(Cli {
-            raster_prefill_range_index: None,
+            command: None,
             compare_prefill_range_stage: None,
             run_prefill_range_stage: None,
             input: None,
@@ -185,13 +197,13 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("requires --raster-prefill-range-index"));
+            .contains("requires `chain run --raster-stage <stage-name>`"));
     }
 
     #[test]
     fn hidden_direct_stage_requires_input_files() {
         let error = execute(Cli {
-            raster_prefill_range_index: Some(3),
+            command: None,
             compare_prefill_range_stage: None,
             run_prefill_range_stage: Some(PathBuf::from("prefill_range_l3")),
             input: None,
@@ -206,7 +218,6 @@ mod tests {
     fn comparison_command_is_unauthenticated_and_isolated() {
         let command = comparison_command(
             Path::new("/tmp/direct-native"),
-            3,
             Path::new("/tmp/chains-no-auth/run/prefill_range_l3"),
             Path::new("/tmp/input.json"),
             Path::new("/tmp/input_manifest.json"),

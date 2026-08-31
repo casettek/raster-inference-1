@@ -76,10 +76,10 @@ struct StageExecutionTime {
     exec_duration_ns: u128,
 }
 
-pub fn run(reference_index: usize, current_exe: &Path) -> Result<HybridRun> {
+pub fn run(raster_stage: &str, current_exe: &Path) -> Result<HybridRun> {
     let base_dir = std::env::current_dir().context("failed to read current directory")?;
     let manifest = read_manifest(&base_dir.join("Raster.toml"))?;
-    validate_reference_index(&manifest.chain.stage, reference_index)?;
+    let reference_index = validate_reference_stage(&manifest.chain.stage, raster_stage)?;
 
     let chain_dir = create_chain_dir(&base_dir)?;
     println!(
@@ -88,9 +88,7 @@ pub fn run(reference_index: usize, current_exe: &Path) -> Result<HybridRun> {
         manifest.chain.stage.len()
     );
     println!("  dir: {}", chain_dir.display());
-    println!(
-        "  mode: unauthenticated hybrid (--no-auth; Raster prefill reference: prefill_range_l{reference_index})"
-    );
+    println!("  mode: unauthenticated hybrid (--no-auth; Raster reference: {raster_stage})");
     println!();
 
     let mut output_commitments: Vec<Vec<u8>> = Vec::new();
@@ -120,7 +118,7 @@ pub fn run(reference_index: usize, current_exe: &Path) -> Result<HybridRun> {
             &stage_index,
         )?;
 
-        let dispatch = dispatch_for_stage(stage, reference_index)?;
+        let dispatch = dispatch_for_stage(stage, raster_stage)?;
         let duration = match dispatch {
             StageDispatch::Raster => {
                 println!("    raster no-auth …");
@@ -191,23 +189,31 @@ fn read_manifest(path: &Path) -> Result<Manifest> {
     toml::from_str(&text).context("failed to decode Raster.toml chain")
 }
 
-fn validate_reference_index(stages: &[StageSpec], reference_index: usize) -> Result<()> {
-    let target = format!("prefill_range_l{reference_index}");
+fn validate_reference_stage(stages: &[StageSpec], raster_stage: &str) -> Result<usize> {
     let count = stages
         .iter()
-        .filter(|stage| stage.name == target && stage.project == "prefill-range")
+        .filter(|stage| stage.name == raster_stage)
         .count();
     if count != 1 {
-        bail!("expected exactly one `{target}` prefill-range stage in Raster.toml, found {count}");
+        bail!("expected exactly one `{raster_stage}` stage in Raster.toml, found {count}");
     }
-    Ok(())
+    let stage = stages
+        .iter()
+        .find(|stage| stage.name == raster_stage)
+        .expect("stage existence checked above");
+    prefill_index(stage)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "`{raster_stage}` is not currently supported as a Raster reference; \
+             choose a prefill_range_lN stage"
+        )
+    })
 }
 
-fn dispatch_for_stage(stage: &StageSpec, reference_index: usize) -> Result<StageDispatch> {
-    let Some(index) = prefill_index(stage)? else {
+fn dispatch_for_stage(stage: &StageSpec, raster_stage: &str) -> Result<StageDispatch> {
+    if prefill_index(stage)?.is_none() {
         return Ok(StageDispatch::Raster);
-    };
-    if index == reference_index {
+    }
+    if stage.name == raster_stage {
         Ok(StageDispatch::RasterReferencePrefill)
     } else {
         Ok(StageDispatch::DirectNativePrefill)
@@ -355,14 +361,12 @@ fn run_direct_native_stage(
     input_manifest_path: &Path,
     stage_dir: &Path,
 ) -> Result<Duration> {
-    let index = prefill_index(stage)?
+    prefill_index(stage)?
         .ok_or_else(|| anyhow::anyhow!("stage '{}' is not a prefill-range stage", stage.name))?;
     let mut command = Command::new(current_exe);
     command
         .arg("--run-prefill-range-stage")
         .arg(stage_dir)
-        .arg("--raster-prefill-range-index")
-        .arg(index.to_string())
         .arg("--input")
         .arg(input_json_path)
         .arg("--input-manifest")
@@ -387,8 +391,6 @@ fn run_compare_stage(current_exe: &Path, index: usize, stage_dir: &Path) -> Resu
     command
         .arg("--compare-prefill-range-stage")
         .arg(stage_dir)
-        .arg("--raster-prefill-range-index")
-        .arg(index.to_string())
         .arg("--input")
         .arg(stage_dir.join("input.json"))
         .arg("--input-manifest")
@@ -559,7 +561,7 @@ mod tests {
         let mut reference = 0usize;
 
         for stage in &manifest.chain.stage {
-            match dispatch_for_stage(stage, 13).unwrap() {
+            match dispatch_for_stage(stage, "prefill_range_l13").unwrap() {
                 StageDispatch::Raster => raster += 1,
                 StageDispatch::DirectNativePrefill => direct += 1,
                 StageDispatch::RasterReferencePrefill => reference += 1,
