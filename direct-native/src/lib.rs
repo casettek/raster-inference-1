@@ -1,6 +1,7 @@
 pub mod artifact_io;
 pub mod hybrid;
 pub mod prefill_range;
+pub mod routines;
 pub mod shadow;
 mod tensor;
 

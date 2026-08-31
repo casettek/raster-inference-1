@@ -9,12 +9,13 @@ use raster_core::input::payload_structural_root;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::routines::StageKind;
 use crate::shadow::{parity_dir, EXECUTION_TIMES_JSON};
 
 #[derive(Debug)]
 pub struct HybridRun {
     pub chain_dir: PathBuf,
-    pub selected_stage_dir: PathBuf,
+    pub selected_stage_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,9 +53,8 @@ struct ExternalRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StageDispatch {
-    Raster,
-    DirectNativePrefill,
-    RasterReferencePrefill,
+    DirectNative,
+    RasterReference,
 }
 
 #[derive(Debug)]
@@ -76,19 +76,27 @@ struct StageExecutionTime {
     exec_duration_ns: u128,
 }
 
-pub fn run(raster_stage: &str, current_exe: &Path) -> Result<HybridRun> {
+pub fn run(raster_stage: Option<&str>, current_exe: &Path) -> Result<HybridRun> {
     let base_dir = std::env::current_dir().context("failed to read current directory")?;
     let manifest = read_manifest(&base_dir.join("Raster.toml"))?;
-    let reference_index = validate_reference_stage(&manifest.chain.stage, raster_stage)?;
+    validate_supported_stages(&manifest.chain.stage)?;
+    if let Some(raster_stage) = raster_stage {
+        validate_reference_stage(&manifest.chain.stage, raster_stage)?;
+    }
 
     let chain_dir = create_chain_dir(&base_dir)?;
     println!(
-        "hybrid direct-native chain run  {}  ({} stages)",
+        "direct-native chain run  {}  ({} stages)",
         chain_run_id_label(&chain_dir),
         manifest.chain.stage.len()
     );
     println!("  dir: {}", chain_dir.display());
-    println!("  mode: unauthenticated hybrid (--no-auth; Raster reference: {raster_stage})");
+    match raster_stage {
+        Some(stage) => {
+            println!("  mode: unauthenticated hybrid (--no-auth; Raster reference: {stage})");
+        }
+        None => println!("  mode: unauthenticated direct-native (--no-auth; no Raster reference)"),
+    }
     println!();
 
     let mut output_commitments: Vec<Vec<u8>> = Vec::new();
@@ -120,28 +128,20 @@ pub fn run(raster_stage: &str, current_exe: &Path) -> Result<HybridRun> {
 
         let dispatch = dispatch_for_stage(stage, raster_stage)?;
         let duration = match dispatch {
-            StageDispatch::Raster => {
-                println!("    raster no-auth …");
-                run_raster_stage(
-                    stage,
-                    &base_dir,
-                    &input_json_path,
-                    &input_manifest_path,
-                    &stage_dir,
-                )?
-            }
-            StageDispatch::DirectNativePrefill => {
-                println!("    direct-native prefill …");
+            StageDispatch::DirectNative => {
+                let kind = StageKind::from_stage_spec(&stage.project, &stage.name)?;
+                println!("    direct-native {} …", kind.routine());
                 run_direct_native_stage(
                     current_exe,
-                    stage,
+                    &kind,
                     &input_json_path,
                     &input_manifest_path,
                     &stage_dir,
                 )?
             }
-            StageDispatch::RasterReferencePrefill => {
-                println!("    raster reference prefill …");
+            StageDispatch::RasterReference => {
+                let kind = StageKind::from_stage_spec(&stage.project, &stage.name)?;
+                println!("    raster reference {} …", kind.routine());
                 let duration = run_raster_stage(
                     stage,
                     &base_dir,
@@ -150,7 +150,7 @@ pub fn run(raster_stage: &str, current_exe: &Path) -> Result<HybridRun> {
                     &stage_dir,
                 )?;
                 println!("    direct-native parity check …");
-                run_compare_stage(current_exe, reference_index, &stage_dir)?;
+                run_compare_stage(current_exe, &stage_dir)?;
                 selected_stage_dir = Some(stage_dir.clone());
                 duration
             }
@@ -171,9 +171,13 @@ pub fn run(raster_stage: &str, current_exe: &Path) -> Result<HybridRun> {
     }
 
     write_execution_times(&chain_dir, &execution_times)?;
-    let selected_stage_dir = selected_stage_dir
-        .ok_or_else(|| anyhow::anyhow!("selected Raster prefill stage did not run"))?;
+    if raster_stage.is_some() && selected_stage_dir.is_none() {
+        bail!("selected Raster reference stage did not run");
+    }
     println!("no chain-commitment written (hybrid --no-auth)");
+    if raster_stage.is_none() {
+        println!("no Raster reference selected; parity comparison skipped");
+    }
 
     Ok(HybridRun {
         chain_dir,
@@ -189,7 +193,14 @@ fn read_manifest(path: &Path) -> Result<Manifest> {
     toml::from_str(&text).context("failed to decode Raster.toml chain")
 }
 
-fn validate_reference_stage(stages: &[StageSpec], raster_stage: &str) -> Result<usize> {
+fn validate_supported_stages(stages: &[StageSpec]) -> Result<()> {
+    for stage in stages {
+        StageKind::from_stage_spec(&stage.project, &stage.name)?;
+    }
+    Ok(())
+}
+
+fn validate_reference_stage(stages: &[StageSpec], raster_stage: &str) -> Result<()> {
     let count = stages
         .iter()
         .filter(|stage| stage.name == raster_stage)
@@ -201,39 +212,17 @@ fn validate_reference_stage(stages: &[StageSpec], raster_stage: &str) -> Result<
         .iter()
         .find(|stage| stage.name == raster_stage)
         .expect("stage existence checked above");
-    prefill_index(stage)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "`{raster_stage}` is not currently supported as a Raster reference; \
-             choose a prefill_range_lN stage"
-        )
-    })
+    StageKind::from_stage_spec(&stage.project, &stage.name)?;
+    Ok(())
 }
 
-fn dispatch_for_stage(stage: &StageSpec, raster_stage: &str) -> Result<StageDispatch> {
-    if prefill_index(stage)?.is_none() {
-        return Ok(StageDispatch::Raster);
-    }
-    if stage.name == raster_stage {
-        Ok(StageDispatch::RasterReferencePrefill)
+fn dispatch_for_stage(stage: &StageSpec, raster_stage: Option<&str>) -> Result<StageDispatch> {
+    StageKind::from_stage_spec(&stage.project, &stage.name)?;
+    if raster_stage == Some(stage.name.as_str()) {
+        Ok(StageDispatch::RasterReference)
     } else {
-        Ok(StageDispatch::DirectNativePrefill)
+        Ok(StageDispatch::DirectNative)
     }
-}
-
-fn prefill_index(stage: &StageSpec) -> Result<Option<usize>> {
-    if stage.project != "prefill-range" {
-        return Ok(None);
-    }
-    let Some(raw) = stage.name.strip_prefix("prefill_range_l") else {
-        bail!(
-            "prefill-range stage `{}` does not use prefill_range_lN naming",
-            stage.name
-        );
-    };
-    let index = raw
-        .parse::<usize>()
-        .with_context(|| format!("failed to parse prefill stage index from `{}`", stage.name))?;
-    Ok(Some(index))
 }
 
 fn synthesize_inputs(
@@ -356,16 +345,14 @@ fn run_raster_stage(
 
 fn run_direct_native_stage(
     current_exe: &Path,
-    stage: &StageSpec,
+    kind: &StageKind,
     input_json_path: &Path,
     input_manifest_path: &Path,
     stage_dir: &Path,
 ) -> Result<Duration> {
-    prefill_index(stage)?
-        .ok_or_else(|| anyhow::anyhow!("stage '{}' is not a prefill-range stage", stage.name))?;
     let mut command = Command::new(current_exe);
     command
-        .arg("--run-prefill-range-stage")
+        .arg("--run-stage")
         .arg(stage_dir)
         .arg("--input")
         .arg(input_json_path)
@@ -375,10 +362,10 @@ fn run_direct_native_stage(
         .stderr(Stdio::inherit());
     apply_stage_env(&mut command, stage_dir);
 
-    run_timed_command(command, &format!("direct-native stage '{}'", stage.name))
+    run_timed_command(command, &format!("direct-native {} stage", kind.routine()))
 }
 
-fn run_compare_stage(current_exe: &Path, index: usize, stage_dir: &Path) -> Result<()> {
+fn run_compare_stage(current_exe: &Path, stage_dir: &Path) -> Result<()> {
     let prior_report = parity_dir(stage_dir).join("report.json");
     if let Err(error) = fs::remove_file(&prior_report) {
         if error.kind() != std::io::ErrorKind::NotFound {
@@ -389,7 +376,7 @@ fn run_compare_stage(current_exe: &Path, index: usize, stage_dir: &Path) -> Resu
 
     let mut command = Command::new(current_exe);
     command
-        .arg("--compare-prefill-range-stage")
+        .arg("--compare-stage")
         .arg(stage_dir)
         .arg("--input")
         .arg(stage_dir.join("input.json"))
@@ -409,7 +396,10 @@ fn run_compare_stage(current_exe: &Path, index: usize, stage_dir: &Path) -> Resu
         .status()
         .context("failed to start direct-native comparison child")?;
     if !status.success() {
-        bail!("direct-native parity check for prefill_range_l{index} failed ({status})");
+        bail!(
+            "direct-native parity check for {} failed ({status})",
+            stage_dir.display()
+        );
     }
     Ok(())
 }
@@ -550,28 +540,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn real_manifest_dispatches_one_reference_and_remaining_prefill_native() {
+    fn real_manifest_dispatches_one_reference_and_remaining_stages_native() {
         let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .join("Raster.toml");
         let manifest = read_manifest(&manifest_path).unwrap();
-        let mut raster = 0usize;
         let mut direct = 0usize;
         let mut reference = 0usize;
 
         for stage in &manifest.chain.stage {
-            match dispatch_for_stage(stage, "prefill_range_l13").unwrap() {
-                StageDispatch::Raster => raster += 1,
-                StageDispatch::DirectNativePrefill => direct += 1,
-                StageDispatch::RasterReferencePrefill => reference += 1,
+            match dispatch_for_stage(stage, Some("prefill_range_l13")).unwrap() {
+                StageDispatch::DirectNative => direct += 1,
+                StageDispatch::RasterReference => reference += 1,
             }
         }
 
         assert_eq!(manifest.chain.stage.len(), 74);
-        assert_eq!(raster, 39);
-        assert_eq!(direct, 34);
+        assert_eq!(direct, 73);
         assert_eq!(reference, 1);
+    }
+
+    #[test]
+    fn real_manifest_dispatches_every_stage_native_without_reference() {
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Raster.toml");
+        let manifest = read_manifest(&manifest_path).unwrap();
+        let mut direct = 0usize;
+        let mut reference = 0usize;
+
+        for stage in &manifest.chain.stage {
+            match dispatch_for_stage(stage, None).unwrap() {
+                StageDispatch::DirectNative => direct += 1,
+                StageDispatch::RasterReference => reference += 1,
+            }
+        }
+
+        assert_eq!(manifest.chain.stage.len(), 74);
+        assert_eq!(direct, 74);
+        assert_eq!(reference, 0);
     }
 
     #[test]

@@ -1,18 +1,13 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use raster_core::input::payload_structural_root;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::artifact_io::{
-    encode_activation_sequence, load_prefill_range_inputs_from_args,
-    write_activation_sequence_output,
-};
-use crate::{run_prefill_range_direct, PrefillRangeDirectInputs};
+use crate::routines::{self, StageKind};
 
 const PARITY_DIR: &str = "direct-native-parity";
 const DIRECT_OUTPUT_BIN: &str = "direct-native-output.bin";
@@ -37,7 +32,9 @@ pub enum RasterSourceMode {
 pub struct ShadowReport {
     pub version: u32,
     pub stage: String,
-    pub index: usize,
+    pub routine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<usize>,
     pub authority: ParityAuthority,
     pub raster_source_mode: RasterSourceMode,
     pub matched: bool,
@@ -61,65 +58,47 @@ pub struct StageExecutionTime {
 }
 
 pub fn run_hidden_stage_compare(stage_dir: &Path) -> Result<ShadowReport> {
-    let index = prefill_stage_index(stage_dir)?;
-    validate_stage_artifacts(stage_dir, index)?;
+    let stage_name = stage_name(stage_dir)?;
+    let kind = StageKind::from_stage_name(&stage_name)?;
+    validate_stage_artifacts(stage_dir)?;
 
-    let direct_stage_started = Instant::now();
-    let input_load_started = Instant::now();
-    let owned = load_prefill_range_inputs_from_args()
-        .context("failed to load selected prefill_range stage inputs")?;
-    let input_load_duration = input_load_started.elapsed();
-
-    let kernel_started = Instant::now();
-    let direct = run_prefill_range_direct(PrefillRangeDirectInputs {
-        activations: &owned.activations,
-        layer: &owned.layer,
-        donor_kv: &owned.donor_kv,
-        ple: &owned.ple,
-    })
-    .context("direct-native prefill_range execution failed")?;
-    let kernel_duration = kernel_started.elapsed();
-
-    let encode_write_started = Instant::now();
-    let encoded = encode_activation_sequence(&direct)
-        .context("failed to encode direct-native output as a Raster artifact")?;
+    let direct = routines::run_for_compare(&kind)?;
 
     let parity_dir = stage_dir.join(PARITY_DIR);
     fs::create_dir_all(&parity_dir)
         .with_context(|| format!("failed to create {}", parity_dir.display()))?;
     let direct_bin = parity_dir.join(DIRECT_OUTPUT_BIN);
     let direct_rindex = parity_dir.join(DIRECT_OUTPUT_RINDEX);
-    write_atomic(&direct_bin, &encoded.data)?;
-    write_atomic(&direct_rindex, &encoded.index)?;
-    let encode_write_duration = encode_write_started.elapsed();
-    let direct_stage_duration = direct_stage_started.elapsed();
+    write_atomic(&direct_bin, &direct.encoded.data)?;
+    write_atomic(&direct_rindex, &direct.encoded.index)?;
 
     let raster_bin = stage_dir.join("output.bin");
     let raster_bytes = fs::read(&raster_bin)
         .with_context(|| format!("failed to read {}", raster_bin.display()))?;
-    let comparison = compare_bytes(&raster_bytes, &encoded.data);
+    let comparison = compare_bytes(&raster_bytes, &direct.encoded.data);
     let raster_sha = sha256_hex(&raster_bytes);
-    let direct_sha = sha256_hex(&encoded.data);
+    let direct_sha = sha256_hex(&direct.encoded.data);
     let raster_structural = structural_hex(&raster_bytes)?;
-    let direct_structural = encoded.structural_commitment;
+    let direct_structural = direct.encoded.structural_commitment;
     let result = ShadowReport {
-        version: 2,
-        stage: format!("prefill_range_l{index}"),
-        index,
+        version: 3,
+        stage: stage_name,
+        routine: kind.routine().to_string(),
+        instance: kind.instance(),
         authority: ParityAuthority::NonAuthoritative,
         raster_source_mode: RasterSourceMode::Unauthenticated,
         matched: comparison.is_match(),
-        input_load_duration_ns: input_load_duration.as_nanos(),
-        kernel_duration_ns: kernel_duration.as_nanos(),
-        encode_write_duration_ns: encode_write_duration.as_nanos(),
-        direct_stage_duration_ns: direct_stage_duration.as_nanos(),
+        input_load_duration_ns: direct.timings.input_load_duration.as_nanos(),
+        kernel_duration_ns: direct.timings.kernel_duration.as_nanos(),
+        encode_write_duration_ns: direct.timings.encode_write_duration.as_nanos(),
+        direct_stage_duration_ns: direct.timings.direct_stage_duration.as_nanos(),
     };
 
     let report = render_report(
-        index,
+        &result.stage,
         &comparison,
         raster_bytes.len(),
-        encoded.data.len(),
+        direct.encoded.data.len(),
         &raster_sha,
         &direct_sha,
         &raster_structural,
@@ -138,48 +117,31 @@ pub fn run_hidden_stage_compare(stage_dir: &Path) -> Result<ShadowReport> {
 }
 
 pub fn run_hidden_stage_direct(stage_dir: &Path) -> Result<()> {
-    let index = prefill_stage_index(stage_dir)?;
-    validate_stage_input_artifacts(stage_dir, index)?;
+    let stage_name = stage_name(stage_dir)?;
+    let kind = StageKind::from_stage_name(&stage_name)?;
+    validate_stage_input_artifacts(stage_dir)?;
 
-    let direct_stage_started = Instant::now();
-    let owned = load_prefill_range_inputs_from_args()
-        .context("failed to load selected prefill_range stage inputs")?;
-    let direct = run_prefill_range_direct(PrefillRangeDirectInputs {
-        activations: &owned.activations,
-        layer: &owned.layer,
-        donor_kv: &owned.donor_kv,
-        ple: &owned.ple,
-    })
-    .context("direct-native prefill_range execution failed")?;
-    let artifact = write_activation_sequence_output(&direct)
-        .context("failed to write direct-native output as Raster artifact")?;
+    let direct = routines::run_and_publish(&kind)?;
     println!(
-        "direct-native prefill_range_l{index}: output {} structural={} stage={}",
-        artifact.data_path.display(),
-        artifact.commitment,
-        format_duration_ns(direct_stage_started.elapsed().as_nanos())
+        "direct-native {stage_name}: output {} structural={} stage={}",
+        direct.artifact.data_path.display(),
+        direct.artifact.commitment,
+        format_duration_ns(direct.timings.direct_stage_duration.as_nanos())
     );
 
     Ok(())
 }
 
-pub fn prefill_stage_index(stage_dir: &Path) -> Result<usize> {
-    let name = stage_dir
+fn stage_name(stage_dir: &Path) -> Result<String> {
+    stage_dir
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("selected stage has no valid UTF-8 directory name"))?;
-    let raw = name.strip_prefix("prefill_range_l").ok_or_else(|| {
-        anyhow::anyhow!(
-            "selected stage directory must end in `prefill_range_lN`: {}",
-            stage_dir.display()
-        )
-    })?;
-    raw.parse::<usize>()
-        .with_context(|| format!("failed to parse prefill stage index from `{name}`"))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("selected stage has no valid UTF-8 directory name"))
 }
 
-fn validate_stage_artifacts(stage_dir: &Path, index: usize) -> Result<()> {
-    validate_stage_input_artifacts(stage_dir, index)?;
+fn validate_stage_artifacts(stage_dir: &Path) -> Result<()> {
+    validate_stage_input_artifacts(stage_dir)?;
     for name in ["output.bin", "output.rindex", "output_manifest.json"] {
         let path = stage_dir.join(name);
         if !path.is_file() {
@@ -192,14 +154,8 @@ fn validate_stage_artifacts(stage_dir: &Path, index: usize) -> Result<()> {
     Ok(())
 }
 
-fn validate_stage_input_artifacts(stage_dir: &Path, index: usize) -> Result<()> {
-    let expected_name = format!("prefill_range_l{index}");
-    if stage_dir.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
-        bail!(
-            "selected stage directory must end in `{expected_name}`: {}",
-            stage_dir.display()
-        );
-    }
+fn validate_stage_input_artifacts(stage_dir: &Path) -> Result<()> {
+    StageKind::from_stage_dir(stage_dir)?;
     for name in ["input.json", "input_manifest.json"] {
         let path = stage_dir.join(name);
         if !path.is_file() {
@@ -313,7 +269,7 @@ fn compare_bytes(raster: &[u8], direct: &[u8]) -> ByteComparison {
 }
 
 fn render_report(
-    index: usize,
+    stage: &str,
     comparison: &ByteComparison,
     raster_len: usize,
     direct_len: usize,
@@ -327,7 +283,7 @@ fn render_report(
 ) -> String {
     match comparison {
         ByteComparison::Match => format!(
-            "NON-AUTHORITATIVE direct-native computational parity prefill_range_l{index}: MATCH\n\
+            "NON-AUTHORITATIVE direct-native computational parity {stage}: MATCH\n\
              Raster source mode: unauthenticated (--no-auth)\n\
              output.bin bytes: {raster_len}\n\
              raster sha256: {raster_sha}\n\
@@ -343,7 +299,7 @@ fn render_report(
             raster,
             direct,
         } => format!(
-            "NON-AUTHORITATIVE direct-native computational parity prefill_range_l{index}: MISMATCH\n\
+            "NON-AUTHORITATIVE direct-native computational parity {stage}: MISMATCH\n\
              Raster source mode: unauthenticated (--no-auth)\n\
              raster bytes: {raster_len}\n\
              direct-native bytes: {direct_len}\n\
@@ -390,7 +346,7 @@ pub fn read_shadow_report(stage_dir: &Path) -> Result<ShadowReport> {
         &fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?,
     )
     .with_context(|| format!("failed to decode {}", path.display()))?;
-    if report.version != 2 {
+    if report.version != 3 {
         bail!(
             "unsupported direct-native report version {} in {}",
             report.version,
@@ -533,7 +489,7 @@ mod tests {
     }
 
     impl TestStage {
-        fn no_auth(index: usize) -> Self {
+        fn no_auth(stage_name: &str) -> Self {
             let id = NEXT_TEST_RUN.fetch_add(1, Ordering::Relaxed);
             let run_dir = std::env::current_dir()
                 .unwrap()
@@ -541,7 +497,7 @@ mod tests {
                 .join("raster")
                 .join("chains-no-auth")
                 .join(format!("shadow-test-{}-{id}", std::process::id()));
-            let stage_dir = run_dir.join(format!("prefill_range_l{index}"));
+            let stage_dir = run_dir.join(stage_name);
             fs::create_dir_all(&stage_dir).unwrap();
             for name in [
                 "input.json",
@@ -564,19 +520,19 @@ mod tests {
 
     #[test]
     fn accepts_complete_no_auth_stage_without_chain_commitment() {
-        let stage = TestStage::no_auth(3);
+        let stage = TestStage::no_auth("prefill_range_l3");
 
-        validate_stage_artifacts(&stage.stage_dir, 3).unwrap();
+        validate_stage_artifacts(&stage.stage_dir).unwrap();
     }
 
     #[test]
     fn rejects_authenticated_artifacts_in_no_auth_stage() {
-        let stage = TestStage::no_auth(3);
+        let stage = TestStage::no_auth("prefill_range_l3");
         fs::write(stage.run_dir.join("chain-commitment"), []).unwrap();
         fs::write(stage.stage_dir.join("trace.bin"), []).unwrap();
         fs::write(stage.stage_dir.join("commit.bin"), []).unwrap();
 
-        let error = validate_stage_artifacts(&stage.stage_dir, 3).unwrap_err();
+        let error = validate_stage_artifacts(&stage.stage_dir).unwrap_err();
         assert!(error.to_string().contains("authenticated artifacts"));
     }
 

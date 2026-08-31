@@ -27,9 +27,10 @@ fn timing_summary_annotates_selected_stage() {
     )
     .unwrap();
     let shadow = ShadowReport {
-        version: 2,
+        version: 3,
         stage: "prefill_range_l3".into(),
-        index: 3,
+        routine: "prefill_range".into(),
+        instance: Some(3),
         authority: ParityAuthority::NonAuthoritative,
         raster_source_mode: RasterSourceMode::Unauthenticated,
         matched: true,

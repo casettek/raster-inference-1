@@ -751,6 +751,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "decode-select-token"
+version = "0.1.0"
+dependencies = [
+ "raster",
+ "serde",
+]
+
+[[package]]
 name = "derivative"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -829,9 +837,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "decode-select-token",
  "det-num",
  "hex",
+ "input-embedding",
+ "prefill-finalize",
+ "prefill-prepare-aux",
  "prefill-range",
+ "prompt-prepare",
  "raster",
  "raster-core",
  "raster-runtime",
@@ -1536,6 +1549,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "input-embedding"
+version = "0.1.0"
+dependencies = [
+ "det-num",
+ "raster",
+ "serde",
+]
+
+[[package]]
 name = "inventory"
 version = "0.3.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1983,6 +2005,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "prefill-finalize"
+version = "0.1.0"
+dependencies = [
+ "det-num",
+ "raster",
+ "serde",
+]
+
+[[package]]
+name = "prefill-prepare-aux"
+version = "0.1.0"
+dependencies = [
+ "det-num",
+ "raster",
+ "serde",
+]
+
+[[package]]
 name = "prefill-range"
 version = "0.1.0"
 dependencies = [
@@ -2007,6 +2047,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prompt-prepare"
+version = "0.1.0"
+dependencies = [
+ "raster",
+ "serde",
 ]
 
 [[package]]

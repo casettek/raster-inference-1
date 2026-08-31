@@ -11,12 +11,12 @@ struct Cli {
     command: Option<Commands>,
 
     /// Compare one already-completed no-auth stage without rerunning the chain.
-    #[arg(long = "compare-prefill-range-stage")]
-    compare_prefill_range_stage: Option<PathBuf>,
+    #[arg(long = "compare-stage", alias = "compare-prefill-range-stage")]
+    compare_stage: Option<PathBuf>,
 
-    /// Run one prefill-range stage directly and publish its canonical output artifact.
-    #[arg(long = "run-prefill-range-stage", hide = true)]
-    run_prefill_range_stage: Option<PathBuf>,
+    /// Run one stage directly and publish its canonical output artifact.
+    #[arg(long = "run-stage", alias = "run-prefill-range-stage", hide = true)]
+    run_stage: Option<PathBuf>,
 
     #[arg(long, hide = true)]
     input: Option<PathBuf>,
@@ -36,11 +36,12 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum ChainCommand {
-    /// Run the hybrid chain, leaving one stage on Raster as the reference.
+    /// Run the direct-native chain, optionally leaving one stage on Raster as the reference.
     Run {
         /// Stage to run on Raster while direct-native owns supported stages around it.
+        /// Omit this to run every stage direct-native.
         #[arg(long = "raster-stage")]
-        raster_stage: String,
+        raster_stage: Option<String>,
     },
 }
 
@@ -59,13 +60,13 @@ fn try_main() -> Result<ExitCode> {
 }
 
 fn execute(cli: Cli) -> Result<ExitCode> {
-    if let Some(stage_dir) = cli.run_prefill_range_stage.as_ref() {
+    if let Some(stage_dir) = cli.run_stage.as_ref() {
         require_input_args(&cli)?;
         direct_native::shadow::run_hidden_stage_direct(stage_dir)?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    if let Some(stage_dir) = cli.compare_prefill_range_stage {
+    if let Some(stage_dir) = cli.compare_stage {
         if cli.input.is_none() || cli.input_manifest.is_none() {
             let status = run_hidden_compare(&stage_dir)?;
             return finish_shadow_run(status, &stage_dir);
@@ -83,8 +84,9 @@ fn execute(cli: Cli) -> Result<ExitCode> {
             command: ChainCommand::Run { raster_stage },
         }) => {
             let exe = std::env::current_exe().context("failed to locate current executable")?;
-            let run = direct_native::hybrid::run(&raster_stage, &exe)?;
-            if let Ok(report) = direct_native::shadow::read_shadow_report(&run.selected_stage_dir) {
+            let run = direct_native::hybrid::run(raster_stage.as_deref(), &exe)?;
+            if let Some(selected_stage_dir) = run.selected_stage_dir.as_ref() {
+                let report = direct_native::shadow::read_shadow_report(selected_stage_dir)?;
                 print!(
                     "{}",
                     render_timing_summary_or_warning(&run.chain_dir, &report)
@@ -93,7 +95,7 @@ fn execute(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         None => bail!(
-            "direct-native requires `chain run --raster-stage <stage-name>`; \
+            "direct-native requires `chain run`; \
              use the Raster CLI directly for Raster-only execution"
         ),
     }
@@ -154,7 +156,7 @@ fn comparison_command(
 ) -> ProcessCommand {
     let mut command = ProcessCommand::new(exe);
     command
-        .arg("--compare-prefill-range-stage")
+        .arg("--compare-stage")
         .arg(stage_dir)
         .arg("--input")
         .arg(input)
@@ -188,24 +190,22 @@ mod tests {
     fn bare_invocation_is_rejected() {
         let error = execute(Cli {
             command: None,
-            compare_prefill_range_stage: None,
-            run_prefill_range_stage: None,
+            compare_stage: None,
+            run_stage: None,
             input: None,
             input_manifest: None,
         })
         .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("requires `chain run --raster-stage <stage-name>`"));
+        assert!(error.to_string().contains("requires `chain run`"));
     }
 
     #[test]
     fn hidden_direct_stage_requires_input_files() {
         let error = execute(Cli {
             command: None,
-            compare_prefill_range_stage: None,
-            run_prefill_range_stage: Some(PathBuf::from("prefill_range_l3")),
+            compare_stage: None,
+            run_stage: Some(PathBuf::from("prefill_range_l3")),
             input: None,
             input_manifest: None,
         })
@@ -246,9 +246,10 @@ mod tests {
     #[test]
     fn missing_execution_times_do_not_override_parity() {
         let report = direct_native::shadow::ShadowReport {
-            version: 2,
+            version: 3,
             stage: String::from("prefill_range_l3"),
-            index: 3,
+            routine: String::from("prefill_range"),
+            instance: Some(3),
             authority: direct_native::shadow::ParityAuthority::NonAuthoritative,
             raster_source_mode: direct_native::shadow::RasterSourceMode::Unauthenticated,
             matched: true,
