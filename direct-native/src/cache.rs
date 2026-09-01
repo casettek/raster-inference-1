@@ -136,6 +136,7 @@ fn aux_activation_from_embedding(
             k: row.k.clone(),
             v: row.v.clone(),
         }),
+        start_position: source.start_position,
     }
 }
 
@@ -153,6 +154,7 @@ fn aux_activation_from_range(
             k: row.k.clone(),
             v: row.v.clone(),
         }),
+        start_position: source.start_position,
     }
 }
 
@@ -170,6 +172,7 @@ fn range_activation_from_embedding(
             k: row.k.clone(),
             v: row.v.clone(),
         }),
+        start_position: source.start_position,
     }
 }
 
@@ -187,6 +190,7 @@ fn finalize_activation_from_embedding(
             k: row.k.clone(),
             v: row.v.clone(),
         }),
+        start_position: source.start_position,
     }
 }
 
@@ -204,6 +208,7 @@ fn finalize_activation_from_range(
             k: row.k.clone(),
             v: row.v.clone(),
         }),
+        start_position: source.start_position,
     }
 }
 

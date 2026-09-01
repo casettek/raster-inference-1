@@ -71,6 +71,7 @@ pub fn run_direct(inputs: &Inputs) -> Result<ActivationSequence> {
         rows: List::from(rows),
         errors: List::new(),
         kv: List::new(),
+        start_position: 0,
     })
 }
 

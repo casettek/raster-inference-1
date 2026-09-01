@@ -41,6 +41,20 @@ pub fn page_of(byte_offset: u64, page_size: u64) -> u64 {
     }
 }
 
+/// Stamps the prompt's starting position onto the activation sequence.
+///
+/// Always zero: this stage embeds the prompt, which by definition starts the
+/// sequence. It is written rather than assumed because every consumer of an
+/// `ActivationSequence` reads `start_position` to place its tokens, and a
+/// decode step's embed stage sets a different value from the same field.
+/// Set-once, so it happens here rather than inside the per-token append.
+#[tile(kind = iter, description = "Open the prompt's activation sequence at position zero")]
+pub fn begin_prompt_activations(output: Draft<ActivationSequence>) -> Draft<ActivationSequence> {
+    let mut output = output;
+    output.start_position().set(0);
+    output
+}
+
 /// Extracts the row at `byte_off` from its page and appends it, or records
 /// a miss when the page does not contain a full row of `hidden_size`.
 #[tile(kind = iter, description = "Append one gathered activation row")]

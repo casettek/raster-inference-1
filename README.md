@@ -2,13 +2,17 @@
 
 A chain project that runs a real Gemma model — `tiny-gemma-dev` from
 `raster-inference` — as a verifiable Raster chain: committed prompt in,
-next-token logits out, one stage per inference phase, expanded per layer.
+exactly N generated token IDs and decoded text out, one stage per inference
+phase, expanded per layer and generated token.
 
 ```sh
 cargo run --manifest-path model-import/Cargo.toml -- \
   --model ../raster-inference/assets/tiny-gemma-dev --prompt "hello raster"
-cargo raster chain run && cargo raster chain audit --execution
+cargo raster chain run --show-output && cargo raster chain audit --execution
 ```
+
+`--show-output` is what prints the generated text; without it a chain run
+reports only per-stage commitments. See [Generating N tokens](#generating-n-tokens).
 
 ```text
    tokenizer      embedding      ple layers    layer weights     head
@@ -23,7 +27,7 @@ cargo raster chain run && cargo raster chain audit --execution
 ```
 
 Every stage that passes activations on shares one type, `ActivationSequence
-{ rows, errors }` — defined field-for-field in each crate, because the chain
+{ rows, errors, kv, start_position }` — defined field-for-field in each crate, because the chain
 links stages by structural commitment. That is what lets `prefill_range`
 instances chain into each other.
 
@@ -52,6 +56,26 @@ With the checked-in fixture (`prompt "hello▁world"`):
 | after vocab pass | `[10, 1, 11]` |
 
 ## Model decisions worth knowing
+
+**The prompt is wrapped in Gemma's turn format.** An instruction-tuned model
+was trained to answer inside a turn it was asked to open. A bare prompt is a
+fragment to it, so the continuation it produces is a turn break rather than an
+answer: `What is ZK?` committed as five raw tokens generated `\n\n` and then
+`<turn|>`, which is the correct continuation of that input and not an answer to
+it. `model-import` therefore renders one user message plus the generation
+prompt the way the model's `chat_template.jinja` does —
+
+```text
+<bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n
+```
+
+— and `split_prompt` emits each special token as a whole piece. It has to: a
+special token is one vocabulary entry several characters long and no merge rule
+mentions one, so the merge pass could never reassemble `<|turn>` from `<`, `|`,
+`t`, … There is no Jinja engine here, so that one shape is written out directly
+rather than rendered from the bundle's template. `--raw-prompt` commits the
+prompt exactly as given; a tokenizer with no turn markers in its vocabulary
+(`tiny-gemma-dev`) falls back to that automatically.
 
 **The merge pass is a single left-to-right pass, not multi-round BPE.**
 Classic BPE repeats "find the globally best merge, rewrite the whole piece
@@ -386,11 +410,94 @@ cargo raster run --input input.json --input-manifest input_manifest.json \
   --audit commit.bin
 
 # chain (from the repo root)
-cargo raster chain run
-cargo raster chain audit
-cargo raster chain audit --execution
+cargo raster chain run --no-auth
 ```
 
 Any change to a tile body, a sequence, or `main`'s signature changes the
 program identity: rebuild with the risc0 backend and commit the new
 `Raster.lock` together with the source change.
+
+## Generating N tokens
+
+`model-import` writes a complete manifest whose decode section is one
+`[[chain.repeat]]`. Selection is the first operation in each iteration, so `--tokens N`
+means exactly N selected tokens and N transformer transitions:
+
+```sh
+cargo run --manifest-path model-import/Cargo.toml -- \
+  --model ../casettek/raster-inference/assets/tiny-gemma-dev \
+  --prompt "hello raster" \
+  --tokens 3 \
+  --manifest Raster.toml
+
+cargo raster chain run --no-auth --show-output    # fast functional check
+```
+
+The final `output_finalize` stage publishes `generated_token_count`,
+`generated_token_ids`, their reference-compatible SHA-256, decoded text, and
+`stop_reason` — but a chain run prints per-stage digests, not values, so
+without `--show-output` the generated text never reaches the terminal.
+`--show-output` renders the last stage's `output.bin` when the run finishes:
+
+```text
+Program output value (output_finalize):
+  {
+    generated_token_count: 2u32
+    generated_token_ids: [2] [ 236775u32 229361u32 ]
+    generated_token_ids_sha256: "fd22a039…"
+    generated_text: "\"ZK"
+    stop_reason: "max_new_tokens"
+  }
+  commitment 2b5bb726c88cf7fd…  ✓ matches .rindex
+```
+
+Every stage's artifact stays on disk, so the same reader works after the fact
+on any of them — which is how you read a middle stage without re-running:
+
+```sh
+cargo raster show target/raster/chains-no-auth/latest/output_finalize/output.bin
+cargo raster show target/raster/chains-no-auth/latest/prompt_prepare/output.bin
+```
+
+`stop_reason` is `eos` when a generated token is in the bundle's
+`eos_token_id` set (`model-import` reads it from `config.json` and marks those
+ids `terminal` in the decoder table), and `max_new_tokens` otherwise. The
+repeat count is a static unroll, so decoding cannot actually stop early:
+everything generated after the terminal token stays in `generated_token_ids`
+and its SHA-256 — it was generated — but it is a new turn, not the answer, so
+`generated_text` ends where the model ended. `Raster.toml.prefill-only` is the generated `--tokens 0` boundary
+fixture; it still runs `decode_init` and `output_finalize` so empty generation is
+tested end to end.
+
+For the 35-layer model, prefill/init/output cost 75 stages once and every generated
+token expands to 73 more stages (`select + embed + 35 aux + 35 range + finalize`).
+The repeat keeps the manifest compact; expansion deliberately keeps every execution
+and audit stage.
+
+KV-sharing layers receive both committed donor candidates. The layer's committed
+`kv_donor_layer` selects the exact candidate inside the tile, which removes the old
+non-templatable donor map and makes a wrong manifest edge fail closed.
+
+**Before you trust the output**, build the guests with the non-default backend —
+`cargo raster build` defaults to `--backend native`, which discovers the tiles and
+prints "Build complete!" while writing no image ids, after which the chain refuses to
+run with advice that does not fix it:
+
+```sh
+for d in prompt-prepare input-embedding prefill-prepare-aux prefill-range \
+         prefill-finalize decode-init decode-select-token decode-embed \
+         output-finalize; do
+  (cd $d && cargo raster build --backend risc0)
+done
+
+# Functional execution:
+cargo raster chain run --no-auth --show-output
+```
+
+Authenticated chain execution is currently blocked by Raster's open
+`authenticated-chain-draft-output` issue: the recorder cannot replay a
+`ProgramEnd` value finalized from a `Draft` at `[u32::MAX, n]`. This affects
+Raster's own `chain-example`, as well as `decode-init`, `decode-select-token`,
+`decode-embed`, and `output-finalize` here. It fails closed; `--no-auth` output
+and no-auth `chain audit --execution` have been validated, but they are not a
+substitute for the missing authenticated gate.

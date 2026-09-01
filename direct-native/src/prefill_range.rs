@@ -32,6 +32,7 @@ pub fn run_prefill_range_direct(
             rows: List::new(),
             errors: List::new(),
             kv: List::new(),
+            start_position: inputs.activations.start_position,
         });
     }
 
@@ -44,6 +45,7 @@ pub fn run_prefill_range_direct(
         rows: List::from(output_rows),
         errors: List::new(),
         kv: List::from(own_keys),
+        start_position: inputs.activations.start_position,
     })
 }
 
