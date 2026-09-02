@@ -44,7 +44,7 @@ const TURN_CLOSE: &str = "<turn|>";
 const NEWLINE_TOKEN: &str = "\n";
 
 fn main() {
-    if let Err(error) = run() {
+    if let Err(error) = run_from_env() {
         eprintln!("model-import: {error}");
         std::process::exit(1);
     }
@@ -79,7 +79,16 @@ struct Args {
     only_ple: bool,
 }
 
-fn parse_args() -> Result<Args, Box<dyn Error>> {
+pub fn run_from_env() -> Result<(), Box<dyn Error>> {
+    run_from_args(std::env::args().skip(1))
+}
+
+pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let args = parse_args_from(args)?;
+    run(args)
+}
+
+fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Error>> {
     let mut model_dir = None;
     let mut prompt = String::from("hello raster");
     let mut raw_prompt = false;
@@ -89,7 +98,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
     let mut only_layers = false;
     let mut only_embedding = false;
     let mut only_ple = false;
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--model" => model_dir = args.next().map(PathBuf::from),
@@ -123,8 +132,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
     })
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
-    let args = parse_args()?;
+fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let tokenizer: serde_json::Value =
         serde_json::from_slice(&fs::read(args.model_dir.join("tokenizer.json"))?)?;
 
