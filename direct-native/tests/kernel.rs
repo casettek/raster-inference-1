@@ -41,6 +41,12 @@ fn tiny_layer(kv_donor_layer: i32) -> TransformerLayer {
             rotary_dim: 0,
             rope_freq_base_dim: 2,
             kv_donor_layer,
+            donor_a_layer: if kv_donor_layer >= 0 {
+                kv_donor_layer
+            } else {
+                -2
+            },
+            donor_b_layer: -3,
             norm_input: norm.clone(),
             norm_post_attn: norm.clone(),
             norm_pre_ffw: norm.clone(),
@@ -70,6 +76,7 @@ fn activation_sequence(values: &[i32]) -> ActivationSequence {
         }]),
         errors: List::new(),
         kv: List::new(),
+        start_position: 0,
     }
 }
 
@@ -82,6 +89,7 @@ fn donor_sequence() -> ActivationSequence {
             k: pack_i32s(&[ONE, 0]),
             v: pack_i32s(&[ONE, 0]),
         }]),
+        start_position: 0,
     }
 }
 
@@ -105,7 +113,9 @@ fn direct_prefill_returns_activation_and_own_kv() {
     let output = run_prefill_range_direct(PrefillRangeDirectInputs {
         activations: &activations,
         layer: &layer,
-        donor_kv: &donor,
+        prior_kv: &donor,
+        donor_a_kv: &donor,
+        donor_b_kv: &donor,
         ple: &ple,
     })
     .unwrap();
@@ -117,7 +127,7 @@ fn direct_prefill_returns_activation_and_own_kv() {
 }
 
 #[test]
-fn donor_layer_still_publishes_own_kv_like_wip() {
+fn donor_layer_carries_prior_kv_and_publishes_own_kv() {
     let activations = activation_sequence(&[ONE, 0]);
     let layer = tiny_layer(0);
     let donor = donor_sequence();
@@ -126,12 +136,15 @@ fn donor_layer_still_publishes_own_kv_like_wip() {
     let output = run_prefill_range_direct(PrefillRangeDirectInputs {
         activations: &activations,
         layer: &layer,
-        donor_kv: &donor,
+        prior_kv: &donor,
+        donor_a_kv: &donor,
+        donor_b_kv: &donor,
         ple: &ple,
     })
     .unwrap();
 
     assert_eq!(output.rows.len(), 1);
-    assert_eq!(output.kv.len(), 1);
+    assert_eq!(output.kv.len(), 2);
     assert_eq!(output.kv[0].position, 0);
+    assert_eq!(output.kv[1].position, 0);
 }

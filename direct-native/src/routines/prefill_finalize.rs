@@ -75,7 +75,7 @@ pub fn run_direct(inputs: &Inputs) -> Result<PrefillLogits> {
     };
 
     Ok(PrefillLogits {
-        decode_position: inputs.activations.rows.len() as u32,
+        decode_position: inputs.activations.start_position + inputs.activations.rows.len() as u32,
         logits: List::from(logits),
         errors: List::new(),
     })

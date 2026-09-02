@@ -751,6 +751,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "decode-embed"
+version = "0.1.0"
+dependencies = [
+ "det-num",
+ "raster",
+ "serde",
+]
+
+[[package]]
 name = "decode-select-token"
 version = "0.1.0"
 dependencies = [
@@ -837,10 +846,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "decode-embed",
  "decode-select-token",
  "det-num",
  "hex",
  "input-embedding",
+ "output-finalize",
  "prefill-finalize",
  "prefill-prepare-aux",
  "prefill-range",
@@ -1911,6 +1922,15 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "output-finalize"
+version = "0.1.0"
+dependencies = [
+ "raster",
+ "serde",
+ "sha2",
+]
 
 [[package]]
 name = "parking_lot"

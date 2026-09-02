@@ -22,17 +22,17 @@ pub struct HybridRun {
     pub selected_stage_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct Manifest {
     chain: ChainSpec,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone)]
 struct ChainSpec {
     stage: Vec<StageSpec>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct StageSpec {
     name: String,
     project: String,
@@ -40,19 +40,117 @@ struct StageSpec {
     inputs: BTreeMap<String, InputBinding>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum InputBinding {
     External(ExternalRef),
     From(String),
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct ExternalRef {
     path: String,
     #[serde(default)]
     index_path: Option<String>,
     commitment: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RasterTomlDoc {
+    chain: ChainTable,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChainTable {
+    #[serde(default, rename = "input")]
+    inputs: BTreeMap<String, InputDecl>,
+    #[serde(default, rename = "stage")]
+    stages: Vec<toml::Spanned<StageSpec>>,
+    #[serde(default, rename = "repeat")]
+    repeats: Vec<toml::Spanned<RepeatSpec>>,
+}
+
+#[derive(Debug)]
+enum ChainItem {
+    Stage(StageSpec),
+    Repeat(RepeatSpec),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum InputDecl {
+    Indexed(IndexedInputDecl),
+    Single(ExternalRef),
+}
+
+#[derive(Debug, Deserialize)]
+struct IndexedInputDecl {
+    index: String,
+    path: String,
+    #[serde(default)]
+    index_path: Option<String>,
+    commitments: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepeatSpec {
+    name: String,
+    index: String,
+    #[serde(default)]
+    start: u32,
+    count: u32,
+    #[serde(default, rename = "stage")]
+    stages: Vec<RepeatStageSpec>,
+    #[serde(default)]
+    exports: BTreeMap<String, ExportDecl>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepeatStageSpec {
+    name: String,
+    project: String,
+    #[serde(default)]
+    index: Option<String>,
+    #[serde(default)]
+    start: u32,
+    #[serde(default)]
+    count: Option<u32>,
+    #[serde(default)]
+    inputs: BTreeMap<String, RepeatBinding>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RepeatBinding {
+    From {
+        from: String,
+        #[serde(default)]
+        first: Option<String>,
+    },
+    Input {
+        input: String,
+    },
+    External {
+        external: ExternalRef,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportDecl {
+    stage: String,
+    entry: String,
+}
+
+#[derive(Clone, Copy)]
+struct TemplateIndex<'a> {
+    name: &'a str,
+    value: u32,
+    start: u32,
+}
+
+enum RenderedTemplate {
+    Text(String),
+    Underflow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,7 +335,248 @@ fn read_manifest(path: &Path) -> Result<Manifest> {
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     text.parse::<toml::Value>()
         .context("failed to parse Raster.toml as TOML")?;
-    toml::from_str(&text).context("failed to decode Raster.toml chain")
+    let doc: RasterTomlDoc = toml::from_str(&text).context("failed to decode Raster.toml chain")?;
+    Ok(Manifest {
+        chain: expand_chain_table(doc.chain)?,
+    })
+}
+
+fn expand_chain_table(table: ChainTable) -> Result<ChainSpec> {
+    let inputs = flatten_input_decls(table.inputs)?;
+    let mut stages = Vec::new();
+    let mut exports = BTreeMap::new();
+
+    for item in merge_chain_items(table.stages, table.repeats) {
+        match item {
+            ChainItem::Stage(stage) => stages.push(stage),
+            ChainItem::Repeat(repeat) => {
+                expand_repeat(&repeat, &inputs, &mut stages, &mut exports)?
+            }
+        }
+    }
+
+    resolve_export_sources(&mut stages, &exports);
+    Ok(ChainSpec { stage: stages })
+}
+
+fn merge_chain_items(
+    stages: Vec<toml::Spanned<StageSpec>>,
+    repeats: Vec<toml::Spanned<RepeatSpec>>,
+) -> Vec<ChainItem> {
+    let mut items: Vec<(usize, ChainItem)> = stages
+        .into_iter()
+        .map(|stage| (stage.span().start, ChainItem::Stage(stage.into_inner())))
+        .chain(
+            repeats
+                .into_iter()
+                .map(|repeat| (repeat.span().start, ChainItem::Repeat(repeat.into_inner()))),
+        )
+        .collect();
+    items.sort_by_key(|(offset, _)| *offset);
+    items.into_iter().map(|(_, item)| item).collect()
+}
+
+fn flatten_input_decls(
+    decls: BTreeMap<String, InputDecl>,
+) -> Result<BTreeMap<String, ExternalRef>> {
+    let mut inputs = BTreeMap::new();
+    for (name, decl) in decls {
+        match decl {
+            InputDecl::Single(external) => {
+                if inputs.insert(name.clone(), external).is_some() {
+                    bail!("chain input `{name}` is declared more than once");
+                }
+            }
+            InputDecl::Indexed(indexed) => {
+                for (member, external) in indexed.flatten(&name)? {
+                    if inputs.insert(member.clone(), external).is_some() {
+                        bail!("chain input `{member}` is declared more than once");
+                    }
+                }
+            }
+        }
+    }
+    Ok(inputs)
+}
+
+impl IndexedInputDecl {
+    fn flatten(self, family: &str) -> Result<Vec<(String, ExternalRef)>> {
+        let placeholder = format!("{{{}}}", self.index);
+        if !self.path.contains(&placeholder) {
+            bail!(
+                "[chain.input.{family}]: path '{}' does not mention '{placeholder}'",
+                self.path
+            );
+        }
+
+        Ok(self
+            .commitments
+            .into_iter()
+            .enumerate()
+            .map(|(idx, commitment)| {
+                let index = idx.to_string();
+                let render = |value: &str| value.replace(&placeholder, &index);
+                (
+                    format!("{family}_{idx}"),
+                    ExternalRef {
+                        path: render(&self.path),
+                        index_path: self.index_path.as_deref().map(render),
+                        commitment,
+                    },
+                )
+            })
+            .collect())
+    }
+}
+
+fn expand_repeat(
+    repeat: &RepeatSpec,
+    inputs: &BTreeMap<String, ExternalRef>,
+    stages: &mut Vec<StageSpec>,
+    exports: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    for outer in repeat.start..repeat.start + repeat.count {
+        let outer_index = TemplateIndex {
+            name: &repeat.index,
+            value: outer,
+            start: repeat.start,
+        };
+        for stage in &repeat.stages {
+            if let (Some(inner_name), Some(inner_count)) = (&stage.index, stage.count) {
+                for inner in stage.start..stage.start + inner_count {
+                    let inner_index = TemplateIndex {
+                        name: inner_name,
+                        value: inner,
+                        start: stage.start,
+                    };
+                    push_repeat_stage(stage, inputs, &[outer_index, inner_index], stages)?;
+                }
+            } else {
+                push_repeat_stage(stage, inputs, &[outer_index], stages)?;
+            }
+        }
+    }
+
+    let export_index = TemplateIndex {
+        name: &repeat.index,
+        value: repeat.start + repeat.count.saturating_sub(1),
+        start: repeat.start,
+    };
+    for (name, export) in &repeat.exports {
+        let source = if repeat.count == 0 {
+            export.entry.clone()
+        } else {
+            render_text(&export.stage, &[export_index])?
+        };
+        exports.insert(format!("{}.{}", repeat.name, name), source);
+    }
+
+    Ok(())
+}
+
+fn push_repeat_stage(
+    template: &RepeatStageSpec,
+    named_inputs: &BTreeMap<String, ExternalRef>,
+    indexes: &[TemplateIndex<'_>],
+    stages: &mut Vec<StageSpec>,
+) -> Result<()> {
+    let mut inputs = BTreeMap::new();
+    for (param, binding) in &template.inputs {
+        inputs.insert(
+            param.clone(),
+            expand_repeat_binding(binding, named_inputs, indexes)?,
+        );
+    }
+    stages.push(StageSpec {
+        name: render_text(&template.name, indexes)?,
+        project: template.project.clone(),
+        inputs,
+    });
+    Ok(())
+}
+
+fn expand_repeat_binding(
+    binding: &RepeatBinding,
+    named_inputs: &BTreeMap<String, ExternalRef>,
+    indexes: &[TemplateIndex<'_>],
+) -> Result<InputBinding> {
+    match binding {
+        RepeatBinding::From { from, first } => match render_template(from, indexes)? {
+            RenderedTemplate::Text(source) => Ok(InputBinding::From(source)),
+            RenderedTemplate::Underflow => {
+                let first = first.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "repeat binding `{from}` underflows but has no `first` fallback"
+                    )
+                })?;
+                Ok(InputBinding::From(render_text(first, indexes)?))
+            }
+        },
+        RepeatBinding::Input { input } => {
+            let name = render_text(input, indexes)?;
+            let external = named_inputs.get(&name).ok_or_else(|| {
+                anyhow::anyhow!("repeat binding names unknown chain input `{name}`")
+            })?;
+            Ok(InputBinding::External(external.clone()))
+        }
+        RepeatBinding::External { external } => Ok(InputBinding::External(external.clone())),
+    }
+}
+
+fn resolve_export_sources(stages: &mut [StageSpec], exports: &BTreeMap<String, String>) {
+    for stage in stages {
+        for binding in stage.inputs.values_mut() {
+            if let InputBinding::From(source) = binding {
+                if let Some(target) = exports.get(source) {
+                    *source = target.clone();
+                }
+            }
+        }
+    }
+}
+
+fn render_text(template: &str, indexes: &[TemplateIndex<'_>]) -> Result<String> {
+    match render_template(template, indexes)? {
+        RenderedTemplate::Text(value) => Ok(value),
+        RenderedTemplate::Underflow => {
+            bail!("template `{template}` underflows outside a `first` binding")
+        }
+    }
+}
+
+fn render_template(template: &str, indexes: &[TemplateIndex<'_>]) -> Result<RenderedTemplate> {
+    let mut rendered = String::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        rendered.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        let close = after_open.find('}').ok_or_else(|| {
+            anyhow::anyhow!("template `{template}` has an unterminated placeholder")
+        })?;
+        let placeholder = &after_open[..close];
+        let (name, previous) = placeholder
+            .strip_suffix("-1")
+            .map(|name| (name, true))
+            .unwrap_or((placeholder, false));
+        let index = indexes
+            .iter()
+            .find(|index| index.name == name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("template `{template}` references unknown index `{name}`")
+            })?;
+        if previous && index.value == index.start {
+            return Ok(RenderedTemplate::Underflow);
+        }
+        let value = if previous {
+            index.value - 1
+        } else {
+            index.value
+        };
+        rendered.push_str(&value.to_string());
+        rest = &after_open[close + 1..];
+    }
+    rendered.push_str(rest);
+    Ok(RenderedTemplate::Text(rendered))
 }
 
 fn validate_supported_stages(stages: &[StageSpec]) -> Result<()> {
@@ -1249,8 +1588,8 @@ mod tests {
             }
         }
 
-        assert_eq!(manifest.chain.stage.len(), 74);
-        assert_eq!(direct, 73);
+        assert_eq!(manifest.chain.stage.len(), 221);
+        assert_eq!(direct, 220);
         assert_eq!(reference, 1);
     }
 
@@ -1271,9 +1610,48 @@ mod tests {
             }
         }
 
-        assert_eq!(manifest.chain.stage.len(), 74);
-        assert_eq!(direct, 74);
+        assert_eq!(manifest.chain.stage.len(), 221);
+        assert_eq!(direct, 221);
         assert_eq!(reference, 0);
+    }
+
+    #[test]
+    fn real_manifest_expands_decode_repeat_and_export() {
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Raster.toml");
+        let manifest = read_manifest(&manifest_path).unwrap();
+        let index = build_stage_index(&manifest.chain.stage).unwrap();
+
+        assert!(index.contains_key("decode_select_t0"));
+        assert!(index.contains_key("decode_embed_t1"));
+        assert!(index.contains_key("decode_range_t1_l34"));
+
+        let output = manifest.chain.stage.last().unwrap();
+        assert_eq!(output.name, "output_finalize");
+        assert_eq!(
+            output.inputs.get("edge"),
+            Some(&InputBinding::From(String::from("decode_select_t1")))
+        );
+    }
+
+    #[test]
+    fn prefill_only_manifest_resolves_zero_count_decode_export() {
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Raster.toml.prefill-only");
+        let manifest = read_manifest(&manifest_path).unwrap();
+        let index = build_stage_index(&manifest.chain.stage).unwrap();
+
+        assert!(!index.contains_key("decode_select_t0"));
+        let output = manifest.chain.stage.last().unwrap();
+        assert_eq!(output.name, "output_finalize");
+        assert_eq!(
+            output.inputs.get("edge"),
+            Some(&InputBinding::From(String::from("decode_init")))
+        );
     }
 
     #[test]

@@ -8,8 +8,11 @@ use serde::Serialize;
 use crate::artifact_io::{encode_output, write_output, EncodedArtifact};
 use crate::cache::{CachedInputs, CachedStageValue};
 
+pub mod decode_embed;
+pub mod decode_init;
 pub mod decode_select_token;
 pub mod input_embedding;
+pub mod output_finalize;
 pub mod prefill_finalize;
 pub mod prefill_prepare_aux;
 pub mod prefill_range;
@@ -22,7 +25,10 @@ pub enum StageKind {
     PrefillPrepareAux { layer: usize },
     PrefillRange { layer: usize },
     PrefillFinalize,
+    DecodeInit,
     DecodeSelectToken,
+    DecodeEmbed,
+    OutputFinalize,
 }
 
 #[derive(Debug)]
@@ -47,15 +53,32 @@ pub struct DirectTimings {
 
 impl StageKind {
     pub fn from_stage_spec(project: &str, name: &str) -> Result<Self> {
-        let kind = Self::from_stage_name(name)?;
-        if kind.project() != project {
-            bail!(
-                "stage `{name}` uses project `{project}`, expected `{}` for direct-native {}",
-                kind.project(),
-                kind.routine()
-            );
+        match project {
+            "prompt-prepare" if name == "prompt_prepare" => Ok(Self::PromptPrepare),
+            "input-embedding" if name == "input_embedding" => Ok(Self::InputEmbedding),
+            "prefill-prepare-aux" => Ok(Self::PrefillPrepareAux {
+                layer: parse_trailing_layer_index(name)?,
+            }),
+            "prefill-range" => Ok(Self::PrefillRange {
+                layer: parse_trailing_layer_index(name)?,
+            }),
+            "prefill-finalize"
+                if name == "prefill_finalize" || name.starts_with("decode_finalize_t") =>
+            {
+                Ok(Self::PrefillFinalize)
+            }
+            "decode-init" if name == "decode_init" => Ok(Self::DecodeInit),
+            "decode-select-token"
+                if name == "decode_select_token" || name.starts_with("decode_select_t") =>
+            {
+                Ok(Self::DecodeSelectToken)
+            }
+            "decode-embed" if name == "decode_embed" || name.starts_with("decode_embed_t") => {
+                Ok(Self::DecodeEmbed)
+            }
+            "output-finalize" if name == "output_finalize" => Ok(Self::OutputFinalize),
+            _ => bail!("stage `{name}` with project `{project}` is not supported by direct-native"),
         }
-        Ok(kind)
     }
 
     pub fn from_stage_dir(stage_dir: &Path) -> Result<Self> {
@@ -71,12 +94,24 @@ impl StageKind {
             "prompt_prepare" => Ok(Self::PromptPrepare),
             "input_embedding" => Ok(Self::InputEmbedding),
             "prefill_finalize" => Ok(Self::PrefillFinalize),
+            "decode_init" => Ok(Self::DecodeInit),
             "decode_select_token" => Ok(Self::DecodeSelectToken),
+            "decode_embed" => Ok(Self::DecodeEmbed),
+            "output_finalize" => Ok(Self::OutputFinalize),
+            _ if name.starts_with("decode_select_t") => Ok(Self::DecodeSelectToken),
+            _ if name.starts_with("decode_embed_t") => Ok(Self::DecodeEmbed),
+            _ if name.starts_with("decode_finalize_t") => Ok(Self::PrefillFinalize),
             _ if name.starts_with("prefill_prepare_aux_l") => Ok(Self::PrefillPrepareAux {
                 layer: parse_layer_index(name, "prefill_prepare_aux_l")?,
             }),
             _ if name.starts_with("prefill_range_l") => Ok(Self::PrefillRange {
                 layer: parse_layer_index(name, "prefill_range_l")?,
+            }),
+            _ if name.starts_with("decode_aux_t") => Ok(Self::PrefillPrepareAux {
+                layer: parse_trailing_layer_index(name)?,
+            }),
+            _ if name.starts_with("decode_range_t") => Ok(Self::PrefillRange {
+                layer: parse_trailing_layer_index(name)?,
             }),
             _ => bail!("stage `{name}` is not supported by direct-native"),
         }
@@ -89,7 +124,10 @@ impl StageKind {
             Self::PrefillPrepareAux { .. } => "prefill-prepare-aux",
             Self::PrefillRange { .. } => "prefill-range",
             Self::PrefillFinalize => "prefill-finalize",
+            Self::DecodeInit => "decode-init",
             Self::DecodeSelectToken => "decode-select-token",
+            Self::DecodeEmbed => "decode-embed",
+            Self::OutputFinalize => "output-finalize",
         }
     }
 
@@ -100,7 +138,10 @@ impl StageKind {
             Self::PrefillPrepareAux { .. } => "prefill_prepare_aux",
             Self::PrefillRange { .. } => "prefill_range",
             Self::PrefillFinalize => "prefill_finalize",
+            Self::DecodeInit => "decode_init",
             Self::DecodeSelectToken => "decode_select_token",
+            Self::DecodeEmbed => "decode_embed",
+            Self::OutputFinalize => "output_finalize",
         }
     }
 
@@ -110,7 +151,10 @@ impl StageKind {
             Self::PromptPrepare
             | Self::InputEmbedding
             | Self::PrefillFinalize
-            | Self::DecodeSelectToken => None,
+            | Self::DecodeInit
+            | Self::DecodeSelectToken
+            | Self::DecodeEmbed
+            | Self::OutputFinalize => None,
         }
     }
 }
@@ -142,10 +186,25 @@ pub fn run_for_compare(kind: &StageKind) -> Result<DirectCompareOutput> {
             prefill_finalize::run_direct,
             "prefill_finalize",
         ),
+        StageKind::DecodeInit => compare(
+            decode_init::load_inputs_from_args,
+            decode_init::run_direct,
+            "decode_init",
+        ),
         StageKind::DecodeSelectToken => compare(
             decode_select_token::load_inputs_from_args,
             decode_select_token::run_direct,
             "decode_select_token",
+        ),
+        StageKind::DecodeEmbed => compare(
+            decode_embed::load_inputs_from_args,
+            decode_embed::run_direct,
+            "decode_embed",
+        ),
+        StageKind::OutputFinalize => compare(
+            output_finalize::load_inputs_from_args,
+            output_finalize::run_direct,
+            "output_finalize",
         ),
     }
 }
@@ -182,11 +241,29 @@ pub fn run_and_publish(kind: &StageKind) -> Result<DirectPublishOutput> {
             "prefill_finalize",
             CachedStageValue::PrefillLogits,
         ),
+        StageKind::DecodeInit => publish(
+            decode_init::load_inputs_from_args,
+            decode_init::run_direct,
+            "decode_init",
+            CachedStageValue::DecodeEdge,
+        ),
         StageKind::DecodeSelectToken => publish(
             decode_select_token::load_inputs_from_args,
             decode_select_token::run_direct,
             "decode_select_token",
-            CachedStageValue::SelectedToken,
+            CachedStageValue::DecodeEdge,
+        ),
+        StageKind::DecodeEmbed => publish(
+            decode_embed::load_inputs_from_args,
+            decode_embed::run_direct,
+            "decode_embed",
+            CachedStageValue::DecodeActivations,
+        ),
+        StageKind::OutputFinalize => publish(
+            output_finalize::load_inputs_from_args,
+            output_finalize::run_direct,
+            "output_finalize",
+            CachedStageValue::GeneratedOutput,
         ),
     }
 }
@@ -258,6 +335,12 @@ pub fn run_and_publish_from_paths(
             "prefill_finalize",
             CachedStageValue::PrefillLogits,
         ),
+        StageKind::DecodeInit => publish(
+            || decode_init::load_inputs_from_paths(input_path, input_manifest_path, cached_inputs),
+            decode_init::run_direct,
+            "decode_init",
+            CachedStageValue::DecodeEdge,
+        ),
         StageKind::DecodeSelectToken => publish(
             || {
                 decode_select_token::load_inputs_from_paths(
@@ -268,7 +351,25 @@ pub fn run_and_publish_from_paths(
             },
             decode_select_token::run_direct,
             "decode_select_token",
-            CachedStageValue::SelectedToken,
+            CachedStageValue::DecodeEdge,
+        ),
+        StageKind::DecodeEmbed => publish(
+            || decode_embed::load_inputs_from_paths(input_path, input_manifest_path, cached_inputs),
+            decode_embed::run_direct,
+            "decode_embed",
+            CachedStageValue::DecodeActivations,
+        ),
+        StageKind::OutputFinalize => publish(
+            || {
+                output_finalize::load_inputs_from_paths(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                )
+            },
+            output_finalize::run_direct,
+            "output_finalize",
+            CachedStageValue::GeneratedOutput,
         ),
     }
 }
@@ -346,6 +447,15 @@ fn parse_layer_index(name: &str, prefix: &str) -> Result<usize> {
     let raw = name
         .strip_prefix(prefix)
         .expect("caller checked stage name prefix");
+    raw.parse::<usize>()
+        .with_context(|| format!("failed to parse layer index from `{name}`"))
+}
+
+fn parse_trailing_layer_index(name: &str) -> Result<usize> {
+    let raw = name
+        .rsplit_once("_l")
+        .map(|(_, layer)| layer)
+        .ok_or_else(|| anyhow::anyhow!("stage `{name}` has no trailing `_lN` layer index"))?;
     raw.parse::<usize>()
         .with_context(|| format!("failed to parse layer index from `{name}`"))
 }

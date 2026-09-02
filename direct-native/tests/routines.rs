@@ -1,6 +1,7 @@
-use decode_select_token::input::{LogitEntry, PrefillLogits};
+use decode_select_token::input::{DecodeEdge, LogitEntry, PrefillLogits};
 use direct_native::routines;
 use input_embedding::input::{EmbeddingTable, PromptTokenization};
+use output_finalize::input::{DecoderTable, DecoderToken};
 use prefill_finalize::input::{FinalHead, FinalHeadParams};
 use prefill_prepare_aux::input::{PleLayer, PleLayerParams};
 use prompt_prepare::input::{BpePieces, MergeBucket, PromptTokenizer, TokenEntry, VocabBucket};
@@ -38,12 +39,94 @@ fn decode_select_token_keeps_first_token_on_tie() {
                 ]),
                 errors: List::new(),
             },
+            prior: DecodeEdge {
+                has_selected: true,
+                decode_position: 8,
+                token_id: 11,
+                value: 1,
+                generated_token_ids: List::from(vec![11, 12]),
+            },
         })
         .unwrap();
 
+    assert!(output.has_selected);
     assert_eq!(output.decode_position, 9);
     assert_eq!(output.token_id, 5);
     assert_eq!(output.value, 10);
+    assert_eq!(output.generated_token_ids.as_slice(), &[11, 12, 5]);
+}
+
+#[test]
+fn decode_init_outputs_empty_edge() {
+    let output = routines::decode_init::run_direct(&routines::decode_init::Inputs).unwrap();
+
+    assert!(!output.has_selected);
+    assert_eq!(output.decode_position, 0);
+    assert_eq!(output.token_id, 0);
+    assert_eq!(output.value, 0);
+    assert!(output.generated_token_ids.is_empty());
+}
+
+#[test]
+fn decode_embed_uses_selected_decode_position() {
+    let output = routines::decode_embed::run_direct(&routines::decode_embed::Inputs {
+        selected: decode_embed::input::DecodeEdge {
+            has_selected: true,
+            decode_position: 9,
+            token_id: 1,
+            value: 10,
+            generated_token_ids: List::from(vec![1]),
+        },
+        embedding: decode_embed::input::EmbeddingTable {
+            hidden_size: 2,
+            embedding_scale: ONE,
+            values: decode_embed::input::EmbeddingTable {
+                hidden_size: 2,
+                embedding_scale: ONE,
+                values: paged(&[0, 0, ONE, 2 * ONE]),
+            }
+            .values,
+        },
+    })
+    .unwrap();
+
+    assert_eq!(output.rows.len(), 1);
+    assert_eq!(output.rows[0].token_id, 1);
+    assert_eq!(output.start_position, 9);
+    assert!(output.errors.is_empty());
+}
+
+#[test]
+fn output_finalize_decodes_generated_ids() {
+    let output = routines::output_finalize::run_direct(&routines::output_finalize::Inputs {
+        edge: output_finalize::input::DecodeEdge {
+            has_selected: true,
+            decode_position: 2,
+            token_id: 1,
+            value: 10,
+            generated_token_ids: List::from(vec![0, 1]),
+        },
+        decoder: DecoderTable {
+            tokens: List::from(vec![
+                DecoderToken {
+                    token: "▁Hi".to_string(),
+                    special: false,
+                    terminal: false,
+                },
+                DecoderToken {
+                    token: "!".to_string(),
+                    special: false,
+                    terminal: false,
+                },
+            ]),
+        },
+    })
+    .unwrap();
+
+    assert_eq!(output.generated_token_count, 2);
+    assert_eq!(output.generated_token_ids.as_slice(), &[0, 1]);
+    assert_eq!(output.generated_text, " Hi!");
+    assert_eq!(output.stop_reason, "max_new_tokens");
 }
 
 #[test]
@@ -99,6 +182,7 @@ fn prefill_prepare_aux_publishes_one_row() {
         }]),
         errors: List::new(),
         kv: List::new(),
+        start_position: 0,
     };
 
     let output =
@@ -153,6 +237,7 @@ fn prefill_prepare_aux_preserves_prompt_row_order() {
                 rows: List::from(rows),
                 errors: List::new(),
                 kv: List::new(),
+                start_position: 0,
             },
             layer: layer(),
         })
@@ -187,6 +272,7 @@ fn prefill_finalize_scores_projection_rows() {
         }]),
         errors: List::new(),
         kv: List::new(),
+        start_position: 4,
     };
 
     let output = routines::prefill_finalize::run_direct(&routines::prefill_finalize::Inputs {
@@ -203,7 +289,7 @@ fn prefill_finalize_scores_projection_rows() {
     })
     .unwrap();
 
-    assert_eq!(output.decode_position, 1);
+    assert_eq!(output.decode_position, 5);
     assert_eq!(output.logits.len(), 2);
     assert!(output.errors.is_empty());
 }

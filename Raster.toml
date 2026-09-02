@@ -90,7 +90,7 @@ commitments = [
 name = "prompt_prepare"
 project = "prompt-prepare"
 inputs.tokenizer = { external = { path = "prompt-prepare/tokenizer.rastered", index_path = "prompt-prepare/tokenizer.rindex", commitment = "aa9b15cfd910f92b91638a8af385aef31f5166466d7871652946f32575812718" } }
-inputs.initial_pieces = { external = { path = "prompt-prepare/initial_pieces.rastered", index_path = "prompt-prepare/initial_pieces.rindex", commitment = "8c07b6cd3c364f072de7412008f080e9ea18d01061a7a59654124f86ff109a1d" } }
+inputs.initial_pieces = { external = { path = "prompt-prepare/initial_pieces.rastered", index_path = "prompt-prepare/initial_pieces.rindex", commitment = "9e57ad49a172b880f9c7bad97bf513dbd5644c516dbac7c41b4db5b29deab60b" } }
 
 [[chain.stage]]
 name = "input_embedding"

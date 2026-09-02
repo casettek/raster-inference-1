@@ -11,10 +11,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+decode-embed = { path = "../decode-embed" }
 decode-select-token = { path = "../decode-select-token" }
 det-num = { path = "../det-num" }
 hex = "0.4"
 input-embedding = { path = "../input-embedding" }
+output-finalize = { path = "../output-finalize" }
 prefill-range = { path = "../prefill-range" }
 prefill-finalize = { path = "../prefill-finalize" }
 prefill-prepare-aux = { path = "../prefill-prepare-aux" }

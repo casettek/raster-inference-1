@@ -16,7 +16,9 @@ use ::prefill_range::input::{
 pub struct PrefillRangeDirectInputs<'a> {
     pub activations: &'a ActivationSequence,
     pub layer: &'a TransformerLayer,
-    pub donor_kv: &'a ActivationSequence,
+    pub prior_kv: &'a ActivationSequence,
+    pub donor_a_kv: &'a ActivationSequence,
+    pub donor_b_kv: &'a ActivationSequence,
     pub ple: &'a PleLayerInputs,
 }
 
@@ -36,15 +38,34 @@ pub fn run_prefill_range_direct(
         });
     }
 
-    let (queries, own_keys) = project_tokens(&input_rows, &weights, &params)?;
-    let donor_keys = inputs.donor_kv.kv.as_slice();
+    let (queries, own_keys) = project_tokens(
+        &input_rows,
+        &weights,
+        &params,
+        inputs.activations.start_position,
+    )?;
     let ple_rows = inputs.ple.rows.as_slice();
-    let output_rows = attend_tokens(&queries, &own_keys, donor_keys, ple_rows, &weights, &params)?;
+    let output_rows = attend_tokens(
+        &queries,
+        inputs.prior_kv.kv.as_slice(),
+        &own_keys,
+        inputs.donor_a_kv.kv.as_slice(),
+        inputs.donor_b_kv.kv.as_slice(),
+        ple_rows,
+        &weights,
+        &params,
+    )?;
+    let output_kv = output_kv(
+        inputs.prior_kv.kv.as_slice(),
+        &own_keys,
+        inputs.activations.start_position,
+        params.sliding_window,
+    );
 
     Ok(ActivationSequence {
         rows: List::from(output_rows),
         errors: List::new(),
-        kv: List::from(own_keys),
+        kv: List::from(output_kv),
         start_position: inputs.activations.start_position,
     })
 }
@@ -62,6 +83,7 @@ impl InputRows {
 
 struct QueryState {
     position: u32,
+    local: u32,
     token_id: u32,
     q: Vec<i32>,
     residual: Vec<i32>,
@@ -154,6 +176,21 @@ fn validate_layer_params(params: &LayerParams) -> Result<LayerParams> {
     if params.norm_eps < 0 {
         bail!("rms-norm epsilon must be non-negative");
     }
+    if params.donor_a_layer == -1 || params.donor_b_layer == -1 {
+        bail!("donor candidate -1 is reserved for a layer's own cache");
+    }
+    if params.kv_donor_layer >= 0
+        && params.kv_donor_layer != params.donor_a_layer
+        && params.kv_donor_layer != params.donor_b_layer
+    {
+        bail!(
+            "layer {} borrows K/V from {}, outside committed candidates {} and {}",
+            params.layer_idx,
+            params.kv_donor_layer,
+            params.donor_a_layer,
+            params.donor_b_layer
+        );
+    }
 
     for (name, page, values) in [
         ("norm_input", &params.norm_input, hidden),
@@ -199,6 +236,7 @@ fn project_tokens(
     rows: &InputRows,
     weights: &LayerWeights,
     params: &LayerParams,
+    start_position: u32,
 ) -> Result<(Vec<QueryState>, Vec<KeyRow>)> {
     let norm_input = unpack_page_i32s(&params.norm_input)?;
     let q_norm = unpack_page_i32s(&params.q_norm)?;
@@ -225,7 +263,8 @@ fn project_tokens(
     let mut queries = Vec::with_capacity(rows.rows());
     let mut keys = Vec::with_capacity(rows.rows());
     for row_idx in 0..rows.rows() {
-        let position = row_idx as u32;
+        let local = row_idx as u32;
+        let position = start_position + local;
         let q_row = q.row(row_idx).to_vec();
         let k_row = k.row(row_idx).to_vec();
         let v_row = v.row(row_idx).to_vec();
@@ -241,6 +280,7 @@ fn project_tokens(
         }
         queries.push(QueryState {
             position,
+            local,
             token_id: rows.token_ids[row_idx],
             q: q_row,
             residual: rows.slab.row(row_idx).to_vec(),
@@ -324,8 +364,10 @@ fn apply_rope(head: &mut [i32], params: &LayerParams, position: u32) {
 
 fn attend_tokens(
     queries: &[QueryState],
+    prior_keys: &[KeyRow],
     own_keys: &[KeyRow],
-    donor_keys: &[KeyRow],
+    donor_a_keys: &[KeyRow],
+    donor_b_keys: &[KeyRow],
     ple_rows: &[PleRow],
     weights: &LayerWeights,
     params: &LayerParams,
@@ -333,30 +375,63 @@ fn attend_tokens(
     if crate::tensor::use_parallel() {
         queries
             .par_iter()
-            .map(|query| attend_token(query, own_keys, donor_keys, ple_rows, weights, params))
+            .map(|query| {
+                attend_token(
+                    query,
+                    prior_keys,
+                    own_keys,
+                    donor_a_keys,
+                    donor_b_keys,
+                    ple_rows,
+                    weights,
+                    params,
+                )
+            })
             .collect()
     } else {
         queries
             .iter()
-            .map(|query| attend_token(query, own_keys, donor_keys, ple_rows, weights, params))
+            .map(|query| {
+                attend_token(
+                    query,
+                    prior_keys,
+                    own_keys,
+                    donor_a_keys,
+                    donor_b_keys,
+                    ple_rows,
+                    weights,
+                    params,
+                )
+            })
             .collect()
     }
 }
 
 fn attend_token(
     query: &QueryState,
+    prior_keys: &[KeyRow],
     own_keys: &[KeyRow],
-    donor_keys: &[KeyRow],
+    donor_a_keys: &[KeyRow],
+    donor_b_keys: &[KeyRow],
     ple_rows: &[PleRow],
     weights: &LayerWeights,
     params: &LayerParams,
 ) -> Result<ActivationRow> {
-    let active_keys = if params.kv_donor_layer >= 0 {
-        donor_keys
+    let context = if params.kv_donor_layer == -1 {
+        attention_context(query, &[prior_keys, own_keys], params)?
+    } else if params.kv_donor_layer == params.donor_a_layer {
+        attention_context(query, &[donor_a_keys], params)?
+    } else if params.kv_donor_layer == params.donor_b_layer {
+        attention_context(query, &[donor_b_keys], params)?
     } else {
-        own_keys
+        bail!(
+            "layer {} borrows K/V from {}, outside committed candidates {} and {}",
+            params.layer_idx,
+            params.kv_donor_layer,
+            params.donor_a_layer,
+            params.donor_b_layer
+        );
     };
-    let context = attention_context(query, active_keys, params)?;
     let attn_proj = weights.w_o.matvec(&context)?;
     let residual = attn_residual(query, attn_proj, params)?;
     let ff_in = pre_ff_norm(&residual, params)?;
@@ -366,8 +441,8 @@ fn attend_token(
     let ff = weights.w_down.matvec(&gated)?;
     let xs = finish_mlp(&residual, &ff_in, ff, params)?;
     let ple_row = ple_rows
-        .get(query.position as usize)
-        .ok_or_else(|| anyhow::anyhow!("missing PLE row at position {}", query.position))?;
+        .get(query.local as usize)
+        .ok_or_else(|| anyhow::anyhow!("missing PLE row at local position {}", query.local))?;
     let ple_gate = weights.ple_input_gate.matvec(&xs)?;
     let ple_gated = ple_gate_mul(ple_gate, ple_row)?;
     let projected = weights.ple_layer_projection.matvec(&ple_gated)?;
@@ -380,16 +455,19 @@ fn attend_token(
 
 fn attention_context(
     query: &QueryState,
-    keys: &[KeyRow],
+    key_sources: &[&[KeyRow]],
     params: &LayerParams,
 ) -> Result<Vec<i32>> {
     let heads = params.num_heads as usize;
     let kv_heads = params.num_kv_heads as usize;
     let head_dim = params.head_dim as usize;
     let group = heads / kv_heads.max(1);
+    let start = window_start(query.position, params.sliding_window);
+    let window_len = query.position.saturating_sub(start) as usize + 1;
     let mut visible = Vec::new();
-    let mut scores = Vec::new();
-    for (index, key) in keys.iter().enumerate() {
+    let mut scores = vec![0_i32; window_len * heads];
+    let mut filled = 0usize;
+    for key in key_sources.iter().flat_map(|keys| keys.iter()) {
         if !is_visible(query.position, key.position, params.sliding_window) {
             continue;
         }
@@ -406,20 +484,28 @@ fn attention_context(
             let kv_head = head / group.max(1);
             let q_head = &query.q[head * head_dim..(head + 1) * head_dim];
             let k_head = &k[kv_head * head_dim..(kv_head + 1) * head_dim];
-            scores.push(dot_bits(q_head, k_head));
+            let slot = key
+                .position
+                .checked_sub(start)
+                .ok_or_else(|| anyhow::anyhow!("visible key precedes the attention window"))?
+                as usize;
+            if slot >= window_len {
+                bail!("visible key falls outside the weight list");
+            }
+            scores[slot * heads + head] = dot_bits(q_head, k_head);
         }
-        visible.push((index, key));
+        visible.push(key);
+        filled += 1;
     }
-    if visible.is_empty() {
-        bail!("attention saw no keys at or before this token");
+    if filled != window_len {
+        bail!("attention window has {filled} of {window_len} positions scored");
     }
 
-    let count = visible.len();
     let mut weights = scores.clone();
-    let mut logits = Vec::with_capacity(count);
+    let mut logits = Vec::with_capacity(window_len);
     for head in 0..heads {
         logits.clear();
-        for key in 0..count {
+        for key in 0..window_len {
             logits.push(Act::from_bits(scores[key * heads + head]));
         }
         let head_weights = attention_softmax(&logits);
@@ -428,13 +514,14 @@ fn attention_context(
         }
     }
 
-    let start = window_start(query.position, params.sliding_window) as usize;
     let mut acc = vec![0_i64; heads * head_dim];
-    for (list_index, key) in &visible {
-        let slot = list_index
+    for key in &visible {
+        let slot = key
+            .position
             .checked_sub(start)
             .ok_or_else(|| anyhow::anyhow!("visible key precedes the attention window"))?;
-        if slot >= count {
+        let slot = slot as usize;
+        if slot >= window_len {
             bail!("visible key falls outside the weight list");
         }
         let v = unpack_page_i32s(&key.v)?;
@@ -456,6 +543,21 @@ fn attention_context(
         }
     }
     Ok(acc.into_iter().map(requantize_acc).collect())
+}
+
+fn output_kv(
+    prior_keys: &[KeyRow],
+    own_keys: &[KeyRow],
+    start_position: u32,
+    sliding_window: u32,
+) -> Vec<KeyRow> {
+    let keep_from = window_start(start_position, sliding_window);
+    prior_keys
+        .iter()
+        .filter(|key| key.position >= keep_from)
+        .cloned()
+        .chain(own_keys.iter().cloned())
+        .collect()
 }
 
 fn window_start(query_position: u32, sliding_window: u32) -> u32 {
@@ -575,6 +677,8 @@ mod tests {
             rotary_dim: 0,
             rope_freq_base_dim: 2,
             kv_donor_layer: -1,
+            donor_a_layer: -2,
+            donor_b_layer: -3,
             norm_input: pack_i32s(&[1 << 16, 1 << 16]),
             norm_post_attn: pack_i32s(&[1 << 16, 1 << 16]),
             norm_pre_ffw: pack_i32s(&[1 << 16, 1 << 16]),

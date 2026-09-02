@@ -11,7 +11,9 @@ pub use crate::prefill_range::{run_prefill_range_direct, PrefillRangeDirectInput
 pub struct Inputs {
     pub activations: ActivationSequence,
     pub layer: TransformerLayer,
-    pub donor_kv: ActivationSequence,
+    pub prior_kv: ActivationSequence,
+    pub donor_a_kv: ActivationSequence,
+    pub donor_b_kv: ActivationSequence,
     pub ple: PleLayerInputs,
 }
 
@@ -33,7 +35,9 @@ pub fn run_direct(inputs: &Inputs) -> Result<ActivationSequence> {
     run_prefill_range_direct(PrefillRangeDirectInputs {
         activations: &inputs.activations,
         layer: &inputs.layer,
-        donor_kv: &inputs.donor_kv,
+        prior_kv: &inputs.prior_kv,
+        donor_a_kv: &inputs.donor_a_kv,
+        donor_b_kv: &inputs.donor_b_kv,
         ple: &inputs.ple,
     })
 }
@@ -42,7 +46,9 @@ fn load_inputs_from_initialized_runtime(cached_inputs: &CachedInputs) -> Result<
     let binding = raster::start_program(&[
         raster::entry_argument_spec::<ActivationSequence>("activations"),
         raster::entry_argument_spec::<TransformerLayer>("layer"),
-        raster::entry_argument_spec::<ActivationSequence>("donor_kv"),
+        raster::entry_argument_spec::<ActivationSequence>("prior_kv"),
+        raster::entry_argument_spec::<ActivationSequence>("donor_a_kv"),
+        raster::entry_argument_spec::<ActivationSequence>("donor_b_kv"),
         raster::entry_argument_spec::<PleLayerInputs>("ple"),
     ])?;
 
@@ -55,11 +61,23 @@ fn load_inputs_from_initialized_runtime(cached_inputs: &CachedInputs) -> Result<
     let layer = raster::materialize_auth_return(
         raster::entry_argument_auth_ref::<TransformerLayer>(binding.reference.clone(), "layer"),
     );
-    let donor_kv = match cached_inputs.get("donor_kv") {
+    let prior_kv = match cached_inputs.get("prior_kv") {
         Some(value) => value.as_range_activation_sequence()?,
         None => raster::materialize_auth_return(raster::entry_argument_auth_ref::<
             ActivationSequence,
-        >(binding.reference.clone(), "donor_kv")),
+        >(binding.reference.clone(), "prior_kv")),
+    };
+    let donor_a_kv = match cached_inputs.get("donor_a_kv") {
+        Some(value) => value.as_range_activation_sequence()?,
+        None => raster::materialize_auth_return(raster::entry_argument_auth_ref::<
+            ActivationSequence,
+        >(binding.reference.clone(), "donor_a_kv")),
+    };
+    let donor_b_kv = match cached_inputs.get("donor_b_kv") {
+        Some(value) => value.as_range_activation_sequence()?,
+        None => raster::materialize_auth_return(raster::entry_argument_auth_ref::<
+            ActivationSequence,
+        >(binding.reference.clone(), "donor_b_kv")),
     };
     let ple = match cached_inputs.get("ple") {
         Some(value) => value.as_range_ple_inputs()?,
@@ -72,7 +90,9 @@ fn load_inputs_from_initialized_runtime(cached_inputs: &CachedInputs) -> Result<
     Ok(Inputs {
         activations,
         layer,
-        donor_kv,
+        prior_kv,
+        donor_a_kv,
+        donor_b_kv,
         ple,
     })
 }

@@ -3,8 +3,10 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Result};
 use raster::List;
 
+use decode_embed::input as decode_embed_input;
 use decode_select_token::input as decode_input;
 use input_embedding::input as embedding_input;
+use output_finalize::input as output_input;
 use prefill_finalize::input as finalize_input;
 use prefill_prepare_aux::input as aux_input;
 use prefill_range::input as range_input;
@@ -17,7 +19,9 @@ pub enum CachedStageValue {
     PleLayerInputs(aux_input::PleLayerInputs),
     RangeActivations(range_input::ActivationSequence),
     PrefillLogits(finalize_input::PrefillLogits),
-    SelectedToken(decode_input::SelectedToken),
+    DecodeEdge(decode_input::DecodeEdge),
+    DecodeActivations(decode_embed_input::ActivationSequence),
+    GeneratedOutput(output_input::GeneratedOutput),
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +81,7 @@ impl CachedStageValue {
     pub fn as_aux_activation_sequence(&self) -> Result<aux_input::ActivationSequence> {
         match self {
             Self::EmbeddedActivations(value) => Ok(aux_activation_from_embedding(value)),
+            Self::DecodeActivations(value) => Ok(aux_activation_from_decode_embed(value)),
             Self::RangeActivations(value) => Ok(aux_activation_from_range(value)),
             _ => bail!("cached value is not an activation sequence"),
         }
@@ -85,6 +90,7 @@ impl CachedStageValue {
     pub fn as_range_activation_sequence(&self) -> Result<range_input::ActivationSequence> {
         match self {
             Self::EmbeddedActivations(value) => Ok(range_activation_from_embedding(value)),
+            Self::DecodeActivations(value) => Ok(range_activation_from_decode_embed(value)),
             Self::RangeActivations(value) => Ok(value.clone()),
             _ => bail!("cached value is not an activation sequence"),
         }
@@ -100,6 +106,7 @@ impl CachedStageValue {
     pub fn as_finalize_activation_sequence(&self) -> Result<finalize_input::ActivationSequence> {
         match self {
             Self::EmbeddedActivations(value) => Ok(finalize_activation_from_embedding(value)),
+            Self::DecodeActivations(value) => Ok(finalize_activation_from_decode_embed(value)),
             Self::RangeActivations(value) => Ok(finalize_activation_from_range(value)),
             _ => bail!("cached value is not an activation sequence"),
         }
@@ -109,6 +116,27 @@ impl CachedStageValue {
         match self {
             Self::PrefillLogits(value) => Ok(decode_logits_from_finalize(value)),
             _ => bail!("cached value is not prefill logits"),
+        }
+    }
+
+    pub fn as_decode_edge(&self) -> Result<decode_input::DecodeEdge> {
+        match self {
+            Self::DecodeEdge(value) => Ok(value.clone()),
+            _ => bail!("cached value is not a decode edge"),
+        }
+    }
+
+    pub fn as_decode_embed_edge(&self) -> Result<decode_embed_input::DecodeEdge> {
+        match self {
+            Self::DecodeEdge(value) => Ok(decode_embed_edge_from_decode(value)),
+            _ => bail!("cached value is not a decode edge"),
+        }
+    }
+
+    pub fn as_output_edge(&self) -> Result<output_input::DecodeEdge> {
+        match self {
+            Self::DecodeEdge(value) => Ok(output_edge_from_decode(value)),
+            _ => bail!("cached value is not a decode edge"),
         }
     }
 }
@@ -158,6 +186,24 @@ fn aux_activation_from_range(
     }
 }
 
+fn aux_activation_from_decode_embed(
+    source: &decode_embed_input::ActivationSequence,
+) -> aux_input::ActivationSequence {
+    aux_input::ActivationSequence {
+        rows: map_list(&source.rows, |row| aux_input::ActivationRow {
+            token_id: row.token_id,
+            values: row.values.clone(),
+        }),
+        errors: source.errors.clone(),
+        kv: map_list(&source.kv, |row| aux_input::KeyRow {
+            position: row.position,
+            k: row.k.clone(),
+            v: row.v.clone(),
+        }),
+        start_position: source.start_position,
+    }
+}
+
 fn range_activation_from_embedding(
     source: &embedding_input::ActivationSequence,
 ) -> range_input::ActivationSequence {
@@ -176,8 +222,44 @@ fn range_activation_from_embedding(
     }
 }
 
+fn range_activation_from_decode_embed(
+    source: &decode_embed_input::ActivationSequence,
+) -> range_input::ActivationSequence {
+    range_input::ActivationSequence {
+        rows: map_list(&source.rows, |row| range_input::ActivationRow {
+            token_id: row.token_id,
+            values: row.values.clone(),
+        }),
+        errors: source.errors.clone(),
+        kv: map_list(&source.kv, |row| range_input::KeyRow {
+            position: row.position,
+            k: row.k.clone(),
+            v: row.v.clone(),
+        }),
+        start_position: source.start_position,
+    }
+}
+
 fn finalize_activation_from_embedding(
     source: &embedding_input::ActivationSequence,
+) -> finalize_input::ActivationSequence {
+    finalize_input::ActivationSequence {
+        rows: map_list(&source.rows, |row| finalize_input::ActivationRow {
+            token_id: row.token_id,
+            values: row.values.clone(),
+        }),
+        errors: source.errors.clone(),
+        kv: map_list(&source.kv, |row| finalize_input::KeyRow {
+            position: row.position,
+            k: row.k.clone(),
+            v: row.v.clone(),
+        }),
+        start_position: source.start_position,
+    }
+}
+
+fn finalize_activation_from_decode_embed(
+    source: &decode_embed_input::ActivationSequence,
 ) -> finalize_input::ActivationSequence {
     finalize_input::ActivationSequence {
         rows: map_list(&source.rows, |row| finalize_input::ActivationRow {
@@ -232,6 +314,28 @@ fn decode_logits_from_finalize(
             value: entry.value,
         }),
         errors: source.errors.clone(),
+    }
+}
+
+fn decode_embed_edge_from_decode(
+    source: &decode_input::DecodeEdge,
+) -> decode_embed_input::DecodeEdge {
+    decode_embed_input::DecodeEdge {
+        has_selected: source.has_selected,
+        decode_position: source.decode_position,
+        token_id: source.token_id,
+        value: source.value,
+        generated_token_ids: source.generated_token_ids.clone(),
+    }
+}
+
+fn output_edge_from_decode(source: &decode_input::DecodeEdge) -> output_input::DecodeEdge {
+    output_input::DecodeEdge {
+        has_selected: source.has_selected,
+        decode_position: source.decode_position,
+        token_id: source.token_id,
+        value: source.value,
+        generated_token_ids: source.generated_token_ids.clone(),
     }
 }
 
