@@ -50,33 +50,41 @@ fn main() {
     }
 }
 
-struct Args {
-    model_dir: PathBuf,
-    prompt: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportConfig {
+    pub model_dir: PathBuf,
+    pub prompt: String,
     /// Commit the prompt exactly as given, with no turn markers and no `<bos>`.
     /// Needed for a tokenizer that has no such tokens — `tiny-gemma-dev` — and
     /// for reproducing a pre-template fixture.
-    raw_prompt: bool,
+    pub raw_prompt: bool,
     /// Exact number of generated tokens. The decode loop is statically
     /// expanded to this many select+transition iterations.
-    tokens: u32,
+    pub tokens: u32,
     /// Write the complete chain manifest here instead of printing it.
-    manifest: Option<PathBuf>,
+    pub manifest: Option<PathBuf>,
     /// Rewrite only the tokenizer externals, leaving the weight externals
     /// alone. The weights are ~9 GB and depend on nothing the tokenizer
     /// touches, so a prompt or vocabulary-layout change has no reason to
     /// re-emit them. Prints only the `prompt_prepare` stage.
-    only_tokenizer: bool,
+    pub only_tokenizer: bool,
     /// Rewrite only the transformer-layer externals (`prefill-range`). Nothing
     /// else depends on `LayerParams`, so a per-layer shape correction has no
     /// reason to re-emit the ~11 GB of tokenizer, embedding, PLE and head
     /// artifacts. Prints only the `prefill_range_*` stages.
-    only_layers: bool,
+    pub only_layers: bool,
     /// Rewrite only the embedding external. Same reasoning as `--only-layers`:
     /// nothing else depends on `EmbeddingTable`.
-    only_embedding: bool,
+    pub only_embedding: bool,
     /// Rewrite only the PLE layer externals (`prefill-prepare-aux`).
-    only_ple: bool,
+    pub only_ple: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportResult {
+    pub manifest_path: Option<PathBuf>,
+    pub manifest_text: Option<String>,
+    pub stage_count: usize,
 }
 
 pub fn run_from_env() -> Result<(), Box<dyn Error>> {
@@ -85,10 +93,10 @@ pub fn run_from_env() -> Result<(), Box<dyn Error>> {
 
 pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let args = parse_args_from(args)?;
-    run(args)
+    import_model(args).map(|_| ())
 }
 
-fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Box<dyn Error>> {
+fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<ImportConfig, Box<dyn Error>> {
     let mut model_dir = None;
     let mut prompt = String::from("hello raster");
     let mut raw_prompt = false;
@@ -119,7 +127,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Box<d
             other => return Err(format!("unknown argument '{other}'").into()),
         }
     }
-    Ok(Args {
+    Ok(ImportConfig {
         model_dir: model_dir.ok_or("--model <bundle-dir> is required")?,
         prompt,
         raw_prompt,
@@ -132,7 +140,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, Box<d
     })
 }
 
-fn run(args: Args) -> Result<(), Box<dyn Error>> {
+pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> {
     let tokenizer: serde_json::Value =
         serde_json::from_slice(&fs::read(args.model_dir.join("tokenizer.json"))?)?;
 
@@ -156,14 +164,13 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
         println!();
         println!(
             "{}",
-            external_line(
-                "decoder",
-                "output-finalize",
-                "decoder",
-                &decoder_commitment
-            )
+            external_line("decoder", "output-finalize", "decoder", &decoder_commitment)
         );
-        return Ok(());
+        return Ok(ImportResult {
+            manifest_path: None,
+            manifest_text: None,
+            stage_count: stages.len(),
+        });
     }
 
     let weights = detwgt::load(&args.model_dir.join("model.detwgt"))?;
@@ -183,7 +190,11 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
             println!();
             print!("{stage}");
         }
-        return Ok(());
+        return Ok(ImportResult {
+            manifest_path: None,
+            manifest_text: None,
+            stage_count: stages.len(),
+        });
     }
 
     if args.only_embedding {
@@ -196,7 +207,11 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
             println!();
             print!("{stage}");
         }
-        return Ok(());
+        return Ok(ImportResult {
+            manifest_path: None,
+            manifest_text: None,
+            stage_count: stages.len(),
+        });
     }
 
     if args.only_layers {
@@ -209,7 +224,11 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
             println!();
             print!("{stage}");
         }
-        return Ok(());
+        return Ok(ImportResult {
+            manifest_path: None,
+            manifest_text: None,
+            stage_count: stages.len(),
+        });
     }
 
     let shape = Shape::from_config(text)?;
@@ -234,9 +253,8 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     write_transformer_layers(&weights, &shape, &mut stages)?;
     write_head(&weights, &shape, text, &mut stages)?;
 
-    let mut manifest = String::from(
-        "[chain]\nname = \"raster-chain-inference\"\nversion = \"0.1.0\"\n",
-    );
+    let mut manifest =
+        String::from("[chain]\nname = \"raster-chain-inference\"\nversion = \"0.1.0\"\n");
     manifest.push_str(&indexed_model_inputs(&shape, &stages)?);
     for stage in &stages {
         manifest.push('\n');
@@ -248,15 +266,25 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
         args.tokens,
         &stages,
     )?);
+    let stage_count = stages.len();
     if let Some(path) = args.manifest {
-        fs::write(&path, manifest)?;
+        fs::write(&path, &manifest)?;
         println!("wrote {}", path.display());
+        Ok(ImportResult {
+            manifest_path: Some(path),
+            manifest_text: None,
+            stage_count,
+        })
     } else {
         println!();
         println!("# ---- root Raster.toml ----");
         print!("{manifest}");
+        Ok(ImportResult {
+            manifest_path: None,
+            manifest_text: Some(manifest),
+            stage_count,
+        })
     }
-    Ok(())
 }
 
 fn stage_external_commitment(
@@ -290,17 +318,11 @@ fn stage_external_commitment(
 fn indexed_model_inputs(shape: &Shape, stages: &[String]) -> Result<String, Box<dyn Error>> {
     let aux = (0..shape.layers)
         .map(|layer| {
-            stage_external_commitment(
-                stages,
-                &format!("prefill_prepare_aux_l{layer}"),
-                "layer",
-            )
+            stage_external_commitment(stages, &format!("prefill_prepare_aux_l{layer}"), "layer")
         })
         .collect::<Result<Vec<_>, _>>()?;
     let transformer = (0..shape.layers)
-        .map(|layer| {
-            stage_external_commitment(stages, &format!("prefill_range_l{layer}"), "layer")
-        })
+        .map(|layer| stage_external_commitment(stages, &format!("prefill_range_l{layer}"), "layer"))
         .collect::<Result<Vec<_>, _>>()?;
     let render = |name: &str, dir: &str, commitments: &[String]| {
         let entries = commitments
@@ -605,12 +627,8 @@ impl Shape {
             rope_base_full: rope_param(text, "full_attention", "rope_theta")
                 .or_else(|| text.get("rope_theta").and_then(as_f64))
                 .unwrap_or(1_000_000.0),
-            full_partial_rotary_factor: rope_param(
-                text,
-                "full_attention",
-                "partial_rotary_factor",
-            )
-            .unwrap_or(1.0),
+            full_partial_rotary_factor: rope_param(text, "full_attention", "partial_rotary_factor")
+                .unwrap_or(1.0),
             num_kv_shared_layers: text
                 .get("num_kv_shared_layers")
                 .and_then(serde_json::Value::as_u64)
@@ -659,9 +677,11 @@ fn load_eos_ids(model_dir: &Path) -> std::collections::BTreeSet<u32> {
     let Ok(config) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Default::default();
     };
-    let declared = config
-        .get("eos_token_id")
-        .or_else(|| config.get("text_config").and_then(|t| t.get("eos_token_id")));
+    let declared = config.get("eos_token_id").or_else(|| {
+        config
+            .get("text_config")
+            .and_then(|t| t.get("eos_token_id"))
+    });
     match declared {
         Some(serde_json::Value::Number(id)) => {
             id.as_u64().map(|id| id as u32).into_iter().collect()
@@ -682,7 +702,9 @@ fn write_tokenizer(
     eos_ids: &std::collections::BTreeSet<u32>,
     stages: &mut Vec<String>,
 ) -> Result<String, Box<dyn Error>> {
-    let model = tokenizer.get("model").ok_or("tokenizer.json has no model")?;
+    let model = tokenizer
+        .get("model")
+        .ok_or("tokenizer.json has no model")?;
     let vocab_map: BTreeMap<String, u32> = model
         .get("vocab")
         .and_then(serde_json::Value::as_object)
@@ -737,8 +759,7 @@ fn write_tokenizer(
     special_tokens.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
     let max_token_id = vocab.iter().map(|entry| entry.id).max().unwrap_or(0);
-    let mut decoder_tokens =
-        vec![DecoderToken::default(); max_token_id.saturating_add(1) as usize];
+    let mut decoder_tokens = vec![DecoderToken::default(); max_token_id.saturating_add(1) as usize];
     for entry in &vocab {
         decoder_tokens[entry.id as usize] = DecoderToken {
             token: entry.token.clone(),
@@ -791,7 +812,11 @@ fn write_tokenizer(
         split_prompt(&rendered, &vocab_map, &[])
     };
 
-    println!("tokenizer: {} entries, {} merges", vocab.len(), merges.len());
+    println!(
+        "tokenizer: {} entries, {} merges",
+        vocab.len(),
+        merges.len()
+    );
     println!(
         "prompt: {} · {} terminal id(s)",
         if templated {
@@ -844,7 +869,12 @@ fn write_tokenizer(
             "{}",
             "{}"
         ),
-        external_line("tokenizer", "prompt-prepare", "tokenizer", &tokenizer_commitment),
+        external_line(
+            "tokenizer",
+            "prompt-prepare",
+            "tokenizer",
+            &tokenizer_commitment
+        ),
         external_line(
             "initial_pieces",
             "prompt-prepare",
@@ -936,10 +966,9 @@ fn parse_merge(rank: u32, entry: &serde_json::Value) -> Option<BpeMerge> {
             let mut parts = text.splitn(2, ' ');
             (parts.next()?.to_string(), parts.next()?.to_string())
         }
-        serde_json::Value::Array(pair) if pair.len() == 2 => (
-            pair[0].as_str()?.to_string(),
-            pair[1].as_str()?.to_string(),
-        ),
+        serde_json::Value::Array(pair) if pair.len() == 2 => {
+            (pair[0].as_str()?.to_string(), pair[1].as_str()?.to_string())
+        }
         _ => return None,
     };
     let merged = format!("{left}{right}");
@@ -983,7 +1012,10 @@ fn split_prompt(prompt: &str, vocab: &BTreeMap<String, u32>, specials: &[String]
     let mut pieces = Vec::new();
     let mut rest = prompt;
     while !rest.is_empty() {
-        if let Some(special) = specials.iter().find(|token| rest.starts_with(token.as_str())) {
+        if let Some(special) = specials
+            .iter()
+            .find(|token| rest.starts_with(token.as_str()))
+        {
             pieces.push(special.clone());
             rest = &rest[special.len()..];
             continue;
@@ -1228,7 +1260,9 @@ fn write_transformer_layers(
                     &weights.get(&at("pre_feedforward_layernorm.weight"))?.values,
                 ),
                 norm_post_ffw: page_of_i32s(
-                    &weights.get(&at("post_feedforward_layernorm.weight"))?.values,
+                    &weights
+                        .get(&at("post_feedforward_layernorm.weight"))?
+                        .values,
                 ),
                 q_norm: page_of_i32s(&weights.get(&at("self_attn.q_norm.weight"))?.values),
                 k_norm: page_of_i32s(&weights.get(&at("self_attn.k_norm.weight"))?.values),
@@ -1431,4 +1465,54 @@ fn external_line(param: &str, stage_dir: &str, name: &str, commitment: &str) -> 
     format!(
         "inputs.{param} = {{ external = {{ path = \"{stage_dir}/{name}.rastered\", index_path = \"{stage_dir}/{name}.rindex\", commitment = \"{commitment}\" }} }}\n"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args_builds_import_config() {
+        let config = parse_args_from(
+            [
+                "--model",
+                "fixtures/model",
+                "--prompt",
+                "hello",
+                "--raw-prompt",
+                "--tokens",
+                "3",
+                "--manifest",
+                "Raster.toml",
+                "--only-tokenizer",
+                "--only-embedding",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config,
+            ImportConfig {
+                model_dir: PathBuf::from("fixtures/model"),
+                prompt: String::from("hello"),
+                raw_prompt: true,
+                tokens: 3,
+                manifest: Some(PathBuf::from("Raster.toml")),
+                only_tokenizer: true,
+                only_layers: false,
+                only_embedding: true,
+                only_ple: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_args_requires_model_dir() {
+        let error = parse_args_from([String::from("--prompt"), String::from("hello")])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("--model <bundle-dir> is required"));
+    }
 }

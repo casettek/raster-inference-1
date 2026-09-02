@@ -18,6 +18,13 @@ Raster reference stage, then writes a `checkpoint_trace.json` and
 need the Raster runner to render the generated text. See
 [Generating N tokens](#generating-n-tokens).
 
+Those two claim files are the stable phase-two artifacts. The trace is the
+ordered list of local checkpoint outputs from the run; the bundle is the small
+entry point that names the executor, points at the trace, and records the final
+claimed checkpoint. Future workflow outputs such as `InferenceResult`,
+`Divergence`, `ChallengeTrace`, `ReplayPackage`, `ChallengeBundle`, and
+`FaultProof` are planned names, not emitted by this repo yet.
+
 ```text
    tokenizer      embedding      ple layers    layer weights     head
     + pieces        table          │   │          │    │           │
@@ -409,6 +416,20 @@ cargo run --manifest-path raster-inference-cli/Cargo.toml -- claim build
 # reserved for the future unconstrained native inference executor
 cargo run --manifest-path raster-inference-cli/Cargo.toml -- infer
 ```
+
+`claim build` currently emits two stable JSON files in the direct-native chain
+run directory:
+
+- `checkpoint_trace.json`: versioned, ordered checkpoint metadata for every
+  stage output, including structural commitment, local output paths, payload
+  SHA-256, and execution duration when `execution-times.json` exists.
+- `claim_bundle.json`: a lightweight local bundle with the executor name, the
+  manifest path, the trace path, the optional timing path, and the final
+  checkpoint reference.
+
+The challenge and fault-proof commands are intentionally reserved until their
+artifact producers exist. For now, lower-level Raster and direct-native commands
+remain backend/debug surfaces, not the primary developer API.
 
 The older commands below are lower-level development and verification surfaces:
 
