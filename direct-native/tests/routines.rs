@@ -1,11 +1,12 @@
 use decode_select_token::input::{DecodeEdge, LogitEntry, PrefillLogits};
-use direct_native::routines;
+use direct_native::{kernels, routines};
 use input_embedding::input::{EmbeddingTable, PromptTokenization};
 use output_finalize::input::{DecoderTable, DecoderToken};
 use prefill_finalize::input::{FinalHead, FinalHeadParams};
 use prefill_prepare_aux::input::{PleLayer, PleLayerParams};
 use prompt_prepare::input::{BpePieces, MergeBucket, PromptTokenizer, TokenEntry, VocabBucket};
 use raster::{Bytes, List};
+use serde::Serialize;
 
 const ONE: i32 = 1 << 16;
 
@@ -21,34 +22,48 @@ fn paged(values: &[i32]) -> Bytes<196_608> {
     Bytes::<196_608>::paged(bytes_of_i32s(values)).unwrap()
 }
 
+fn assert_same_json<T: Serialize>(left: &T, right: &T) {
+    assert_eq!(
+        serde_json::to_value(left).unwrap(),
+        serde_json::to_value(right).unwrap()
+    );
+}
+
 #[test]
 fn decode_select_token_keeps_first_token_on_tie() {
-    let output =
-        routines::decode_select_token::run_direct(&routines::decode_select_token::Inputs {
-            logits: PrefillLogits {
-                decode_position: 9,
-                logits: List::from(vec![
-                    LogitEntry {
-                        token_id: 5,
-                        value: 10,
-                    },
-                    LogitEntry {
-                        token_id: 3,
-                        value: 10,
-                    },
-                ]),
-                errors: List::new(),
-            },
-            prior: DecodeEdge {
-                has_selected: true,
-                decode_position: 8,
-                token_id: 11,
-                value: 1,
-                generated_token_ids: List::from(vec![11, 12]),
-            },
-        })
-        .unwrap();
+    let inputs = routines::decode_select_token::Inputs {
+        logits: PrefillLogits {
+            decode_position: 9,
+            logits: List::from(vec![
+                LogitEntry {
+                    token_id: 5,
+                    value: 10,
+                },
+                LogitEntry {
+                    token_id: 3,
+                    value: 10,
+                },
+            ]),
+            errors: List::new(),
+        },
+        prior: DecodeEdge {
+            has_selected: true,
+            decode_position: 8,
+            token_id: 11,
+            value: 1,
+            generated_token_ids: List::from(vec![11, 12]),
+        },
+    };
+    let output = routines::decode_select_token::run_direct(&inputs).unwrap();
+    let kernel_output = kernels::decode_select_token::run_decode_select_token_direct(
+        kernels::decode_select_token::DecodeSelectTokenDirectInputs {
+            logits: &inputs.logits,
+            prior: &inputs.prior,
+        },
+    )
+    .unwrap();
 
+    assert_same_json(&output, &kernel_output);
     assert!(output.has_selected);
     assert_eq!(output.decode_position, 9);
     assert_eq!(output.token_id, 5);
@@ -59,7 +74,11 @@ fn decode_select_token_keeps_first_token_on_tie() {
 #[test]
 fn decode_init_outputs_empty_edge() {
     let output = routines::decode_init::run_direct(&routines::decode_init::Inputs).unwrap();
+    let kernel_output =
+        kernels::decode_init::run_decode_init_direct(kernels::decode_init::DecodeInitDirectInputs)
+            .unwrap();
 
+    assert_same_json(&output, &kernel_output);
     assert!(!output.has_selected);
     assert_eq!(output.decode_position, 0);
     assert_eq!(output.token_id, 0);
@@ -69,7 +88,7 @@ fn decode_init_outputs_empty_edge() {
 
 #[test]
 fn decode_embed_uses_selected_decode_position() {
-    let output = routines::decode_embed::run_direct(&routines::decode_embed::Inputs {
+    let inputs = routines::decode_embed::Inputs {
         selected: decode_embed::input::DecodeEdge {
             has_selected: true,
             decode_position: 9,
@@ -87,9 +106,17 @@ fn decode_embed_uses_selected_decode_position() {
             }
             .values,
         },
-    })
+    };
+    let output = routines::decode_embed::run_direct(&inputs).unwrap();
+    let kernel_output = kernels::decode_embed::run_decode_embed_direct(
+        kernels::decode_embed::DecodeEmbedDirectInputs {
+            selected: &inputs.selected,
+            embedding: &inputs.embedding,
+        },
+    )
     .unwrap();
 
+    assert_same_json(&output, &kernel_output);
     assert_eq!(output.rows.len(), 1);
     assert_eq!(output.rows[0].token_id, 1);
     assert_eq!(output.start_position, 9);
@@ -98,7 +125,7 @@ fn decode_embed_uses_selected_decode_position() {
 
 #[test]
 fn output_finalize_decodes_generated_ids() {
-    let output = routines::output_finalize::run_direct(&routines::output_finalize::Inputs {
+    let inputs = routines::output_finalize::Inputs {
         edge: output_finalize::input::DecodeEdge {
             has_selected: true,
             decode_position: 2,
@@ -120,9 +147,17 @@ fn output_finalize_decodes_generated_ids() {
                 },
             ]),
         },
-    })
+    };
+    let output = routines::output_finalize::run_direct(&inputs).unwrap();
+    let kernel_output = kernels::output_finalize::run_output_finalize_direct(
+        kernels::output_finalize::OutputFinalizeDirectInputs {
+            edge: &inputs.edge,
+            decoder: &inputs.decoder,
+        },
+    )
     .unwrap();
 
+    assert_same_json(&output, &kernel_output);
     assert_eq!(output.generated_token_count, 2);
     assert_eq!(output.generated_token_ids.as_slice(), &[0, 1]);
     assert_eq!(output.generated_text, " Hi!");
@@ -131,7 +166,7 @@ fn output_finalize_decodes_generated_ids() {
 
 #[test]
 fn prompt_prepare_resolves_vocab_bucket() {
-    let output = routines::prompt_prepare::run_direct(&routines::prompt_prepare::Inputs {
+    let inputs = routines::prompt_prepare::Inputs {
         tokenizer: PromptTokenizer {
             vocab_bucket_count: 1,
             merge_bucket_count: 1,
@@ -146,15 +181,23 @@ fn prompt_prepare_resolves_vocab_bucket() {
         initial_pieces: BpePieces {
             pieces: List::from(vec!["hello".to_string(), "</w>".to_string()]),
         },
-    })
+    };
+    let output = routines::prompt_prepare::run_direct(&inputs).unwrap();
+    let kernel_output = kernels::prompt_prepare::run_prompt_prepare_direct(
+        kernels::prompt_prepare::PromptPrepareDirectInputs {
+            tokenizer: &inputs.tokenizer,
+            initial_pieces: &inputs.initial_pieces,
+        },
+    )
     .unwrap();
 
+    assert_same_json(&output, &kernel_output);
     assert_eq!(output.token_ids.as_slice(), &[42]);
 }
 
 #[test]
 fn input_embedding_gathers_and_scales_rows() {
-    let output = routines::input_embedding::run_direct(&routines::input_embedding::Inputs {
+    let inputs = routines::input_embedding::Inputs {
         prompt: PromptTokenization {
             token_ids: List::from(vec![1]),
         },
@@ -163,9 +206,17 @@ fn input_embedding_gathers_and_scales_rows() {
             embedding_scale: ONE,
             values: paged(&[0, 0, ONE, 2 * ONE]),
         },
-    })
+    };
+    let output = routines::input_embedding::run_direct(&inputs).unwrap();
+    let kernel_output = kernels::input_embedding::run_input_embedding_direct(
+        kernels::input_embedding::InputEmbeddingDirectInputs {
+            prompt: &inputs.prompt,
+            embedding: &inputs.embedding,
+        },
+    )
     .unwrap();
 
+    assert_same_json(&output, &kernel_output);
     assert_eq!(output.rows.len(), 1);
     assert_eq!(output.rows[0].token_id, 1);
     assert!(output.errors.is_empty());
@@ -185,26 +236,33 @@ fn prefill_prepare_aux_publishes_one_row() {
         start_position: 0,
     };
 
-    let output =
-        routines::prefill_prepare_aux::run_direct(&routines::prefill_prepare_aux::Inputs {
-            embedded: activation,
-            layer: PleLayer {
-                params: PleLayerParams {
-                    layer_idx: 7,
-                    hidden_size: 2,
-                    ple_width: 2,
-                    embedding_scale: ONE,
-                    projection_scalar: ONE,
-                    input_scale: ONE,
-                    norm_eps: 0,
-                    norm_weights: norm.clone(),
-                },
-                embeddings: paged(&[ONE, 0]),
-                projection: paged(&[ONE, 0, 0, ONE]),
+    let inputs = routines::prefill_prepare_aux::Inputs {
+        embedded: activation,
+        layer: PleLayer {
+            params: PleLayerParams {
+                layer_idx: 7,
+                hidden_size: 2,
+                ple_width: 2,
+                embedding_scale: ONE,
+                projection_scalar: ONE,
+                input_scale: ONE,
+                norm_eps: 0,
+                norm_weights: norm.clone(),
             },
-        })
-        .unwrap();
+            embeddings: paged(&[ONE, 0]),
+            projection: paged(&[ONE, 0, 0, ONE]),
+        },
+    };
+    let output = routines::prefill_prepare_aux::run_direct(&inputs).unwrap();
+    let kernel_output = kernels::prefill_prepare_aux::run_prefill_prepare_aux_direct(
+        kernels::prefill_prepare_aux::PrefillPrepareAuxDirectInputs {
+            embedded: &inputs.embedded,
+            layer: &inputs.layer,
+        },
+    )
+    .unwrap();
 
+    assert_same_json(&output, &kernel_output);
     assert_eq!(output.layer_idx, 7);
     assert_eq!(output.rows.len(), 1);
     assert!(output.errors.is_empty());
@@ -275,7 +333,7 @@ fn prefill_finalize_scores_projection_rows() {
         start_position: 4,
     };
 
-    let output = routines::prefill_finalize::run_direct(&routines::prefill_finalize::Inputs {
+    let inputs = routines::prefill_finalize::Inputs {
         activations,
         head: FinalHead {
             params: FinalHeadParams {
@@ -286,9 +344,17 @@ fn prefill_finalize_scores_projection_rows() {
             },
             projection: paged(&[ONE, 0, 0, ONE]),
         },
-    })
+    };
+    let output = routines::prefill_finalize::run_direct(&inputs).unwrap();
+    let kernel_output = kernels::prefill_finalize::run_prefill_finalize_direct(
+        kernels::prefill_finalize::PrefillFinalizeDirectInputs {
+            activations: &inputs.activations,
+            head: &inputs.head,
+        },
+    )
     .unwrap();
 
+    assert_same_json(&output, &kernel_output);
     assert_eq!(output.decode_position, 5);
     assert_eq!(output.logits.len(), 2);
     assert!(output.errors.is_empty());

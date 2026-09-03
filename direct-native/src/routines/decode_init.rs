@@ -2,10 +2,10 @@ use std::path::Path;
 
 use anyhow::Result;
 use decode_select_token::input::DecodeEdge;
-use raster::List;
 
 use crate::artifact_io::{with_main_sequence_scope, with_stage_sequence_scope};
 use crate::cache::CachedInputs;
+use crate::kernels::decode_init::{run_decode_init_direct, DecodeInitDirectInputs};
 
 pub struct Inputs;
 
@@ -22,11 +22,5 @@ pub fn load_inputs_from_paths(
 }
 
 pub fn run_direct(_inputs: &Inputs) -> Result<DecodeEdge> {
-    Ok(DecodeEdge {
-        has_selected: false,
-        decode_position: 0,
-        token_id: 0,
-        value: 0,
-        generated_token_ids: List::new(),
-    })
+    run_decode_init_direct(DecodeInitDirectInputs)
 }

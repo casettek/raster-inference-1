@@ -1,4 +1,4 @@
-use direct_native::{run_prefill_range_direct, PrefillRangeDirectInputs};
+use direct_native::{routines, run_prefill_range_direct, PrefillRangeDirectInputs};
 use prefill_range::input::{
     pack_i32s, ActivationRow, ActivationSequence, KeyRow, LayerParams, PleLayerInputs, PleRow,
     TransformerLayer, PAGE_SIZE,
@@ -124,6 +124,20 @@ fn direct_prefill_returns_activation_and_own_kv() {
     assert_eq!(output.rows[0].token_id, 7);
     assert_eq!(output.kv.len(), 1);
     assert!(output.errors.is_empty());
+
+    let wrapper_output = routines::prefill_range::run_direct(&routines::prefill_range::Inputs {
+        activations,
+        layer,
+        prior_kv: donor.clone(),
+        donor_a_kv: donor.clone(),
+        donor_b_kv: donor,
+        ple,
+    })
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&output).unwrap(),
+        serde_json::to_value(&wrapper_output).unwrap()
+    );
 }
 
 #[test]
@@ -147,4 +161,18 @@ fn donor_layer_carries_prior_kv_and_publishes_own_kv() {
     assert_eq!(output.kv.len(), 2);
     assert_eq!(output.kv[0].position, 0);
     assert_eq!(output.kv[1].position, 0);
+
+    let wrapper_output = routines::prefill_range::run_direct(&routines::prefill_range::Inputs {
+        activations,
+        layer,
+        prior_kv: donor.clone(),
+        donor_a_kv: donor.clone(),
+        donor_b_kv: donor,
+        ple,
+    })
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&output).unwrap(),
+        serde_json::to_value(&wrapper_output).unwrap()
+    );
 }

@@ -6,7 +6,7 @@ use prefill_range::input::{ActivationSequence, PleLayerInputs, TransformerLayer}
 use crate::artifact_io::{with_main_sequence_scope, with_stage_sequence_scope};
 use crate::cache::CachedInputs;
 
-pub use crate::prefill_range::{run_prefill_range_direct, PrefillRangeDirectInputs};
+pub use crate::kernels::prefill_range::{run_prefill_range_direct, PrefillRangeDirectInputs};
 
 pub struct Inputs {
     pub activations: ActivationSequence,
