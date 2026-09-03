@@ -8,6 +8,7 @@ use clap::{Args, Parser, Subcommand};
 mod artifacts;
 mod challenge;
 mod claim;
+mod infer;
 
 pub use artifacts::{
     build_checkpoint_trace, write_claim_artifacts, ChallengeBundle, ChallengeTrace, Checkpoint,
@@ -20,6 +21,7 @@ pub use challenge::{
     ChallengeInput,
 };
 pub use claim::{build_claim, ClaimBuildOptions, ClaimBuildResult};
+pub use infer::run_infer;
 
 #[derive(Debug, Parser)]
 #[command(name = "raster-inference")]
@@ -182,7 +184,12 @@ fn execute(cli: Cli) -> Result<ExitCode> {
             println!("claim bundle: {}", result.claim_bundle_path.display());
             Ok(ExitCode::SUCCESS)
         }
-        Some(Commands::Infer) => bail!("raster-inference infer is not implemented yet"),
+        Some(Commands::Infer) => {
+            warn_if_debug_build("infer");
+            let result = run_infer()?;
+            print_infer_result(&result);
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Commands::Challenge { command }) => match command {
             ChallengeCommand::Locate => {
                 bail!("raster-inference challenge locate is not implemented yet")
@@ -268,6 +275,18 @@ fn print_challenge_result(result: &ChallengeBuildResult) {
             println!("challenge bundle: {}", challenge_bundle_path.display());
         }
     }
+}
+
+fn print_infer_result(result: &direct_native::InferenceResult) {
+    println!("generated token count: {}", result.generated_token_count);
+    println!("generated token ids: {:?}", result.generated_token_ids);
+    println!(
+        "generated token ids sha256: {}",
+        result.generated_token_ids_sha256
+    );
+    println!("stop reason: {}", result.stop_reason);
+    println!("generated text:");
+    println!("{}", result.generated_text);
 }
 
 fn finish_shadow_run(status: ExitStatus, stage_dir: &Path) -> Result<ExitCode> {
@@ -413,10 +432,10 @@ mod tests {
     }
 
     #[test]
-    fn infer_is_reserved_for_later() {
+    fn infer_requires_an_imported_workspace() {
         let error = execute_from(["raster-inference", "infer"]).unwrap_err();
 
-        assert!(error.to_string().contains("not implemented yet"));
+        assert!(error.to_string().contains("imported workspace"));
     }
 
     #[test]

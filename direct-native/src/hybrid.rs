@@ -23,32 +23,32 @@ pub struct HybridRun {
 }
 
 #[derive(Debug)]
-struct Manifest {
-    chain: ChainSpec,
+pub(crate) struct Manifest {
+    pub(crate) chain: ChainSpec,
 }
 
 #[derive(Debug, Clone)]
-struct ChainSpec {
-    stage: Vec<StageSpec>,
+pub(crate) struct ChainSpec {
+    pub(crate) stage: Vec<StageSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-struct StageSpec {
-    name: String,
-    project: String,
+pub(crate) struct StageSpec {
+    pub(crate) name: String,
+    pub(crate) project: String,
     #[serde(default)]
-    inputs: BTreeMap<String, InputBinding>,
+    pub(crate) inputs: BTreeMap<String, InputBinding>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum InputBinding {
+pub(crate) enum InputBinding {
     External(ExternalRef),
     From(String),
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-struct ExternalRef {
+pub(crate) struct ExternalRef {
     path: String,
     #[serde(default)]
     index_path: Option<String>,
@@ -326,7 +326,7 @@ pub fn run(
     })
 }
 
-fn read_manifest(path: &Path) -> Result<Manifest> {
+pub(crate) fn read_manifest(path: &Path) -> Result<Manifest> {
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     text.parse::<toml::Value>()
@@ -575,14 +575,14 @@ fn render_template(template: &str, indexes: &[TemplateIndex<'_>]) -> Result<Rend
     Ok(RenderedTemplate::Text(rendered))
 }
 
-fn validate_supported_stages(stages: &[StageSpec]) -> Result<()> {
+pub(crate) fn validate_supported_stages(stages: &[StageSpec]) -> Result<()> {
     for stage in stages {
         StageKind::from_stage_spec(&stage.project, &stage.name)?;
     }
     Ok(())
 }
 
-fn build_stage_index(stages: &[StageSpec]) -> Result<BTreeMap<String, usize>> {
+pub(crate) fn build_stage_index(stages: &[StageSpec]) -> Result<BTreeMap<String, usize>> {
     let mut stage_index = BTreeMap::new();
     for (idx, stage) in stages.iter().enumerate() {
         if stage_index.insert(stage.name.clone(), idx).is_some() {
@@ -993,7 +993,7 @@ fn aux_parallelism_from(
         .clamp(1, job_count)
 }
 
-fn cached_inputs_for_stage(
+pub(crate) fn cached_inputs_for_stage(
     stage: &StageSpec,
     stage_index: &BTreeMap<String, usize>,
     outputs: &[Option<Vec<u8>>],
@@ -1017,7 +1017,7 @@ fn cached_inputs_for_stage(
     Ok(cached_inputs)
 }
 
-fn synthesize_inputs(
+pub(crate) fn synthesize_inputs(
     stage: &StageSpec,
     stage_dir: &Path,
     base_dir: &Path,

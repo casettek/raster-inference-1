@@ -7,6 +7,8 @@ use prefill_prepare_aux::input::{PleLayer, PleLayerParams};
 use prompt_prepare::input::{BpePieces, MergeBucket, PromptTokenizer, TokenEntry, VocabBucket};
 use raster::{Bytes, List};
 use serde::Serialize;
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const ONE: i32 = 1 << 16;
 
@@ -87,6 +89,31 @@ fn decode_init_outputs_empty_edge() {
 }
 
 #[test]
+fn cached_runner_executes_without_writing_output_artifact() {
+    let base = temp_dir("cached-runner");
+    fs::create_dir_all(&base).unwrap();
+    let input = base.join("input.json");
+    let input_manifest = base.join("input_manifest.json");
+    fs::write(&input, "{}").unwrap();
+    fs::write(&input_manifest, "{}").unwrap();
+
+    let output = routines::run_cached_from_paths(
+        &routines::StageKind::DecodeInit,
+        &input,
+        &input_manifest,
+        &Default::default(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        output.output,
+        direct_native::cache::CachedStageValue::DecodeEdge(_)
+    ));
+    assert!(!base.join("output.bin").exists());
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn decode_embed_uses_selected_decode_position() {
     let inputs = routines::decode_embed::Inputs {
         selected: decode_embed::input::DecodeEdge {
@@ -121,6 +148,17 @@ fn decode_embed_uses_selected_decode_position() {
     assert_eq!(output.rows[0].token_id, 1);
     assert_eq!(output.start_position, 9);
     assert!(output.errors.is_empty());
+}
+
+fn temp_dir(label: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "direct-native-routines-{label}-{}-{nanos}",
+        std::process::id()
+    ))
 }
 
 #[test]

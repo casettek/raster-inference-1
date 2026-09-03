@@ -43,6 +43,12 @@ pub struct DirectPublishOutput {
     pub output: CachedStageValue,
 }
 
+#[derive(Debug)]
+pub struct DirectCachedOutput {
+    pub encoded: EncodedArtifact,
+    pub output: CachedStageValue,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectTimings {
     pub input_load_duration: Duration,
@@ -374,6 +380,112 @@ pub fn run_and_publish_from_paths(
     }
 }
 
+pub fn run_cached_from_paths(
+    kind: &StageKind,
+    input_path: &Path,
+    input_manifest_path: &Path,
+    cached_inputs: &CachedInputs,
+) -> Result<DirectCachedOutput> {
+    match kind {
+        StageKind::PromptPrepare => cache(
+            || {
+                prompt_prepare::load_inputs_from_paths(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                )
+            },
+            prompt_prepare::run_direct,
+            "prompt_prepare",
+            CachedStageValue::PromptTokenization,
+        ),
+        StageKind::InputEmbedding => cache(
+            || {
+                input_embedding::load_inputs_from_paths(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                )
+            },
+            input_embedding::run_direct,
+            "input_embedding",
+            CachedStageValue::EmbeddedActivations,
+        ),
+        StageKind::PrefillPrepareAux { .. } => cache(
+            || {
+                prefill_prepare_aux::load_inputs_from_paths(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                )
+            },
+            prefill_prepare_aux::run_direct,
+            "prefill_prepare_aux",
+            CachedStageValue::PleLayerInputs,
+        ),
+        StageKind::PrefillRange { .. } => cache(
+            || {
+                prefill_range::load_inputs_from_paths(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                )
+            },
+            prefill_range::run_direct,
+            "prefill_range",
+            CachedStageValue::RangeActivations,
+        ),
+        StageKind::PrefillFinalize => cache(
+            || {
+                prefill_finalize::load_inputs_from_paths(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                )
+            },
+            prefill_finalize::run_direct,
+            "prefill_finalize",
+            CachedStageValue::PrefillLogits,
+        ),
+        StageKind::DecodeInit => cache(
+            || decode_init::load_inputs_from_paths(input_path, input_manifest_path, cached_inputs),
+            decode_init::run_direct,
+            "decode_init",
+            CachedStageValue::DecodeEdge,
+        ),
+        StageKind::DecodeSelectToken => cache(
+            || {
+                decode_select_token::load_inputs_from_paths(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                )
+            },
+            decode_select_token::run_direct,
+            "decode_select_token",
+            CachedStageValue::DecodeEdge,
+        ),
+        StageKind::DecodeEmbed => cache(
+            || decode_embed::load_inputs_from_paths(input_path, input_manifest_path, cached_inputs),
+            decode_embed::run_direct,
+            "decode_embed",
+            CachedStageValue::DecodeActivations,
+        ),
+        StageKind::OutputFinalize => cache(
+            || {
+                output_finalize::load_inputs_from_paths(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                )
+            },
+            output_finalize::run_direct,
+            "output_finalize",
+            CachedStageValue::GeneratedOutput,
+        ),
+    }
+}
+
 fn compare<I, O>(
     load: impl FnOnce() -> Result<I>,
     run: impl FnOnce(&I) -> Result<O>,
@@ -405,6 +517,24 @@ where
             direct_stage_duration: direct_stage_started.elapsed(),
         },
     })
+}
+
+fn cache<I, O>(
+    load: impl FnOnce() -> Result<I>,
+    run: impl FnOnce(&I) -> Result<O>,
+    label: &str,
+    cache_value: impl FnOnce(O) -> CachedStageValue,
+) -> Result<DirectCachedOutput>
+where
+    O: Serialize,
+{
+    let inputs = load().with_context(|| format!("failed to load {label} stage inputs"))?;
+    let output = run(&inputs).with_context(|| format!("direct-native {label} execution failed"))?;
+    let encoded = encode_output(&output)
+        .with_context(|| format!("failed to encode direct-native {label} output"))?;
+    let output = cache_value(output);
+
+    Ok(DirectCachedOutput { encoded, output })
 }
 
 fn publish<I, O>(
