@@ -108,6 +108,7 @@ mod tests {
             CheckpointedInferenceResult {
                 chain_dir: base.clone(),
                 selected_stage_dir: None,
+                final_result: None,
             },
             &manifest_path,
         )

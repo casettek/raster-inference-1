@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
+use crate::cache::CachedStageValue;
 use crate::hybrid::{self, DirectStageBackend};
+use crate::infer::InferenceResult;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParityPolicy {
@@ -23,6 +25,7 @@ pub struct CheckpointedInferenceConfig {
 pub struct CheckpointedInferenceResult {
     pub chain_dir: PathBuf,
     pub selected_stage_dir: Option<PathBuf>,
+    pub final_result: Option<InferenceResult>,
 }
 
 #[derive(Debug, Default)]
@@ -37,9 +40,14 @@ impl CheckpointedInferenceExecutor {
             ParityPolicy::ReferenceStage(stage) => Some(stage.as_str()),
         };
         let run = hybrid::run(raster_stage, &config.current_exe, config.direct_backend)?;
+        let final_result = match run.final_output {
+            Some(CachedStageValue::GeneratedOutput(output)) => Some(output.into()),
+            _ => None,
+        };
         Ok(CheckpointedInferenceResult {
             chain_dir: run.chain_dir,
             selected_stage_dir: run.selected_stage_dir,
+            final_result,
         })
     }
 }

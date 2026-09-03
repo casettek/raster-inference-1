@@ -20,6 +20,7 @@ use crate::shadow::{parity_dir, EXECUTION_TIMES_JSON};
 pub struct HybridRun {
     pub chain_dir: PathBuf,
     pub selected_stage_dir: Option<PathBuf>,
+    pub final_output: Option<CachedStageValue>,
 }
 
 #[derive(Debug)]
@@ -182,6 +183,7 @@ struct ChainRunState {
     aux_waves: Vec<AuxWaveExecutionTime>,
     output_cache: StageOutputCache,
     selected_stage_dir: Option<PathBuf>,
+    last_output: Option<CachedStageValue>,
 }
 
 struct AuxStageJob {
@@ -268,6 +270,7 @@ pub fn run(
         aux_waves: Vec::new(),
         output_cache: StageOutputCache::default(),
         selected_stage_dir: None,
+        last_output: None,
     };
 
     let mut idx = 0;
@@ -323,6 +326,7 @@ pub fn run(
     Ok(HybridRun {
         chain_dir,
         selected_stage_dir: state.selected_stage_dir,
+        final_output: state.last_output,
     })
 }
 
@@ -731,12 +735,15 @@ fn finish_stage(
     state.execution_times[idx] = Some(stage_run.duration);
     let output = collect_output(&stage_dir)?;
     if let Some(value) = stage_run.output {
+        state.last_output = Some(value.clone());
         output_cache_insert(
             &mut state.output_cache,
             &stage.name,
             &output.structural_commitment,
             value,
         );
+    } else {
+        state.last_output = None;
     }
     print_stage_output(&output);
     state.output_commitments[idx] = Some(output.structural_commitment);
