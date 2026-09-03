@@ -256,7 +256,7 @@ pub fn run(
         Some(stage) => {
             println!("  mode: unauthenticated hybrid (--no-auth; Raster reference: {stage})");
         }
-        None => println!("  mode: unauthenticated direct-native (--no-auth; no Raster reference)"),
+        None => println!("  mode: unauthenticated direct-native (--no-auth)"),
     }
     println!();
 
@@ -318,10 +318,6 @@ pub fn run(
     )?;
     if raster_stage.is_some() && state.selected_stage_dir.is_none() {
         bail!("selected Raster reference stage did not run");
-    }
-    println!("no chain-commitment written (hybrid --no-auth)");
-    if raster_stage.is_none() {
-        println!("no Raster reference selected; parity comparison skipped");
     }
 
     Ok(HybridRun {
@@ -788,7 +784,7 @@ fn run_aux_wave(
     state: &mut ChainRunState,
 ) -> Result<()> {
     println!(
-        "▸ stages {}-{}  prefill_prepare_aux wave   ({} stages)",
+        "▸ stages {}-{}  prefill_prepare_aux   ({} parallel stages)",
         range.start + 1,
         range.end,
         range.end - range.start
@@ -848,7 +844,6 @@ fn run_aux_wave(
         });
     }
     for result in batch.results {
-        println!("  completed {}", result.name);
         state.execution_times[result.idx] = Some(result.duration);
         print_stage_output(&result.output);
         state.output_commitments[result.idx] = Some(result.output.structural_commitment);
@@ -911,11 +906,6 @@ fn run_aux_stage_jobs(current_exe: &Path, jobs: Vec<AuxStageJob>) -> Result<AuxS
         });
     }
     let parallelism = aux_parallelism(jobs.len());
-    println!(
-        "  aux wave: running {} direct-native stages with up to {} subprocesses",
-        jobs.len(),
-        parallelism
-    );
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(parallelism)
         .build()
@@ -1377,7 +1367,7 @@ fn print_direct_timing_summary(
     stages: &[StageSpec],
     execution_times: &[Option<Duration>],
     total_wall_duration: Duration,
-    aux_waves: &[AuxWaveExecutionTime],
+    _aux_waves: &[AuxWaveExecutionTime],
 ) -> Result<()> {
     let stage_duration_sum = execution_times
         .iter()
@@ -1404,18 +1394,6 @@ fn print_direct_timing_summary(
         "  stage duration sum: {}",
         format_duration(stage_duration_sum)
     );
-    for wave in aux_waves {
-        println!(
-            "  aux wave {} ({}..{}): wall={} stage-sum={} parallelism={} effective={}",
-            wave.name,
-            wave.first_stage,
-            wave.last_stage,
-            format_duration_ns(wave.wall_duration_ns),
-            format_duration_ns(wave.stage_duration_sum_ns),
-            wave.parallelism,
-            format_speedup(wave.stage_duration_sum_ns, wave.wall_duration_ns)
-        );
-    }
     Ok(())
 }
 
@@ -1528,7 +1506,6 @@ fn print_stage_output(output: &StageOutput) {
         short_hex(&output.payload_commitment),
         short_hex(&output.structural_commitment)
     );
-    println!("    (no trace, no commitment - hybrid --no-auth)");
     println!();
 }
 
@@ -1545,14 +1522,6 @@ fn format_duration_ns(ns: u128) -> String {
         format!("{:.2}ms", ns as f64 / 1_000_000.0)
     } else {
         format!("{:.2}s", ns as f64 / 1_000_000_000.0)
-    }
-}
-
-fn format_speedup(numerator_ns: u128, denominator_ns: u128) -> String {
-    if denominator_ns == 0 {
-        String::from("—")
-    } else {
-        format!("{:.2}x", numerator_ns as f64 / denominator_ns as f64)
     }
 }
 

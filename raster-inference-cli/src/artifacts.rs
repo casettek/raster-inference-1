@@ -7,56 +7,102 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const CHECKPOINT_TRACE_JSON: &str = "checkpoint_trace.json";
+pub const CHECKPOINT_HASHES_TXT: &str = "checkpoint_hashes.txt";
 pub const CLAIM_BUNDLE_JSON: &str = "claim_bundle.json";
-pub const CLAIM_EXECUTOR: &str = "checkpointed-direct-native";
+pub const DIVERGENCE_JSON: &str = "divergence.json";
+pub const CHALLENGE_TRACE_JSON: &str = "challenge_trace.json";
+pub const REPLAY_PACKAGE_JSON: &str = "replay_package.json";
+pub const CHALLENGE_BUNDLE_JSON: &str = "challenge_bundle.json";
 
 /// Ordered routine-boundary checkpoints from one checkpointed inference run.
-///
-/// Paths are local filesystem paths as written by the current repo run. A later
-/// packaging step can make claims portable without changing this local trace.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
 pub struct CheckpointTrace {
-    pub version: u32,
-    pub chain_dir: PathBuf,
-    pub manifest_path: PathBuf,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution_times_path: Option<PathBuf>,
     pub checkpoints: Vec<Checkpoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Checkpoint {
     pub stage: String,
+    pub input_commitment: String,
     pub output_commitment: String,
-    pub output_path: PathBuf,
-    pub output_index_path: PathBuf,
-    pub output_manifest_path: PathBuf,
     pub output_sha256: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exec_duration_ns: Option<u128>,
 }
 
-/// Small entrypoint artifact for a proposer claim.
-///
-/// The bundle identifies the executor and points at the trace that carries the
-/// full checkpoint list. It intentionally stays local and lightweight for now.
+/// Contract-shaped summary of a proposer claim.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClaimBundle {
     pub version: u32,
-    pub executor: String,
-    pub chain_dir: PathBuf,
-    pub manifest_path: PathBuf,
-    pub checkpoint_trace_path: PathBuf,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution_times_path: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub final_output: Option<CheckpointRef>,
+    pub input: ClaimEndpoint,
+    pub output: ClaimEndpoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CheckpointRef {
+pub struct ClaimEndpoint {
     pub stage: String,
-    pub output_commitment: String,
+    pub commitment: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Divergence {
+    pub version: u32,
+    pub checkpoint_index: usize,
+    pub stage: String,
+    pub reason: DivergenceReason,
+    pub claimed_trace_path: PathBuf,
+    pub recomputed_trace_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed: Option<Checkpoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recomputed: Option<Checkpoint>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DivergenceReason {
+    StageName,
+    InputCommitment,
+    OutputCommitment,
+    OutputSha256,
+    MissingClaimedCheckpoint,
+    MissingRecomputedCheckpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChallengeTrace {
+    pub version: u32,
+    pub stage: String,
+    pub divergence_path: PathBuf,
+    pub replay_package_path: PathBuf,
+    pub raster_commit_path: PathBuf,
+    pub raster_output_commitment: String,
+    pub raster_output_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplayPackage {
+    pub version: u32,
+    pub stage: String,
+    pub replay_run_dir: PathBuf,
+    pub stage_dir: PathBuf,
+    pub input_path: PathBuf,
+    pub input_manifest_path: PathBuf,
+    pub output_path: PathBuf,
+    pub output_index_path: PathBuf,
+    pub output_manifest_path: PathBuf,
+    pub commit_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChallengeBundle {
+    pub version: u32,
+    pub stage: String,
+    pub source_trace_path: PathBuf,
+    pub recomputed_trace_path: PathBuf,
+    pub divergence_path: PathBuf,
+    pub challenge_trace_path: PathBuf,
+    pub replay_package_path: PathBuf,
+    pub raster_commit_path: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,33 +123,136 @@ struct ExecutionTimesDocument {
 #[derive(Debug, Deserialize)]
 struct StageExecutionTime {
     name: String,
-    exec_duration_ns: u128,
 }
 
-pub fn write_claim_artifacts(chain_dir: &Path, manifest_path: &Path) -> Result<(PathBuf, PathBuf)> {
+pub fn write_claim_artifacts(
+    chain_dir: &Path,
+    manifest_path: &Path,
+) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let trace = build_checkpoint_trace(chain_dir, manifest_path)?;
     let trace_path = chain_dir.join(CHECKPOINT_TRACE_JSON);
     write_json(&trace_path, &trace)?;
+    let hashes_path = write_checkpoint_hashes_artifact(chain_dir, &trace)?;
 
-    let final_output = trace.checkpoints.last().map(|checkpoint| CheckpointRef {
-        stage: checkpoint.stage.clone(),
-        output_commitment: checkpoint.output_commitment.clone(),
-    });
+    let first = trace
+        .checkpoints
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("cannot build a claim bundle from an empty trace"))?;
+    let last = trace
+        .checkpoints
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("cannot build a claim bundle from an empty trace"))?;
     let bundle = ClaimBundle {
         version: 1,
-        executor: String::from(CLAIM_EXECUTOR),
-        chain_dir: chain_dir.to_path_buf(),
-        manifest_path: manifest_path.to_path_buf(),
-        checkpoint_trace_path: trace_path.clone(),
-        execution_times_path: trace.execution_times_path.clone(),
-        final_output,
+        input: ClaimEndpoint {
+            stage: first.stage.clone(),
+            commitment: first.input_commitment.clone(),
+        },
+        output: ClaimEndpoint {
+            stage: last.stage.clone(),
+            commitment: last.output_commitment.clone(),
+        },
     };
     let bundle_path = chain_dir.join(CLAIM_BUNDLE_JSON);
     write_json(&bundle_path, &bundle)?;
-    Ok((trace_path, bundle_path))
+    Ok((trace_path, hashes_path, bundle_path))
 }
 
-pub fn build_checkpoint_trace(chain_dir: &Path, manifest_path: &Path) -> Result<CheckpointTrace> {
+pub fn read_checkpoint_trace(path: &Path) -> Result<CheckpointTrace> {
+    read_json(path)
+}
+
+pub fn read_challenge_bundle(path: &Path) -> Result<ChallengeBundle> {
+    read_json(path)
+}
+
+pub fn write_checkpoint_trace_artifact(
+    chain_dir: &Path,
+    trace: &CheckpointTrace,
+) -> Result<PathBuf> {
+    let trace_path = chain_dir.join(CHECKPOINT_TRACE_JSON);
+    write_json(&trace_path, trace)?;
+    Ok(trace_path)
+}
+
+pub fn write_checkpoint_hashes_artifact(
+    chain_dir: &Path,
+    trace: &CheckpointTrace,
+) -> Result<PathBuf> {
+    let hashes_path = chain_dir.join(CHECKPOINT_HASHES_TXT);
+    let mut output = checkpoint_hashes(trace)?.join("\n");
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    fs::write(&hashes_path, output)
+        .with_context(|| format!("failed to write {}", hashes_path.display()))?;
+    Ok(hashes_path)
+}
+
+pub fn checkpoint_hashes(trace: &CheckpointTrace) -> Result<Vec<String>> {
+    trace
+        .checkpoints
+        .iter()
+        .map(|checkpoint| {
+            let encoded = serde_json::to_vec(checkpoint)
+                .context("failed to encode checkpoint for hashing")?;
+            Ok(format!("{:x}", Sha256::digest(encoded)))
+        })
+        .collect()
+}
+
+pub fn write_challenge_artifacts(
+    challenge_dir: &Path,
+    source_trace_path: &Path,
+    recomputed_trace_path: &Path,
+    divergence: &Divergence,
+    replay_package: &ReplayPackage,
+) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+    fs::create_dir_all(challenge_dir)
+        .with_context(|| format!("failed to create {}", challenge_dir.display()))?;
+
+    let divergence_path = challenge_dir.join(DIVERGENCE_JSON);
+    write_json(&divergence_path, divergence)?;
+
+    let replay_package_path = challenge_dir.join(REPLAY_PACKAGE_JSON);
+    write_json(&replay_package_path, replay_package)?;
+
+    let replay_output =
+        read_checkpoint_from_stage_dir(&replay_package.stage, &replay_package.stage_dir)?;
+    let challenge_trace = ChallengeTrace {
+        version: 1,
+        stage: replay_package.stage.clone(),
+        divergence_path: divergence_path.clone(),
+        replay_package_path: replay_package_path.clone(),
+        raster_commit_path: replay_package.commit_path.clone(),
+        raster_output_commitment: replay_output.output_commitment,
+        raster_output_sha256: replay_output.output_sha256,
+    };
+    let challenge_trace_path = challenge_dir.join(CHALLENGE_TRACE_JSON);
+    write_json(&challenge_trace_path, &challenge_trace)?;
+
+    let bundle = ChallengeBundle {
+        version: 1,
+        stage: replay_package.stage.clone(),
+        source_trace_path: source_trace_path.to_path_buf(),
+        recomputed_trace_path: recomputed_trace_path.to_path_buf(),
+        divergence_path: divergence_path.clone(),
+        challenge_trace_path: challenge_trace_path.clone(),
+        replay_package_path: replay_package_path.clone(),
+        raster_commit_path: replay_package.commit_path.clone(),
+    };
+    let bundle_path = challenge_dir.join(CHALLENGE_BUNDLE_JSON);
+    write_json(&bundle_path, &bundle)?;
+
+    Ok((
+        divergence_path,
+        replay_package_path,
+        challenge_trace_path,
+        bundle_path,
+    ))
+}
+
+pub fn build_checkpoint_trace(chain_dir: &Path, _manifest_path: &Path) -> Result<CheckpointTrace> {
     let execution_times_path = chain_dir.join(direct_native::shadow::EXECUTION_TIMES_JSON);
     let execution_times = if execution_times_path.is_file() {
         Some(read_execution_times(&execution_times_path)?)
@@ -128,26 +277,7 @@ pub fn build_checkpoint_trace(chain_dir: &Path, manifest_path: &Path) -> Result<
         if !output_manifest_path.is_file() {
             continue;
         }
-        let output_path = stage_dir.join("output.bin");
-        let output_index_path = stage_dir.join("output.rindex");
-        let manifest: OutputManifest = serde_json::from_slice(
-            &fs::read(&output_manifest_path)
-                .with_context(|| format!("failed to read {}", output_manifest_path.display()))?,
-        )
-        .with_context(|| format!("failed to parse {}", output_manifest_path.display()))?;
-        let output = fs::read(&output_path)
-            .with_context(|| format!("failed to read {}", output_path.display()))?;
-        checkpoints.push(Checkpoint {
-            stage: stage.to_string(),
-            output_commitment: manifest.output.commitment,
-            output_path,
-            output_index_path,
-            output_manifest_path,
-            output_sha256: format!("{:x}", Sha256::digest(&output)),
-            exec_duration_ns: execution_times
-                .as_ref()
-                .and_then(|timings| timings.get(stage).copied()),
-        });
+        checkpoints.push(read_checkpoint_from_stage_dir(stage, &stage_dir)?);
     }
     checkpoints.sort_by(|left, right| match execution_times.as_ref() {
         Some(timings) => timings
@@ -157,12 +287,27 @@ pub fn build_checkpoint_trace(chain_dir: &Path, manifest_path: &Path) -> Result<
         None => left.stage.cmp(&right.stage),
     });
 
-    Ok(CheckpointTrace {
-        version: 1,
-        chain_dir: chain_dir.to_path_buf(),
-        manifest_path: manifest_path.to_path_buf(),
-        execution_times_path: execution_times.map(|_| execution_times_path),
-        checkpoints,
+    Ok(CheckpointTrace { checkpoints })
+}
+
+pub fn read_checkpoint_from_stage_dir(stage: &str, stage_dir: &Path) -> Result<Checkpoint> {
+    let input_manifest_path = stage_dir.join("input_manifest.json");
+    let output_manifest_path = stage_dir.join("output_manifest.json");
+    let output_path = stage_dir.join("output.bin");
+    let input_manifest = fs::read(&input_manifest_path)
+        .with_context(|| format!("failed to read {}", input_manifest_path.display()))?;
+    let manifest: OutputManifest = serde_json::from_slice(
+        &fs::read(&output_manifest_path)
+            .with_context(|| format!("failed to read {}", output_manifest_path.display()))?,
+    )
+    .with_context(|| format!("failed to parse {}", output_manifest_path.display()))?;
+    let output = fs::read(&output_path)
+        .with_context(|| format!("failed to read {}", output_path.display()))?;
+    Ok(Checkpoint {
+        stage: stage.to_string(),
+        input_commitment: format!("{:x}", Sha256::digest(&input_manifest)),
+        output_commitment: manifest.output.commitment,
+        output_sha256: format!("{:x}", Sha256::digest(&output)),
     })
 }
 
@@ -176,14 +321,9 @@ fn read_execution_times(path: &Path) -> Result<ExecutionTimesIndex> {
 
 struct ExecutionTimesIndex {
     order: BTreeMap<String, usize>,
-    durations: BTreeMap<String, u128>,
 }
 
 impl ExecutionTimesIndex {
-    fn get(&self, stage: &str) -> Option<&u128> {
-        self.durations.get(stage)
-    }
-
     fn order(&self, stage: &str) -> usize {
         self.order.get(stage).copied().unwrap_or(usize::MAX)
     }
@@ -192,13 +332,21 @@ impl ExecutionTimesIndex {
 impl From<ExecutionTimesDocument> for ExecutionTimesIndex {
     fn from(document: ExecutionTimesDocument) -> Self {
         let mut order = BTreeMap::new();
-        let mut durations = BTreeMap::new();
         for (idx, stage) in document.stages.into_iter().enumerate() {
-            order.insert(stage.name.clone(), idx);
-            durations.insert(stage.name, stage.exec_duration_ns);
+            order.insert(stage.name, idx);
         }
-        Self { order, durations }
+        Self { order }
     }
+}
+
+fn read_json<T>(path: &Path) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("failed to read {}", path.display()))?,
+    )
+    .with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -228,8 +376,10 @@ mod tests {
 
         let manifest_path = base.join("Raster.toml");
         fs::write(&manifest_path, "[chain]\nname = \"test\"\n").unwrap();
-        let (trace_path, bundle_path) = write_claim_artifacts(&base, &manifest_path).unwrap();
+        let (trace_path, hashes_path, bundle_path) =
+            write_claim_artifacts(&base, &manifest_path).unwrap();
         assert_eq!(trace_path.file_name().unwrap(), CHECKPOINT_TRACE_JSON);
+        assert_eq!(hashes_path.file_name().unwrap(), CHECKPOINT_HASHES_TXT);
         assert_eq!(bundle_path.file_name().unwrap(), CLAIM_BUNDLE_JSON);
 
         let trace: CheckpointTrace =
@@ -238,17 +388,20 @@ mod tests {
 
         assert_eq!(trace.checkpoints[0].stage, "stage_b");
         assert_eq!(trace.checkpoints[0].output_commitment, "bbb");
-        assert_eq!(trace.checkpoints[0].exec_duration_ns, Some(20));
         assert_eq!(trace.checkpoints[1].stage, "stage_a");
-        assert_eq!(trace.checkpoints[1].exec_duration_ns, Some(10));
-        assert_eq!(bundle.executor, CLAIM_EXECUTOR);
-        assert_eq!(bundle.checkpoint_trace_path, trace_path);
+        assert_eq!(checkpoint_hashes(&trace).unwrap().len(), 2);
+        assert_eq!(fs::read_to_string(&hashes_path).unwrap().lines().count(), 2);
+        assert!(trace_path.is_file());
+        assert!(hashes_path.is_file());
+        let input_commitment = format!("{:x}", Sha256::digest(b"input-manifest"));
+        assert_eq!(bundle.input.stage, "stage_b");
+        assert_eq!(bundle.input.commitment, input_commitment);
         assert_eq!(
-            bundle.final_output,
-            Some(CheckpointRef {
+            bundle.output,
+            ClaimEndpoint {
                 stage: String::from("stage_a"),
-                output_commitment: String::from("aaa")
-            })
+                commitment: String::from("aaa")
+            }
         );
 
         fs::remove_dir_all(base).unwrap();
@@ -267,7 +420,6 @@ mod tests {
         fs::write(&manifest_path, "[chain]\nname = \"test\"\n").unwrap();
         let trace = build_checkpoint_trace(&base, &manifest_path).unwrap();
 
-        assert_eq!(trace.execution_times_path, None);
         assert_eq!(
             trace
                 .checkpoints
@@ -283,31 +435,23 @@ mod tests {
     #[test]
     fn claim_artifacts_round_trip_as_json() {
         let trace = CheckpointTrace {
-            version: 1,
-            chain_dir: PathBuf::from("run"),
-            manifest_path: PathBuf::from("Raster.toml"),
-            execution_times_path: Some(PathBuf::from("execution-times.json")),
             checkpoints: vec![Checkpoint {
                 stage: String::from("output_finalize"),
+                input_commitment: String::from("input"),
                 output_commitment: String::from("abc"),
-                output_path: PathBuf::from("output_finalize/output.bin"),
-                output_index_path: PathBuf::from("output_finalize/output.rindex"),
-                output_manifest_path: PathBuf::from("output_finalize/output_manifest.json"),
                 output_sha256: String::from("deadbeef"),
-                exec_duration_ns: Some(42),
             }],
         };
         let bundle = ClaimBundle {
             version: 1,
-            executor: String::from(CLAIM_EXECUTOR),
-            chain_dir: trace.chain_dir.clone(),
-            manifest_path: trace.manifest_path.clone(),
-            checkpoint_trace_path: PathBuf::from(CHECKPOINT_TRACE_JSON),
-            execution_times_path: trace.execution_times_path.clone(),
-            final_output: Some(CheckpointRef {
+            input: ClaimEndpoint {
+                stage: String::from("prompt_prepare"),
+                commitment: String::from("input"),
+            },
+            output: ClaimEndpoint {
                 stage: String::from("output_finalize"),
-                output_commitment: String::from("abc"),
-            }),
+                commitment: String::from("abc"),
+            },
         };
 
         assert_eq!(
@@ -321,9 +465,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn challenge_artifacts_summarize_raster_replay() {
+        let base = temp_dir("challenge-artifacts");
+        let replay_run_dir = base.join("replay");
+        fs::create_dir_all(&replay_run_dir).unwrap();
+        write_stage(
+            &replay_run_dir,
+            "stage_a",
+            "raster-commitment",
+            b"raster-output",
+        );
+        let stage_dir = replay_run_dir.join("stage_a");
+        fs::write(stage_dir.join("input.json"), b"{}").unwrap();
+        fs::write(stage_dir.join("input_manifest.json"), b"{}").unwrap();
+        fs::write(stage_dir.join("commit.bin"), b"commit").unwrap();
+
+        let divergence = Divergence {
+            version: 1,
+            checkpoint_index: 0,
+            stage: String::from("stage_a"),
+            reason: DivergenceReason::OutputCommitment,
+            claimed_trace_path: PathBuf::from("claimed.json"),
+            recomputed_trace_path: PathBuf::from("recomputed.json"),
+            claimed: Some(Checkpoint {
+                stage: String::from("stage_a"),
+                input_commitment: String::from("input"),
+                output_commitment: String::from("claimed"),
+                output_sha256: String::from("111"),
+            }),
+            recomputed: Some(Checkpoint {
+                stage: String::from("stage_a"),
+                input_commitment: String::from("input"),
+                output_commitment: String::from("recomputed"),
+                output_sha256: String::from("222"),
+            }),
+        };
+        let replay_package = ReplayPackage {
+            version: 1,
+            stage: String::from("stage_a"),
+            replay_run_dir: replay_run_dir.clone(),
+            stage_dir: stage_dir.clone(),
+            input_path: stage_dir.join("input.json"),
+            input_manifest_path: stage_dir.join("input_manifest.json"),
+            output_path: stage_dir.join("output.bin"),
+            output_index_path: stage_dir.join("output.rindex"),
+            output_manifest_path: stage_dir.join("output_manifest.json"),
+            commit_path: stage_dir.join("commit.bin"),
+        };
+
+        let (divergence_path, replay_package_path, challenge_trace_path, bundle_path) =
+            write_challenge_artifacts(
+                &base.join("challenge"),
+                Path::new("claimed.json"),
+                Path::new("recomputed.json"),
+                &divergence,
+                &replay_package,
+            )
+            .unwrap();
+
+        assert_eq!(divergence_path.file_name().unwrap(), DIVERGENCE_JSON);
+        assert_eq!(
+            replay_package_path.file_name().unwrap(),
+            REPLAY_PACKAGE_JSON
+        );
+        assert_eq!(
+            challenge_trace_path.file_name().unwrap(),
+            CHALLENGE_TRACE_JSON
+        );
+        assert_eq!(bundle_path.file_name().unwrap(), CHALLENGE_BUNDLE_JSON);
+
+        let bundle: ChallengeBundle =
+            serde_json::from_slice(&fs::read(&bundle_path).unwrap()).unwrap();
+        assert_eq!(bundle.stage, "stage_a");
+        assert_eq!(bundle.raster_commit_path, replay_package.commit_path);
+
+        let challenge_trace: ChallengeTrace =
+            serde_json::from_slice(&fs::read(&challenge_trace_path).unwrap()).unwrap();
+        assert_eq!(
+            challenge_trace.raster_output_commitment,
+            "raster-commitment"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
     fn write_stage(base: &Path, stage: &str, commitment: &str, output: &[u8]) {
         let stage_dir = base.join(stage);
         fs::create_dir_all(&stage_dir).unwrap();
+        fs::write(stage_dir.join("input_manifest.json"), b"input-manifest").unwrap();
         fs::write(stage_dir.join("output.bin"), output).unwrap();
         fs::write(stage_dir.join("output.rindex"), b"index").unwrap();
         fs::write(

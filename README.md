@@ -6,24 +6,29 @@ exactly N generated token IDs and decoded text out, one stage per inference
 phase, expanded per layer and generated token.
 
 ```sh
-cargo run --manifest-path raster-inference-cli/Cargo.toml -- model import \
+cargo run --release --manifest-path raster-inference-cli/Cargo.toml -- model import \
   --model ../raster-inference/assets/tiny-gemma-dev --prompt "hello raster"
-cargo run --manifest-path raster-inference-cli/Cargo.toml -- claim build
+cargo run --release --manifest-path raster-inference-cli/Cargo.toml -- claim build
 ```
 
 `claim build` runs the direct-native checkpointed path without selecting a
-Raster reference stage, then writes a `checkpoint_trace.json` and
-`claim_bundle.json` beside the generated checkpoints. Use the lower-level
+Raster reference stage, then writes a compact `checkpoint_trace.json`,
+`checkpoint_hashes.txt`, and `claim_bundle.json` beside the generated
+checkpoints. Use the lower-level
 `cargo raster chain run --no-auth --show-output` flow when you specifically
 need the Raster runner to render the generated text. See
 [Generating N tokens](#generating-n-tokens).
 
-Those two claim files are the stable phase-two artifacts. The trace is the
-ordered list of local checkpoint outputs from the run; the bundle is the small
-entry point that names the executor, points at the trace, and records the final
-claimed checkpoint. Future workflow outputs such as `InferenceResult`,
-`Divergence`, `ChallengeTrace`, `ReplayPackage`, `ChallengeBundle`, and
-`FaultProof` are planned names, not emitted by this repo yet.
+Those claim files are the stable phase-two artifacts. The trace is an ordered
+JSON array of checkpoint records; each record names the stage, the SHA-256 of
+that stage's `input_manifest.json`, the output structural commitment, and the
+output payload SHA-256. The hashes file is one SHA-256 per checkpoint record,
+one per line. The bundle is the contract-shaped summary: whole-claim `input`
+and `output` commitments only. `challenge build` consumes one of those traces,
+reruns the checkpointed path, and emits `Divergence`, `ChallengeTrace`,
+`ReplayPackage`, and `ChallengeBundle` when a mismatch is found. Future workflow
+outputs such as `InferenceResult` and `FaultProof` are planned names, not
+emitted by this repo yet.
 
 ```text
    tokenizer      embedding      ple layers    layer weights     head
@@ -407,29 +412,40 @@ The workflow CLI is the developer-facing entry point for this repo:
 
 ```bash
 # regenerate every committed external + the root manifest from a model bundle
-cargo run --manifest-path raster-inference-cli/Cargo.toml -- model import \
+cargo run --release --manifest-path raster-inference-cli/Cargo.toml -- model import \
   --model ../raster-inference/assets/tiny-gemma-dev --prompt "hello raster"
 
 # build a proposer claim with all direct-native checkpoints
-cargo run --manifest-path raster-inference-cli/Cargo.toml -- claim build
+cargo run --release --manifest-path raster-inference-cli/Cargo.toml -- claim build
+
+# compare an existing checkpoint trace against a fresh run, then build a Raster
+# replay package for the first divergent stage
+cargo run --release --manifest-path raster-inference-cli/Cargo.toml -- challenge build \
+  --trace target/direct-native/chains-no-auth/.../checkpoint_trace.json
 
 # reserved for the future unconstrained native inference executor
-cargo run --manifest-path raster-inference-cli/Cargo.toml -- infer
+cargo run --release --manifest-path raster-inference-cli/Cargo.toml -- infer
 ```
 
-`claim build` currently emits two stable JSON files in the direct-native chain
-run directory:
+`claim build` currently emits three stable files in the direct-native chain run
+directory:
 
-- `checkpoint_trace.json`: versioned, ordered checkpoint metadata for every
-  stage output, including structural commitment, local output paths, payload
-  SHA-256, and execution duration when `execution-times.json` exists.
-- `claim_bundle.json`: a lightweight local bundle with the executor name, the
-  manifest path, the trace path, the optional timing path, and the final
-  checkpoint reference.
+- `checkpoint_trace.json`: an ordered JSON array with each stage's input
+  manifest commitment, output structural commitment, and output payload SHA-256.
+- `checkpoint_hashes.txt`: one line-delimited SHA-256 hash per checkpoint record
+  in `checkpoint_trace.json`.
+- `claim_bundle.json`: a path-free claim summary with whole-claim `input` and
+  `output` commitments.
 
-The challenge and fault-proof commands are intentionally reserved until their
-artifact producers exist. For now, lower-level Raster and direct-native commands
-remain backend/debug surfaces, not the primary developer API.
+`challenge build` has two successful outcomes. If the fresh checkpointed run
+matches the referenced trace, it prints `no divergence found` plus both trace
+paths. If a checkpoint diverges, it prints the first divergent stage, the
+claimed and recomputed commitments, the generated Raster `commit.bin` fingerprint
+path, and the `challenge_bundle.json` path.
+
+The fault-proof command is intentionally reserved until its artifact producer
+exists. For now, lower-level Raster and direct-native commands remain
+backend/debug surfaces, not the primary developer API.
 
 The older commands below are lower-level development and verification surfaces:
 

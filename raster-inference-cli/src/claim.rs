@@ -21,6 +21,7 @@ pub struct ClaimBuildOptions {
 pub struct ClaimBuildResult {
     pub chain_dir: PathBuf,
     pub checkpoint_trace_path: PathBuf,
+    pub checkpoint_hashes_path: PathBuf,
     pub claim_bundle_path: PathBuf,
 }
 
@@ -40,11 +41,12 @@ fn write_claim_result(
     checkpointed: CheckpointedInferenceResult,
     manifest_path: &PathBuf,
 ) -> Result<ClaimBuildResult> {
-    let (checkpoint_trace_path, claim_bundle_path) =
+    let (checkpoint_trace_path, checkpoint_hashes_path, claim_bundle_path) =
         write_claim_artifacts(&checkpointed.chain_dir, manifest_path)?;
     Ok(ClaimBuildResult {
         chain_dir: checkpointed.chain_dir,
         checkpoint_trace_path,
+        checkpoint_hashes_path,
         claim_bundle_path,
     })
 }
@@ -117,6 +119,10 @@ mod tests {
             CHECKPOINT_TRACE_JSON
         );
         assert_eq!(
+            result.checkpoint_hashes_path.file_name().unwrap(),
+            crate::artifacts::CHECKPOINT_HASHES_TXT
+        );
+        assert_eq!(
             result.claim_bundle_path.file_name().unwrap(),
             CLAIM_BUNDLE_JSON
         );
@@ -127,6 +133,7 @@ mod tests {
     fn write_stage(base: &PathBuf, stage: &str, commitment: &str, output: &[u8]) {
         let stage_dir = base.join(stage);
         fs::create_dir_all(&stage_dir).unwrap();
+        fs::write(stage_dir.join("input_manifest.json"), b"input-manifest").unwrap();
         fs::write(stage_dir.join("output.bin"), output).unwrap();
         fs::write(stage_dir.join("output.rindex"), b"index").unwrap();
         fs::write(
