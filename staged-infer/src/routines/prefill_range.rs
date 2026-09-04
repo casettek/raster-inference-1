@@ -4,13 +4,17 @@ use anyhow::Result;
 use prefill_range::input::{ActivationSequence, PleLayerInputs, TransformerLayer};
 
 use crate::artifact_io::{with_main_sequence_scope, with_stage_sequence_scope};
-use crate::cache::CachedInputs;
+use crate::cache::{materialization_key_from_stage_files, CachedInputs, MaterializationCacheKey};
 
-pub use crate::kernels::prefill_range::{run_prefill_range_direct, PrefillRangeDirectInputs};
+pub use crate::kernels::prefill_range::{
+    run_prefill_range_direct, run_prefill_range_direct_with_weight_cache, PrefillRangeDirectInputs,
+    PrefillRangeWeightCache,
+};
 
 pub struct Inputs {
     pub activations: ActivationSequence,
     pub layer: TransformerLayer,
+    pub layer_cache_key: Option<MaterializationCacheKey>,
     pub prior_kv: ActivationSequence,
     pub donor_a_kv: ActivationSequence,
     pub donor_b_kv: ActivationSequence,
@@ -18,7 +22,7 @@ pub struct Inputs {
 }
 
 pub fn load_inputs_from_args() -> Result<Inputs> {
-    with_main_sequence_scope(|| load_inputs_from_initialized_runtime(&CachedInputs::new()))
+    with_main_sequence_scope(|| load_inputs_from_initialized_runtime(&CachedInputs::new(), None))
 }
 
 pub fn load_inputs_from_paths(
@@ -26,23 +30,39 @@ pub fn load_inputs_from_paths(
     input_manifest: &Path,
     cached_inputs: &CachedInputs,
 ) -> Result<Inputs> {
+    let layer_key =
+        materialization_key_from_stage_files::<TransformerLayer>(input, input_manifest, "layer")?;
     with_stage_sequence_scope(input, input_manifest, || {
-        load_inputs_from_initialized_runtime(cached_inputs)
+        load_inputs_from_initialized_runtime(cached_inputs, layer_key)
     })
 }
 
 pub fn run_direct(inputs: &Inputs) -> Result<ActivationSequence> {
-    run_prefill_range_direct(PrefillRangeDirectInputs {
-        activations: &inputs.activations,
-        layer: &inputs.layer,
-        prior_kv: &inputs.prior_kv,
-        donor_a_kv: &inputs.donor_a_kv,
-        donor_b_kv: &inputs.donor_b_kv,
-        ple: &inputs.ple,
-    })
+    run_direct_with_weight_cache(inputs, None)
 }
 
-fn load_inputs_from_initialized_runtime(cached_inputs: &CachedInputs) -> Result<Inputs> {
+pub fn run_direct_with_weight_cache(
+    inputs: &Inputs,
+    weight_cache: Option<&PrefillRangeWeightCache>,
+) -> Result<ActivationSequence> {
+    run_prefill_range_direct_with_weight_cache(
+        PrefillRangeDirectInputs {
+            activations: &inputs.activations,
+            layer: &inputs.layer,
+            layer_cache_key: inputs.layer_cache_key.as_ref(),
+            prior_kv: &inputs.prior_kv,
+            donor_a_kv: &inputs.donor_a_kv,
+            donor_b_kv: &inputs.donor_b_kv,
+            ple: &inputs.ple,
+        },
+        weight_cache,
+    )
+}
+
+fn load_inputs_from_initialized_runtime(
+    cached_inputs: &CachedInputs,
+    layer_key: Option<MaterializationCacheKey>,
+) -> Result<Inputs> {
     let binding = raster::start_program(&[
         raster::entry_argument_spec::<ActivationSequence>("activations"),
         raster::entry_argument_spec::<TransformerLayer>("layer"),
@@ -90,6 +110,7 @@ fn load_inputs_from_initialized_runtime(cached_inputs: &CachedInputs) -> Result<
     Ok(Inputs {
         activations,
         layer,
+        layer_cache_key: layer_key,
         prior_kv,
         donor_a_kv,
         donor_b_kv,

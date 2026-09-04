@@ -2,7 +2,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use direct_native::shadow::{
+use staged_infer::shadow::{
     render_timing_summary, ChainExecutionTimes, ParityAuthority, RasterSourceMode, ShadowReport,
 };
 
@@ -10,8 +10,8 @@ use direct_native::shadow::{
 fn parity_artifacts_live_under_stage_directory() {
     let stage = Path::new("target/raster/chains/run/prefill_range_l3");
     assert_eq!(
-        direct_native::shadow::parity_dir(stage),
-        stage.join("direct-native-parity")
+        staged_infer::shadow::parity_dir(stage),
+        stage.join("staged-infer-parity")
     );
 }
 
@@ -104,7 +104,7 @@ fn timing_summary_reports_wall_time_and_aux_wave_speedup() {
 }
 
 #[test]
-#[ignore = "runs the full direct-native chain twice"]
+#[ignore = "runs the full staged-infer chain twice"]
 fn full_chain_parallel_aux_matches_single_worker_outputs() {
     let single_worker = run_chain_with_aux_parallelism("1");
     let parallel = run_chain_with_aux_parallelism("4");
@@ -123,13 +123,13 @@ fn full_chain_parallel_aux_matches_single_worker_outputs() {
 fn run_chain_with_aux_parallelism(parallelism: &str) -> PathBuf {
     let output = Command::new(full_chain_binary())
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
-        .args(["chain", "run", "--direct-subprocess"])
-        .env("DIRECT_NATIVE_AUX_PARALLELISM", parallelism)
+        .args(["chain", "run", "--staged-subprocess"])
+        .env("STAGED_INFER_AUX_PARALLELISM", parallelism)
         .output()
-        .expect("direct-native chain run should spawn");
+        .expect("staged-infer chain run should spawn");
     assert!(
         output.status.success(),
-        "direct-native chain run failed\nstdout:\n{}\nstderr:\n{}",
+        "staged-infer chain run failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -137,21 +137,21 @@ fn run_chain_with_aux_parallelism(parallelism: &str) -> PathBuf {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .find_map(|line| line.trim().strip_prefix("dir: ").map(PathBuf::from))
-        .expect("direct-native output should print chain run dir")
+        .expect("staged-infer output should print chain run dir")
 }
 
 fn full_chain_binary() -> PathBuf {
-    if let Ok(path) = std::env::var("DIRECT_NATIVE_FULL_CHAIN_BIN") {
+    if let Ok(path) = std::env::var("STAGED_INFER_FULL_CHAIN_BIN") {
         return PathBuf::from(path);
     }
 
     let release_binary = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join("release")
-        .join("direct-native");
+        .join("staged-infer");
     assert!(
         release_binary.is_file(),
-        "build the release binary first with `cargo build --release --manifest-path direct-native/Cargo.toml`, or set DIRECT_NATIVE_FULL_CHAIN_BIN"
+        "build the release binary first with `cargo build --release --manifest-path staged-infer/Cargo.toml`, or set STAGED_INFER_FULL_CHAIN_BIN"
     );
     release_binary
 }

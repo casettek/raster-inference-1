@@ -1,9 +1,13 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
 use anyhow::{bail, Result};
 use det_num::ops::{attention_softmax, rope_rotate_pairs_in_place};
 use det_num::{Acc, Act};
 use raster::List;
 use rayon::prelude::*;
 
+use crate::cache::MaterializationCacheKey;
 use crate::tensor::{
     dot_bits, linear_slab, mac_weighted_value, pack_i32_page, requantize_acc, unpack_page_i32s,
     Matrix, Slab,
@@ -16,17 +20,70 @@ use ::prefill_range::input::{
 pub struct PrefillRangeDirectInputs<'a> {
     pub activations: &'a ActivationSequence,
     pub layer: &'a TransformerLayer,
+    pub layer_cache_key: Option<&'a MaterializationCacheKey>,
     pub prior_kv: &'a ActivationSequence,
     pub donor_a_kv: &'a ActivationSequence,
     pub donor_b_kv: &'a ActivationSequence,
     pub ple: &'a PleLayerInputs,
 }
 
+pub struct PrefillRangeWeightCache {
+    state: Mutex<PrefillRangeWeightCacheState>,
+    capacity: usize,
+}
+
+#[derive(Default)]
+struct PrefillRangeWeightCacheState {
+    weights: BTreeMap<PreparedLayerWeightCacheKey, Arc<LayerWeights>>,
+    order: VecDeque<PreparedLayerWeightCacheKey>,
+}
+
+impl Default for PrefillRangeWeightCache {
+    fn default() -> Self {
+        let capacity = std::env::var("STAGED_INFER_PREFILL_WEIGHT_CACHE_ENTRIES")
+            .or_else(|_| std::env::var("DIRECT_NATIVE_PREFILL_WEIGHT_CACHE_ENTRIES"))
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        Self {
+            state: Mutex::new(PrefillRangeWeightCacheState::default()),
+            capacity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LayerWeightCacheKey {
+    layer_idx: u32,
+    hidden_size: u32,
+    ffn_size: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    ple_width: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PreparedLayerWeightCacheKey {
+    materialization: MaterializationCacheKey,
+    params: LayerWeightCacheKey,
+}
+
 pub fn run_prefill_range_direct(
     inputs: PrefillRangeDirectInputs<'_>,
 ) -> Result<ActivationSequence> {
+    run_prefill_range_direct_with_weight_cache(inputs, None)
+}
+
+pub fn run_prefill_range_direct_with_weight_cache(
+    inputs: PrefillRangeDirectInputs<'_>,
+    weight_cache: Option<&PrefillRangeWeightCache>,
+) -> Result<ActivationSequence> {
     let params = validate_layer_params(&inputs.layer.params)?;
-    let weights = LayerWeights::from_layer(inputs.layer, &params)?;
+    let weights = match (weight_cache, inputs.layer_cache_key) {
+        (Some(cache), Some(key)) => cache.get_or_prepare(inputs.layer, &params, key)?,
+        _ => Arc::new(LayerWeights::from_layer(inputs.layer, &params)?),
+    };
     let input_rows = activation_rows(inputs.activations, params.hidden_size as usize)?;
 
     if input_rows.rows() == 0 {
@@ -68,6 +125,62 @@ pub fn run_prefill_range_direct(
         kv: List::from(output_kv),
         start_position: inputs.activations.start_position,
     })
+}
+
+impl PrefillRangeWeightCache {
+    #[cfg(test)]
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(PrefillRangeWeightCacheState::default()),
+            capacity,
+        }
+    }
+
+    fn get_or_prepare(
+        &self,
+        layer: &TransformerLayer,
+        params: &LayerParams,
+        materialization_key: &MaterializationCacheKey,
+    ) -> Result<Arc<LayerWeights>> {
+        if self.capacity == 0 {
+            return Ok(Arc::new(LayerWeights::from_layer(layer, params)?));
+        }
+
+        let key = PreparedLayerWeightCacheKey {
+            materialization: materialization_key.clone(),
+            params: LayerWeightCacheKey::from(params),
+        };
+        if let Some(weights) = self.state.lock().unwrap().weights.get(&key).cloned() {
+            return Ok(weights);
+        }
+        let weights = Arc::new(LayerWeights::from_layer(layer, params)?);
+        let mut state = self.state.lock().unwrap();
+        if let Some(existing) = state.weights.get(&key).cloned() {
+            return Ok(existing);
+        }
+        if state.weights.len() >= self.capacity {
+            if let Some(evicted) = state.order.pop_front() {
+                state.weights.remove(&evicted);
+            }
+        }
+        state.order.push_back(key.clone());
+        state.weights.insert(key, weights.clone());
+        Ok(weights)
+    }
+}
+
+impl From<&LayerParams> for LayerWeightCacheKey {
+    fn from(params: &LayerParams) -> Self {
+        Self {
+            layer_idx: params.layer_idx,
+            hidden_size: params.hidden_size,
+            ffn_size: params.ffn_size,
+            num_heads: params.num_heads,
+            num_kv_heads: params.num_kv_heads,
+            head_dim: params.head_dim,
+            ple_width: params.ple_width,
+        }
+    }
 }
 
 struct InputRows {
@@ -659,7 +772,9 @@ fn finish_layer(xs: &[i32], mut projected: Vec<i32>, params: &LayerParams) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ::prefill_range::input::{pack_i32s, LayerParams};
+    use ::prefill_range::input::{pack_i32s, LayerParams, TransformerLayer};
+    use raster::Bytes;
+    use std::sync::Arc;
 
     fn tiny_params() -> LayerParams {
         LayerParams {
@@ -690,6 +805,30 @@ mod tests {
         }
     }
 
+    fn paged(values: &[i32]) -> Bytes<196_608> {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        Bytes::<196_608>::paged(bytes).unwrap()
+    }
+
+    fn tiny_layer() -> TransformerLayer {
+        let matrix = paged(&[1 << 16, 0, 0, 1 << 16]);
+        TransformerLayer {
+            params: tiny_params(),
+            w_q: matrix.clone(),
+            w_k: matrix.clone(),
+            w_v: matrix.clone(),
+            w_o: matrix.clone(),
+            w_gate: matrix.clone(),
+            w_up: matrix.clone(),
+            w_down: matrix.clone(),
+            ple_input_gate: matrix.clone(),
+            ple_layer_projection: matrix,
+        }
+    }
+
     #[test]
     fn rejects_invalid_head_grouping() {
         let mut params = tiny_params();
@@ -707,5 +846,25 @@ mod tests {
         assert!(!is_visible(3, 1, 2));
         assert!(!is_visible(3, 4, 0));
         assert!(is_visible(3, 0, 0));
+    }
+
+    #[test]
+    fn weight_cache_reuses_prepared_weights_for_same_layer_key() {
+        let cache = PrefillRangeWeightCache::with_capacity(1);
+        let layer = tiny_layer();
+        let params = validate_layer_params(&layer.params).unwrap();
+        let key = MaterializationCacheKey {
+            param: String::from("layer"),
+            path: "layer.rastered".into(),
+            index_path: "layer.rindex".into(),
+            commitment: String::from("abc"),
+            type_name: std::any::type_name::<TransformerLayer>(),
+        };
+
+        let first = cache.get_or_prepare(&layer, &params, &key).unwrap();
+        let second = cache.get_or_prepare(&layer, &params, &key).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.state.lock().unwrap().weights.len(), 1);
     }
 }

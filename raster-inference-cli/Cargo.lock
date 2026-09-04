@@ -976,29 +976,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "direct-native"
+name = "direct-infer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap",
- "decode-embed",
- "decode-select-token",
  "det-num",
- "hex",
- "input-embedding",
- "output-finalize",
- "prefill-finalize",
- "prefill-prepare-aux",
- "prefill-range",
- "prompt-prepare",
- "raster",
- "raster-core",
- "raster-runtime",
- "rayon",
+ "inference-artifacts",
  "serde",
- "serde_json",
- "sha2",
- "toml 0.8.23",
 ]
 
 [[package]]
@@ -1764,6 +1748,17 @@ dependencies = [
  "portable-atomic",
  "unicode-width",
  "web-time",
+]
+
+[[package]]
+name = "inference-artifacts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -2716,13 +2711,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "direct-native",
+ "direct-infer",
  "hex",
+ "inference-artifacts",
  "model-import",
  "raster-runtime",
  "serde",
  "serde_json",
  "sha2",
+ "staged-infer",
 ]
 
 [[package]]
@@ -3528,6 +3525,33 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "staged-infer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "decode-embed",
+ "decode-select-token",
+ "det-num",
+ "hex",
+ "inference-artifacts",
+ "input-embedding",
+ "output-finalize",
+ "prefill-finalize",
+ "prefill-prepare-aux",
+ "prefill-range",
+ "prompt-prepare",
+ "raster",
+ "raster-core",
+ "raster-runtime",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml 0.8.23",
+]
 
 [[package]]
 name = "static_assertions"

@@ -3,15 +3,15 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use decode_select_token::input::{LogitEntry, PrefillLogits};
-use direct_native::hybrid::DirectStageBackend;
-use direct_native::{
-    CheckpointedInferenceConfig, CheckpointedInferenceExecutor, UnconstrainedInferenceConfig,
-    UnconstrainedInferenceExecutor,
-};
 use output_finalize::input::{DecoderTable, DecoderToken};
 use raster::List;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use staged_infer::hybrid::StagedExecutionBackend;
+use staged_infer::{
+    ArtifactlessStagedInferenceConfig, ArtifactlessStagedInferenceExecutor,
+    CheckpointedInferenceConfig, CheckpointedInferenceExecutor,
+};
 
 #[test]
 fn infer_final_result_matches_checkpointed_claim_path() {
@@ -51,24 +51,27 @@ fn infer_final_result_matches_checkpointed_claim_path() {
     let decoder_commitment = write_external(&base, "decoder", &decoder);
     write_manifest(&base, &logits_commitment, &decoder_commitment);
 
-    let infer_result = UnconstrainedInferenceExecutor
-        .run(UnconstrainedInferenceConfig {
+    let infer_report = ArtifactlessStagedInferenceExecutor
+        .run_with_report(ArtifactlessStagedInferenceConfig {
             base_dir: base.clone(),
             manifest_path: base.join("Raster.toml"),
         })
         .unwrap();
+    let infer_result = infer_report.result;
     assert!(
         !base.join("target").exists(),
         "infer should not write checkpoint artifacts under the imported workspace"
     );
+    assert_eq!(infer_report.timings.stages.len(), 3);
+    assert!(infer_report.timings.aux_waves.is_empty());
 
     let checkpointed = CheckpointedInferenceExecutor
         .run(CheckpointedInferenceConfig {
             base_dir: base.clone(),
             manifest_path: base.join("Raster.toml"),
             current_exe: PathBuf::from("unused-for-in-process"),
-            direct_backend: DirectStageBackend::InProcess,
-            parity_policy: direct_native::ParityPolicy::Skip,
+            staged_backend: StagedExecutionBackend::InProcess,
+            parity_policy: staged_infer::ParityPolicy::Skip,
         })
         .unwrap();
     let checkpointed_result = checkpointed
@@ -136,7 +139,7 @@ fn temp_dir(label: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "direct-native-{label}-{}-{nanos}",
+        "staged-infer-{label}-{}-{nanos}",
         std::process::id()
     ))
 }

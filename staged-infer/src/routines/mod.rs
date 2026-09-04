@@ -6,7 +6,7 @@ use raster_runtime::OutputArtifact;
 use serde::Serialize;
 
 use crate::artifact_io::{encode_output, write_output, EncodedArtifact};
-use crate::cache::{CachedInputs, CachedStageValue};
+use crate::cache::{CachedInputs, CachedStageValue, MaterializationCache};
 
 pub mod decode_embed;
 pub mod decode_init;
@@ -47,6 +47,13 @@ pub struct DirectPublishOutput {
 pub struct DirectCachedOutput {
     pub encoded: EncodedArtifact,
     pub output: CachedStageValue,
+    pub timings: DirectTimings,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct RoutineRunCaches<'a> {
+    pub materializations: Option<&'a MaterializationCache>,
+    pub prefill_range_weights: Option<&'a crate::prefill_range::PrefillRangeWeightCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +90,7 @@ impl StageKind {
                 Ok(Self::DecodeEmbed)
             }
             "output-finalize" if name == "output_finalize" => Ok(Self::OutputFinalize),
-            _ => bail!("stage `{name}` with project `{project}` is not supported by direct-native"),
+            _ => bail!("stage `{name}` with project `{project}` is not supported by staged-infer"),
         }
     }
 
@@ -119,7 +126,7 @@ impl StageKind {
             _ if name.starts_with("decode_range_t") => Ok(Self::PrefillRange {
                 layer: parse_trailing_layer_index(name)?,
             }),
-            _ => bail!("stage `{name}` is not supported by direct-native"),
+            _ => bail!("stage `{name}` is not supported by staged-infer"),
         }
     }
 
@@ -386,6 +393,22 @@ pub fn run_cached_from_paths(
     input_manifest_path: &Path,
     cached_inputs: &CachedInputs,
 ) -> Result<DirectCachedOutput> {
+    run_cached_from_paths_with_caches(
+        kind,
+        input_path,
+        input_manifest_path,
+        cached_inputs,
+        RoutineRunCaches::default(),
+    )
+}
+
+pub fn run_cached_from_paths_with_caches(
+    kind: &StageKind,
+    input_path: &Path,
+    input_manifest_path: &Path,
+    cached_inputs: &CachedInputs,
+    caches: RoutineRunCaches<'_>,
+) -> Result<DirectCachedOutput> {
     match kind {
         StageKind::PromptPrepare => cache(
             || {
@@ -401,10 +424,11 @@ pub fn run_cached_from_paths(
         ),
         StageKind::InputEmbedding => cache(
             || {
-                input_embedding::load_inputs_from_paths(
+                input_embedding::load_inputs_from_paths_with_cache(
                     input_path,
                     input_manifest_path,
                     cached_inputs,
+                    caches.materializations,
                 )
             },
             input_embedding::run_direct,
@@ -431,16 +455,19 @@ pub fn run_cached_from_paths(
                     cached_inputs,
                 )
             },
-            prefill_range::run_direct,
+            |inputs| {
+                prefill_range::run_direct_with_weight_cache(inputs, caches.prefill_range_weights)
+            },
             "prefill_range",
             CachedStageValue::RangeActivations,
         ),
         StageKind::PrefillFinalize => cache(
             || {
-                prefill_finalize::load_inputs_from_paths(
+                prefill_finalize::load_inputs_from_paths_with_cache(
                     input_path,
                     input_manifest_path,
                     cached_inputs,
+                    caches.materializations,
                 )
             },
             prefill_finalize::run_direct,
@@ -466,7 +493,14 @@ pub fn run_cached_from_paths(
             CachedStageValue::DecodeEdge,
         ),
         StageKind::DecodeEmbed => cache(
-            || decode_embed::load_inputs_from_paths(input_path, input_manifest_path, cached_inputs),
+            || {
+                decode_embed::load_inputs_from_paths_with_cache(
+                    input_path,
+                    input_manifest_path,
+                    cached_inputs,
+                    caches.materializations,
+                )
+            },
             decode_embed::run_direct,
             "decode_embed",
             CachedStageValue::DecodeActivations,
@@ -500,12 +534,12 @@ where
     let input_load_duration = input_load_started.elapsed();
 
     let kernel_started = Instant::now();
-    let output = run(&inputs).with_context(|| format!("direct-native {label} execution failed"))?;
+    let output = run(&inputs).with_context(|| format!("staged-infer {label} execution failed"))?;
     let kernel_duration = kernel_started.elapsed();
 
     let encode_write_started = Instant::now();
     let encoded = encode_output(&output)
-        .with_context(|| format!("failed to encode direct-native {label} output"))?;
+        .with_context(|| format!("failed to encode staged-infer {label} output"))?;
     let encode_write_duration = encode_write_started.elapsed();
 
     Ok(DirectCompareOutput {
@@ -528,13 +562,31 @@ fn cache<I, O>(
 where
     O: Serialize,
 {
+    let direct_stage_started = Instant::now();
+    let input_load_started = Instant::now();
     let inputs = load().with_context(|| format!("failed to load {label} stage inputs"))?;
-    let output = run(&inputs).with_context(|| format!("direct-native {label} execution failed"))?;
+    let input_load_duration = input_load_started.elapsed();
+
+    let kernel_started = Instant::now();
+    let output = run(&inputs).with_context(|| format!("staged-infer {label} execution failed"))?;
+    let kernel_duration = kernel_started.elapsed();
+
+    let encode_write_started = Instant::now();
     let encoded = encode_output(&output)
-        .with_context(|| format!("failed to encode direct-native {label} output"))?;
+        .with_context(|| format!("failed to encode staged-infer {label} output"))?;
+    let encode_write_duration = encode_write_started.elapsed();
     let output = cache_value(output);
 
-    Ok(DirectCachedOutput { encoded, output })
+    Ok(DirectCachedOutput {
+        encoded,
+        output,
+        timings: DirectTimings {
+            input_load_duration,
+            kernel_duration,
+            encode_write_duration,
+            direct_stage_duration: direct_stage_started.elapsed(),
+        },
+    })
 }
 
 fn publish<I, O>(
@@ -552,12 +604,12 @@ where
     let input_load_duration = input_load_started.elapsed();
 
     let kernel_started = Instant::now();
-    let output = run(&inputs).with_context(|| format!("direct-native {label} execution failed"))?;
+    let output = run(&inputs).with_context(|| format!("staged-infer {label} execution failed"))?;
     let kernel_duration = kernel_started.elapsed();
 
     let encode_write_started = Instant::now();
     let artifact = write_output(&output)
-        .with_context(|| format!("failed to write direct-native {label} output"))?;
+        .with_context(|| format!("failed to write staged-infer {label} output"))?;
     let encode_write_duration = encode_write_started.elapsed();
     let output = cache_value(output);
 

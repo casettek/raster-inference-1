@@ -1,11 +1,11 @@
 [package]
-name = "direct-native"
+name = "staged-infer"
 version = "0.1.0"
 edition = "2021"
-default-run = "direct-native"
+default-run = "staged-infer"
 
 [[bin]]
-name = "direct-native"
+name = "staged-infer"
 path = "src/main.rs"
 
 [dependencies]
@@ -16,6 +16,7 @@ decode-select-token = { path = "../decode-select-token" }
 det-num = { path = "../det-num" }
 hex = "0.4"
 input-embedding = { path = "../input-embedding" }
+inference-artifacts = { path = "../inference-artifacts" }
 output-finalize = { path = "../output-finalize" }
 prefill-range = { path = "../prefill-range" }
 prefill-finalize = { path = "../prefill-finalize" }

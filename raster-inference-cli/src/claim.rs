@@ -1,20 +1,20 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use direct_native::hybrid::DirectStageBackend;
-use direct_native::{
+use staged_infer::hybrid::StagedExecutionBackend;
+use staged_infer::{
     CheckpointedInferenceConfig, CheckpointedInferenceExecutor, CheckpointedInferenceResult,
     ParityPolicy,
 };
 
-use crate::artifacts::write_claim_artifacts;
+use inference_artifacts::write_claim_artifacts;
 
 #[derive(Debug, Clone)]
 pub struct ClaimBuildOptions {
     pub base_dir: PathBuf,
     pub manifest_path: PathBuf,
     pub current_exe: PathBuf,
-    pub direct_backend: DirectStageBackend,
+    pub staged_backend: StagedExecutionBackend,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +31,7 @@ pub fn build_claim(options: ClaimBuildOptions) -> Result<ClaimBuildResult> {
         base_dir: options.base_dir,
         manifest_path: options.manifest_path.clone(),
         current_exe: options.current_exe,
-        direct_backend: options.direct_backend,
+        staged_backend: options.staged_backend,
         parity_policy: ParityPolicy::Skip,
     })?;
     write_claim_result(checkpointed, &options.manifest_path)
@@ -54,14 +54,14 @@ fn write_claim_result(
 impl ClaimBuildOptions {
     pub fn from_current_dir(
         current_exe: PathBuf,
-        direct_backend: DirectStageBackend,
+        staged_backend: StagedExecutionBackend,
     ) -> Result<Self> {
         let base_dir = std::env::current_dir().context("failed to read current directory")?;
         Ok(Self {
             manifest_path: base_dir.join("Raster.toml"),
             base_dir,
             current_exe,
-            direct_backend,
+            staged_backend,
         })
     }
 }
@@ -69,7 +69,7 @@ impl ClaimBuildOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifacts::{CHECKPOINT_TRACE_JSON, CLAIM_BUNDLE_JSON};
+    use inference_artifacts::{CHECKPOINT_TRACE_JSON, CLAIM_BUNDLE_JSON};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -83,7 +83,7 @@ mod tests {
 
         let options = ClaimBuildOptions::from_current_dir(
             PathBuf::from("raster-inference"),
-            DirectStageBackend::InProcess,
+            StagedExecutionBackend::InProcess,
         )
         .unwrap();
 
@@ -93,7 +93,7 @@ mod tests {
         assert_eq!(options.base_dir, expected_base);
         assert_eq!(options.manifest_path, expected_base.join("Raster.toml"));
         assert_eq!(options.current_exe, PathBuf::from("raster-inference"));
-        assert_eq!(options.direct_backend, DirectStageBackend::InProcess);
+        assert_eq!(options.staged_backend, StagedExecutionBackend::InProcess);
     }
 
     #[test]
@@ -121,7 +121,7 @@ mod tests {
         );
         assert_eq!(
             result.checkpoint_hashes_path.file_name().unwrap(),
-            crate::artifacts::CHECKPOINT_HASHES_TXT
+            inference_artifacts::CHECKPOINT_HASHES_TXT
         );
         assert_eq!(
             result.claim_bundle_path.file_name().unwrap(),

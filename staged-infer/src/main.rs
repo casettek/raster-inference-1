@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "direct-native")]
+#[command(name = "staged-infer")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Run direct-native chain commands.
+    /// Run staged-infer chain commands.
     Chain {
         #[command(subcommand)]
         command: ChainCommand,
@@ -36,16 +36,16 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum ChainCommand {
-    /// Run the direct-native chain, optionally leaving one stage on Raster as the reference.
+    /// Run the staged-infer chain, optionally leaving one stage on Raster as the reference.
     Run {
-        /// Stage to run on Raster while direct-native owns supported stages around it.
-        /// Omit this to run every stage direct-native.
+        /// Stage to run on Raster while staged-infer owns supported stages around it.
+        /// Omit this to run every stage staged-infer.
         #[arg(long = "raster-stage")]
         raster_stage: Option<String>,
 
-        /// Use the previous per-stage child-process direct-native runner.
-        #[arg(long = "direct-subprocess", hide = true)]
-        direct_subprocess: bool,
+        /// Use the previous per-stage child-process staged-infer runner.
+        #[arg(long = "staged-subprocess", alias = "direct-subprocess", hide = true)]
+        staged_subprocess: bool,
     },
 }
 
@@ -53,7 +53,7 @@ fn main() -> ExitCode {
     match try_main() {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("direct-native error: {error:#}");
+            eprintln!("staged-infer error: {error:#}");
             ExitCode::from(1)
         }
     }
@@ -66,7 +66,7 @@ fn try_main() -> Result<ExitCode> {
 fn execute(cli: Cli) -> Result<ExitCode> {
     if let Some(stage_dir) = cli.run_stage.as_ref() {
         require_input_args(&cli)?;
-        direct_native::shadow::run_hidden_stage_direct(stage_dir)?;
+        staged_infer::shadow::run_hidden_stage_direct(stage_dir)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -75,7 +75,7 @@ fn execute(cli: Cli) -> Result<ExitCode> {
             let status = run_hidden_compare(&stage_dir)?;
             return finish_shadow_run(status, &stage_dir);
         }
-        let report = direct_native::shadow::run_hidden_stage_compare(&stage_dir)?;
+        let report = staged_infer::shadow::run_hidden_stage_compare(&stage_dir)?;
         return Ok(if report.matched {
             ExitCode::SUCCESS
         } else {
@@ -88,18 +88,18 @@ fn execute(cli: Cli) -> Result<ExitCode> {
             command:
                 ChainCommand::Run {
                     raster_stage,
-                    direct_subprocess,
+                    staged_subprocess,
                 },
         }) => {
             let exe = std::env::current_exe().context("failed to locate current executable")?;
-            let direct_backend = if direct_subprocess {
-                direct_native::hybrid::DirectStageBackend::Subprocess
+            let staged_backend = if staged_subprocess {
+                staged_infer::hybrid::StagedExecutionBackend::Subprocess
             } else {
-                direct_native::hybrid::DirectStageBackend::InProcess
+                staged_infer::hybrid::StagedExecutionBackend::InProcess
             };
-            let run = direct_native::hybrid::run(raster_stage.as_deref(), &exe, direct_backend)?;
+            let run = staged_infer::hybrid::run(raster_stage.as_deref(), &exe, staged_backend)?;
             if let Some(selected_stage_dir) = run.selected_stage_dir.as_ref() {
-                let report = direct_native::shadow::read_shadow_report(selected_stage_dir)?;
+                let report = staged_infer::shadow::read_shadow_report(selected_stage_dir)?;
                 print!(
                     "{}",
                     render_timing_summary_or_warning(&run.chain_dir, &report)
@@ -108,14 +108,14 @@ fn execute(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         None => bail!(
-            "direct-native requires `chain run`; \
+            "staged-infer requires `chain run`; \
              use the Raster CLI directly for Raster-only execution"
         ),
     }
 }
 
 fn finish_shadow_run(status: ExitStatus, stage_dir: &Path) -> Result<ExitCode> {
-    match direct_native::shadow::read_shadow_report(stage_dir) {
+    match staged_infer::shadow::read_shadow_report(stage_dir) {
         Ok(report) => {
             let chain_dir = stage_dir
                 .parent()
@@ -137,17 +137,17 @@ fn require_input_args(cli: &Cli) -> Result<()> {
 
 fn render_timing_summary_or_warning(
     chain_dir: &Path,
-    report: &direct_native::shadow::ShadowReport,
+    report: &staged_infer::shadow::ShadowReport,
 ) -> String {
-    direct_native::shadow::read_chain_execution_times(chain_dir)
-        .and_then(|timings| direct_native::shadow::render_timing_summary(&timings, report))
+    staged_infer::shadow::read_chain_execution_times(chain_dir)
+        .and_then(|timings| staged_infer::shadow::render_timing_summary(&timings, report))
         .unwrap_or_else(|error| format!("\ntiming summary unavailable: {error:#}\n"))
 }
 
 fn run_hidden_compare(stage_dir: &Path) -> Result<ExitStatus> {
     let input = stage_dir.join("input.json");
     let input_manifest = stage_dir.join("input_manifest.json");
-    let prior_report = direct_native::shadow::parity_dir(stage_dir).join("report.json");
+    let prior_report = staged_infer::shadow::parity_dir(stage_dir).join("report.json");
     if let Err(error) = std::fs::remove_file(&prior_report) {
         if error.kind() != std::io::ErrorKind::NotFound {
             return Err(error)
@@ -157,7 +157,7 @@ fn run_hidden_compare(stage_dir: &Path) -> Result<ExitStatus> {
     let exe = std::env::current_exe().context("failed to locate current executable")?;
     let status = comparison_command(&exe, stage_dir, &input, &input_manifest)
         .status()
-        .context("failed to start direct-native comparison child")?;
+        .context("failed to start staged-infer comparison child")?;
     Ok(status)
 }
 
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn comparison_command_is_unauthenticated_and_isolated() {
         let command = comparison_command(
-            Path::new("/tmp/direct-native"),
+            Path::new("/tmp/staged-infer"),
             Path::new("/tmp/chains-no-auth/run/prefill_range_l3"),
             Path::new("/tmp/input.json"),
             Path::new("/tmp/input_manifest.json"),
@@ -258,13 +258,13 @@ mod tests {
 
     #[test]
     fn missing_execution_times_do_not_override_parity() {
-        let report = direct_native::shadow::ShadowReport {
+        let report = staged_infer::shadow::ShadowReport {
             version: 3,
             stage: String::from("prefill_range_l3"),
             routine: String::from("prefill_range"),
             instance: Some(3),
-            authority: direct_native::shadow::ParityAuthority::NonAuthoritative,
-            raster_source_mode: direct_native::shadow::RasterSourceMode::Unauthenticated,
+            authority: staged_infer::shadow::ParityAuthority::NonAuthoritative,
+            raster_source_mode: staged_infer::shadow::RasterSourceMode::Unauthenticated,
             matched: true,
             input_load_duration_ns: 1,
             kernel_duration_ns: 1,

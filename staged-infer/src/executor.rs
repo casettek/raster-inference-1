@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use inference_artifacts::InferenceResult;
 
+use crate::artifactless::inference_result_from_generated;
 use crate::cache::CachedStageValue;
-use crate::hybrid::{self, DirectStageBackend};
-use crate::infer::InferenceResult;
+use crate::hybrid::{self, StagedExecutionBackend};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParityPolicy {
@@ -17,7 +18,7 @@ pub struct CheckpointedInferenceConfig {
     pub base_dir: PathBuf,
     pub manifest_path: PathBuf,
     pub current_exe: PathBuf,
-    pub direct_backend: DirectStageBackend,
+    pub staged_backend: StagedExecutionBackend,
     pub parity_policy: ParityPolicy,
 }
 
@@ -39,9 +40,11 @@ impl CheckpointedInferenceExecutor {
             ParityPolicy::Skip => None,
             ParityPolicy::ReferenceStage(stage) => Some(stage.as_str()),
         };
-        let run = hybrid::run(raster_stage, &config.current_exe, config.direct_backend)?;
+        let run = hybrid::run(raster_stage, &config.current_exe, config.staged_backend)?;
         let final_result = match run.final_output {
-            Some(CachedStageValue::GeneratedOutput(output)) => Some(output.into()),
+            Some(CachedStageValue::GeneratedOutput(output)) => {
+                Some(inference_result_from_generated(output))
+            }
             _ => None,
         };
         Ok(CheckpointedInferenceResult {
@@ -86,14 +89,14 @@ impl Drop for CurrentDirGuard {
 impl CheckpointedInferenceConfig {
     pub fn from_current_dir(
         current_exe: PathBuf,
-        direct_backend: DirectStageBackend,
+        staged_backend: StagedExecutionBackend,
     ) -> Result<Self> {
         let base_dir = std::env::current_dir().context("failed to read current directory")?;
         Ok(Self {
             manifest_path: base_dir.join("Raster.toml"),
             base_dir,
             current_exe,
-            direct_backend,
+            staged_backend,
             parity_policy: ParityPolicy::Skip,
         })
     }
@@ -103,10 +106,10 @@ impl CheckpointedInferenceConfig {
         self
     }
 
-    pub fn with_current_exe_from_env(direct_backend: DirectStageBackend) -> Result<Self> {
+    pub fn with_current_exe_from_env(staged_backend: StagedExecutionBackend) -> Result<Self> {
         Self::from_current_dir(
             std::env::current_exe().context("failed to locate current executable")?,
-            direct_backend,
+            staged_backend,
         )
     }
 }
@@ -120,7 +123,7 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let config = CheckpointedInferenceConfig::from_current_dir(
             PathBuf::from("bin"),
-            DirectStageBackend::InProcess,
+            StagedExecutionBackend::InProcess,
         )
         .unwrap();
 

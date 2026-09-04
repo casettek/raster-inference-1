@@ -13,6 +13,16 @@ pub const DIVERGENCE_JSON: &str = "divergence.json";
 pub const CHALLENGE_TRACE_JSON: &str = "challenge_trace.json";
 pub const REPLAY_PACKAGE_JSON: &str = "replay_package.json";
 pub const CHALLENGE_BUNDLE_JSON: &str = "challenge_bundle.json";
+pub const EXECUTION_TIMES_JSON: &str = "execution-times.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InferenceResult {
+    pub generated_token_count: u32,
+    pub generated_token_ids: Vec<u32>,
+    pub generated_token_ids_sha256: String,
+    pub generated_text: String,
+    pub stop_reason: String,
+}
 
 /// Ordered routine-boundary checkpoints from one checkpointed inference run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -253,7 +263,7 @@ pub fn write_challenge_artifacts(
 }
 
 pub fn build_checkpoint_trace(chain_dir: &Path, _manifest_path: &Path) -> Result<CheckpointTrace> {
-    let execution_times_path = chain_dir.join(direct_native::shadow::EXECUTION_TIMES_JSON);
+    let execution_times_path = chain_dir.join(EXECUTION_TIMES_JSON);
     let execution_times = if execution_times_path.is_file() {
         Some(read_execution_times(&execution_times_path)?)
     } else {
@@ -369,7 +379,7 @@ mod tests {
         write_stage(&base, "stage_a", "aaa", b"stage-a");
         write_stage(&base, "stage_b", "bbb", b"stage-b");
         fs::write(
-            base.join(direct_native::shadow::EXECUTION_TIMES_JSON),
+            base.join(EXECUTION_TIMES_JSON),
             r#"{"version":2,"stages":[{"name":"stage_b","exec_duration_ns":20},{"name":"stage_a","exec_duration_ns":10}],"total_exec_duration_ns":30}"#,
         )
         .unwrap();

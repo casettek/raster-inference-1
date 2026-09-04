@@ -1,0 +1,10 @@
+[package]
+name = "direct-infer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+det-num = { path = "../det-num" }
+inference-artifacts = { path = "../inference-artifacts" }
+serde = { version = "1.0", features = ["derive"] }

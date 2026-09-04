@@ -156,12 +156,12 @@ enum RenderedTemplate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StageDispatch {
-    DirectNative,
+    StagedNative,
     RasterReference,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DirectStageBackend {
+pub enum StagedExecutionBackend {
     InProcess,
     Subprocess,
 }
@@ -238,7 +238,7 @@ struct AuxWaveExecutionTime {
 pub fn run(
     raster_stage: Option<&str>,
     current_exe: &Path,
-    direct_backend: DirectStageBackend,
+    staged_backend: StagedExecutionBackend,
 ) -> Result<HybridRun> {
     let base_dir = std::env::current_dir().context("failed to read current directory")?;
     let manifest = read_manifest(&base_dir.join("Raster.toml"))?;
@@ -249,7 +249,7 @@ pub fn run(
 
     let chain_dir = create_chain_dir(&base_dir)?;
     println!(
-        "direct-native chain run  {}  ({} stages)",
+        "staged-infer chain run  {}  ({} stages)",
         chain_run_id_label(&chain_dir),
         manifest.chain.stage.len()
     );
@@ -258,7 +258,7 @@ pub fn run(
         Some(stage) => {
             println!("  mode: unauthenticated hybrid (--no-auth; Raster reference: {stage})");
         }
-        None => println!("  mode: unauthenticated direct-native (--no-auth)"),
+        None => println!("  mode: unauthenticated staged-infer (--no-auth)"),
     }
     println!();
 
@@ -283,7 +283,7 @@ pub fn run(
                 &chain_dir,
                 &stage_index,
                 current_exe,
-                direct_backend,
+                staged_backend,
                 raster_stage,
                 &mut state,
             )?;
@@ -298,7 +298,7 @@ pub fn run(
             &chain_dir,
             &stage_index,
             current_exe,
-            direct_backend,
+            staged_backend,
             raster_stage,
             &mut state,
         )?;
@@ -617,7 +617,7 @@ fn dispatch_for_stage(stage: &StageSpec, raster_stage: Option<&str>) -> Result<S
     if raster_stage == Some(stage.name.as_str()) {
         Ok(StageDispatch::RasterReference)
     } else {
-        Ok(StageDispatch::DirectNative)
+        Ok(StageDispatch::StagedNative)
     }
 }
 
@@ -628,7 +628,7 @@ fn run_one_stage(
     chain_dir: &Path,
     stage_index: &BTreeMap<String, usize>,
     current_exe: &Path,
-    direct_backend: DirectStageBackend,
+    staged_backend: StagedExecutionBackend,
     raster_stage: Option<&str>,
     state: &mut ChainRunState,
 ) -> Result<()> {
@@ -658,7 +658,7 @@ fn run_one_stage(
         stage,
         base_dir,
         current_exe,
-        direct_backend,
+        staged_backend,
         raster_stage,
         &input_json_path,
         &input_manifest_path,
@@ -674,7 +674,7 @@ fn run_prepared_stage(
     stage: &StageSpec,
     base_dir: &Path,
     current_exe: &Path,
-    direct_backend: DirectStageBackend,
+    staged_backend: StagedExecutionBackend,
     raster_stage: Option<&str>,
     input_json_path: &Path,
     input_manifest_path: &Path,
@@ -684,17 +684,17 @@ fn run_prepared_stage(
 ) -> Result<DirectStageRun> {
     let dispatch = dispatch_for_stage(stage, raster_stage)?;
     match dispatch {
-        StageDispatch::DirectNative => {
+        StageDispatch::StagedNative => {
             let kind = StageKind::from_stage_spec(&stage.project, &stage.name)?;
-            println!("    direct-native {} …", kind.routine());
+            println!("    staged-infer {} …", kind.routine());
             let cached_inputs = cached_inputs_for_stage(
                 stage,
                 stage_index,
                 &state.output_commitments,
                 &state.output_cache,
             )?;
-            run_direct_native_stage(
-                direct_backend,
+            run_staged_infer_stage(
+                staged_backend,
                 current_exe,
                 &kind,
                 &stage.name,
@@ -714,7 +714,7 @@ fn run_prepared_stage(
                 input_manifest_path,
                 stage_dir,
             )?;
-            println!("    direct-native parity check …");
+            println!("    staged-infer parity check …");
             run_compare_stage(current_exe, stage_dir)?;
             state.selected_stage_dir = Some(stage_dir.to_path_buf());
             Ok(DirectStageRun {
@@ -786,7 +786,7 @@ fn run_aux_wave(
     chain_dir: &Path,
     stage_index: &BTreeMap<String, usize>,
     current_exe: &Path,
-    direct_backend: DirectStageBackend,
+    staged_backend: StagedExecutionBackend,
     raster_stage: Option<&str>,
     state: &mut ChainRunState,
 ) -> Result<()> {
@@ -808,7 +808,7 @@ fn run_aux_wave(
                     bail!("aux wave cannot contain more than one Raster reference stage");
                 }
             }
-            StageDispatch::DirectNative => jobs.push(prepare_aux_stage_job(
+            StageDispatch::StagedNative => jobs.push(prepare_aux_stage_job(
                 idx,
                 stages,
                 base_dir,
@@ -827,7 +827,7 @@ fn run_aux_wave(
             chain_dir,
             stage_index,
             current_exe,
-            direct_backend,
+            staged_backend,
             raster_stage,
             state,
         )?;
@@ -933,7 +933,7 @@ fn run_aux_stage_jobs(current_exe: &Path, jobs: Vec<AuxStageJob>) -> Result<AuxS
 }
 
 fn run_aux_stage_job(current_exe: &Path, job: AuxStageJob) -> Result<AuxStageResult> {
-    let stage_run = run_direct_native_stage_subprocess(
+    let stage_run = run_staged_infer_stage_subprocess(
         current_exe,
         &job.kind,
         &job.input_json_path,
@@ -977,7 +977,8 @@ fn ensure_stage_inputs_ready(
 }
 
 fn aux_parallelism(job_count: usize) -> usize {
-    let requested = std::env::var("DIRECT_NATIVE_AUX_PARALLELISM")
+    let requested = std::env::var("STAGED_INFER_AUX_PARALLELISM")
+        .or_else(|_| std::env::var("DIRECT_NATIVE_AUX_PARALLELISM"))
         .ok()
         .and_then(|value| value.parse::<usize>().ok());
     let available = std::thread::available_parallelism()
@@ -1149,8 +1150,8 @@ fn run_raster_stage(
     run_timed_command(command, &format!("Raster stage '{}'", stage.name))
 }
 
-fn run_direct_native_stage(
-    backend: DirectStageBackend,
+fn run_staged_infer_stage(
+    backend: StagedExecutionBackend,
     current_exe: &Path,
     kind: &StageKind,
     stage_name: &str,
@@ -1160,7 +1161,7 @@ fn run_direct_native_stage(
     cached_inputs: &CachedInputs,
 ) -> Result<DirectStageRun> {
     match backend {
-        DirectStageBackend::InProcess => run_direct_native_stage_in_process(
+        StagedExecutionBackend::InProcess => run_staged_infer_stage_in_process(
             kind,
             stage_name,
             input_json_path,
@@ -1168,7 +1169,7 @@ fn run_direct_native_stage(
             stage_dir,
             cached_inputs,
         ),
-        DirectStageBackend::Subprocess => run_direct_native_stage_subprocess(
+        StagedExecutionBackend::Subprocess => run_staged_infer_stage_subprocess(
             current_exe,
             kind,
             input_json_path,
@@ -1178,7 +1179,7 @@ fn run_direct_native_stage(
     }
 }
 
-fn run_direct_native_stage_subprocess(
+fn run_staged_infer_stage_subprocess(
     current_exe: &Path,
     kind: &StageKind,
     input_json_path: &Path,
@@ -1198,12 +1199,12 @@ fn run_direct_native_stage_subprocess(
     apply_stage_env(&mut command, stage_dir);
 
     Ok(DirectStageRun {
-        duration: run_timed_command(command, &format!("direct-native {} stage", kind.routine()))?,
+        duration: run_timed_command(command, &format!("staged-infer {} stage", kind.routine()))?,
         output: None,
     })
 }
 
-fn run_direct_native_stage_in_process(
+fn run_staged_infer_stage_in_process(
     kind: &StageKind,
     stage_name: &str,
     input_json_path: &Path,
@@ -1221,7 +1222,7 @@ fn run_direct_native_stage_in_process(
     )?;
     let duration = started.elapsed();
     println!(
-        "direct-native {stage_name}: output {} structural={} stage={}",
+        "staged-infer {stage_name}: output {} structural={} stage={}",
         direct.artifact.data_path.display(),
         direct.artifact.commitment,
         format_duration(duration),
@@ -1261,10 +1262,10 @@ fn run_compare_stage(current_exe: &Path, stage_dir: &Path) -> Result<()> {
 
     let status = command
         .status()
-        .context("failed to start direct-native comparison child")?;
+        .context("failed to start staged-infer comparison child")?;
     if !status.success() {
         bail!(
-            "direct-native parity check for {} failed ({status})",
+            "staged-infer parity check for {} failed ({status})",
             stage_dir.display()
         );
     }
@@ -1392,7 +1393,7 @@ fn print_direct_timing_summary(
             duration.map(|duration| sum + duration)
         })?;
 
-    println!("direct-native timing:");
+    println!("staged-infer timing:");
     println!(
         "  elapsed wall time: {}",
         format_duration(total_wall_duration)
@@ -1407,7 +1408,7 @@ fn print_direct_timing_summary(
 fn create_chain_dir(base_dir: &Path) -> Result<PathBuf> {
     let root = base_dir
         .join("target")
-        .join("direct-native")
+        .join("staged-infer")
         .join("chains-no-auth");
     fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
     let chain_dir = root.join(chain_run_id());
@@ -1542,7 +1543,7 @@ mod tests {
     fn test_base_dir() -> PathBuf {
         let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "direct-native-hybrid-test-{}-{id}",
+            "staged-infer-hybrid-test-{}-{id}",
             std::process::id()
         ))
     }
@@ -1559,7 +1560,7 @@ mod tests {
 
         for stage in &manifest.chain.stage {
             match dispatch_for_stage(stage, Some("prefill_range_l13")).unwrap() {
-                StageDispatch::DirectNative => direct += 1,
+                StageDispatch::StagedNative => direct += 1,
                 StageDispatch::RasterReference => reference += 1,
             }
         }
@@ -1581,7 +1582,7 @@ mod tests {
 
         for stage in &manifest.chain.stage {
             match dispatch_for_stage(stage, None).unwrap() {
-                StageDispatch::DirectNative => direct += 1,
+                StageDispatch::StagedNative => direct += 1,
                 StageDispatch::RasterReference => reference += 1,
             }
         }
@@ -1758,7 +1759,7 @@ mod tests {
 
         for stage in &manifest.chain.stage[range] {
             match dispatch_for_stage(stage, Some("prefill_prepare_aux_l5")).unwrap() {
-                StageDispatch::DirectNative => direct += 1,
+                StageDispatch::StagedNative => direct += 1,
                 StageDispatch::RasterReference => reference.push(stage.name.as_str()),
             }
         }

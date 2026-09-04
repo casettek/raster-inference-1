@@ -1,9 +1,9 @@
-use direct_native::{routines, run_prefill_range_direct, PrefillRangeDirectInputs};
 use prefill_range::input::{
     pack_i32s, ActivationRow, ActivationSequence, KeyRow, LayerParams, PleLayerInputs, PleRow,
     TransformerLayer, PAGE_SIZE,
 };
 use raster::{Bytes, List};
+use staged_infer::{routines, run_prefill_range_direct, PrefillRangeDirectInputs};
 
 const ONE: i32 = 1 << 16;
 
@@ -113,6 +113,7 @@ fn direct_prefill_returns_activation_and_own_kv() {
     let output = run_prefill_range_direct(PrefillRangeDirectInputs {
         activations: &activations,
         layer: &layer,
+        layer_cache_key: None,
         prior_kv: &donor,
         donor_a_kv: &donor,
         donor_b_kv: &donor,
@@ -128,6 +129,7 @@ fn direct_prefill_returns_activation_and_own_kv() {
     let wrapper_output = routines::prefill_range::run_direct(&routines::prefill_range::Inputs {
         activations,
         layer,
+        layer_cache_key: None,
         prior_kv: donor.clone(),
         donor_a_kv: donor.clone(),
         donor_b_kv: donor,
@@ -150,6 +152,7 @@ fn donor_layer_carries_prior_kv_and_publishes_own_kv() {
     let output = run_prefill_range_direct(PrefillRangeDirectInputs {
         activations: &activations,
         layer: &layer,
+        layer_cache_key: None,
         prior_kv: &donor,
         donor_a_kv: &donor,
         donor_b_kv: &donor,
@@ -165,6 +168,7 @@ fn donor_layer_carries_prior_kv_and_publishes_own_kv() {
     let wrapper_output = routines::prefill_range::run_direct(&routines::prefill_range::Inputs {
         activations,
         layer,
+        layer_cache_key: None,
         prior_kv: donor.clone(),
         donor_a_kv: donor.clone(),
         donor_b_kv: donor,

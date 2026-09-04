@@ -1,7 +1,12 @@
-use std::collections::BTreeMap;
+use std::any::Any;
+use std::collections::{BTreeMap, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use raster::List;
+use serde::Deserialize;
 
 use decode_embed::input as decode_embed_input;
 use decode_select_token::input as decode_input;
@@ -27,7 +32,7 @@ pub enum CachedStageValue {
 #[derive(Clone, Debug)]
 pub struct CachedStageOutput {
     pub structural_commitment: Vec<u8>,
-    pub value: CachedStageValue,
+    pub value: Arc<CachedStageValue>,
 }
 
 #[derive(Default)]
@@ -35,7 +40,154 @@ pub struct StageOutputCache {
     outputs: BTreeMap<String, CachedStageOutput>,
 }
 
-pub type CachedInputs = BTreeMap<String, CachedStageValue>;
+pub type CachedInputs = BTreeMap<String, Arc<CachedStageValue>>;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MaterializationCacheKey {
+    pub param: String,
+    pub path: PathBuf,
+    pub index_path: PathBuf,
+    pub commitment: String,
+    pub type_name: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct InputDocumentEntry {
+    path: PathBuf,
+    #[serde(default)]
+    index_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InputManifestEntry {
+    commitment: String,
+}
+
+pub struct MaterializationCache {
+    state: Mutex<MaterializationCacheState>,
+    capacity: usize,
+}
+
+#[derive(Default)]
+struct MaterializationCacheState {
+    entries: BTreeMap<MaterializationCacheKey, Arc<dyn Any + Send + Sync>>,
+    order: VecDeque<MaterializationCacheKey>,
+}
+
+impl Default for MaterializationCache {
+    fn default() -> Self {
+        let capacity = std::env::var("STAGED_INFER_MATERIALIZATION_CACHE_ENTRIES")
+            .or_else(|_| std::env::var("DIRECT_NATIVE_MATERIALIZATION_CACHE_ENTRIES"))
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2);
+        Self {
+            state: Mutex::new(MaterializationCacheState::default()),
+            capacity,
+        }
+    }
+}
+
+impl MaterializationCache {
+    pub fn get_or_insert_with<T>(
+        &self,
+        key: Option<MaterializationCacheKey>,
+        load: impl FnOnce() -> T,
+    ) -> Result<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        let Some(key) = key else {
+            return Ok(Arc::new(load()));
+        };
+
+        if self.capacity == 0 {
+            return Ok(Arc::new(load()));
+        }
+
+        if let Some(existing) = self.state.lock().unwrap().entries.get(&key).cloned() {
+            return existing.downcast::<T>().map_err(|_| {
+                anyhow::anyhow!(
+                    "cached materialization `{}` for `{}` had the wrong type",
+                    key.param,
+                    key.type_name
+                )
+            });
+        }
+
+        let value: Arc<T> = Arc::new(load());
+        let mut state = self.state.lock().unwrap();
+        if let Some(existing) = state.entries.get(&key).cloned() {
+            return existing.downcast::<T>().map_err(|_| {
+                anyhow::anyhow!(
+                    "cached materialization `{}` for `{}` had the wrong type",
+                    key.param,
+                    key.type_name
+                )
+            });
+        }
+        if state.entries.len() >= self.capacity {
+            if let Some(evicted) = state.order.pop_front() {
+                state.entries.remove(&evicted);
+            }
+        }
+        state.order.push_back(key.clone());
+        state.entries.insert(key, value.clone());
+        Ok(value)
+    }
+}
+
+pub fn materialize_with_cache<T>(
+    cache: Option<&MaterializationCache>,
+    key: Option<MaterializationCacheKey>,
+    load: impl FnOnce() -> T,
+) -> Result<Arc<T>>
+where
+    T: Send + Sync + 'static,
+{
+    match cache {
+        Some(cache) => cache.get_or_insert_with(key, load),
+        None => Ok(Arc::new(load())),
+    }
+}
+
+pub fn materialization_key_from_stage_files<T>(
+    input_path: &Path,
+    input_manifest_path: &Path,
+    param: &str,
+) -> Result<Option<MaterializationCacheKey>>
+where
+    T: 'static,
+{
+    let input_entries = read_input_entries(input_path)?;
+    let manifest_entries = read_manifest_entries(input_manifest_path)?;
+    let Some(input) = input_entries.get(param) else {
+        return Ok(None);
+    };
+    let Some(manifest) = manifest_entries.get(param) else {
+        return Ok(None);
+    };
+    Ok(Some(MaterializationCacheKey {
+        param: param.to_string(),
+        path: input.path.clone(),
+        index_path: input
+            .index_path
+            .clone()
+            .unwrap_or_else(|| input.path.with_extension("rindex")),
+        commitment: manifest.commitment.clone(),
+        type_name: std::any::type_name::<T>(),
+    }))
+}
+
+fn read_input_entries(path: &Path) -> Result<BTreeMap<String, InputDocumentEntry>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("failed to decode {}", path.display()))
+}
+
+fn read_manifest_entries(path: &Path) -> Result<BTreeMap<String, InputManifestEntry>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("failed to decode {}", path.display()))
+}
 
 impl StageOutputCache {
     pub fn insert(
@@ -43,28 +195,30 @@ impl StageOutputCache {
         stage: impl Into<String>,
         structural_commitment: Vec<u8>,
         value: CachedStageValue,
-    ) {
+    ) -> Arc<CachedStageValue> {
+        let value = Arc::new(value);
         self.outputs.insert(
             stage.into(),
             CachedStageOutput {
                 structural_commitment,
-                value,
+                value: Arc::clone(&value),
             },
         );
+        value
     }
 
     pub fn get(
         &self,
         stage: &str,
         expected_structural_commitment: &[u8],
-    ) -> Result<Option<CachedStageValue>> {
+    ) -> Result<Option<Arc<CachedStageValue>>> {
         let Some(output) = self.outputs.get(stage) else {
             return Ok(None);
         };
         if output.structural_commitment != expected_structural_commitment {
-            bail!("cached direct-native output for stage `{stage}` has stale commitment");
+            bail!("cached staged-infer output for stage `{stage}` has stale commitment");
         }
-        Ok(Some(output.value.clone()))
+        Ok(Some(Arc::clone(&output.value)))
     }
 }
 
@@ -342,6 +496,84 @@ fn output_edge_from_decode(source: &decode_input::DecodeEdge) -> output_input::D
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn materialization_cache_reuses_matching_key() {
+        let cache = MaterializationCache::default();
+        let key = MaterializationCacheKey {
+            param: String::from("embedding"),
+            path: PathBuf::from("embedding.rastered"),
+            index_path: PathBuf::from("embedding.rindex"),
+            commitment: String::from("abc"),
+            type_name: std::any::type_name::<String>(),
+        };
+
+        let first =
+            materialize_with_cache(Some(&cache), Some(key.clone()), || String::from("loaded"))
+                .unwrap();
+        let second =
+            materialize_with_cache(Some(&cache), Some(key), || String::from("reloaded")).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(second.as_str(), "loaded");
+    }
+
+    #[test]
+    fn materialization_cache_misses_when_commitment_changes() {
+        let cache = MaterializationCache::default();
+        let base_key = MaterializationCacheKey {
+            param: String::from("embedding"),
+            path: PathBuf::from("embedding.rastered"),
+            index_path: PathBuf::from("embedding.rindex"),
+            commitment: String::from("abc"),
+            type_name: std::any::type_name::<String>(),
+        };
+        let changed_key = MaterializationCacheKey {
+            commitment: String::from("def"),
+            ..base_key.clone()
+        };
+
+        let first =
+            materialize_with_cache(Some(&cache), Some(base_key), || String::from("first")).unwrap();
+        let second =
+            materialize_with_cache(Some(&cache), Some(changed_key), || String::from("second"))
+                .unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(first.as_str(), "first");
+        assert_eq!(second.as_str(), "second");
+    }
+
+    #[test]
+    fn materialization_key_uses_stage_files_and_type_name() {
+        let base = temp_dir("materialization-key");
+        fs::create_dir_all(&base).unwrap();
+        let input = base.join("input.json");
+        let manifest = base.join("input_manifest.json");
+        fs::write(
+            &input,
+            r#"{"embedding":{"path":"/tmp/embedding.rastered","index_path":"/tmp/embedding.rindex","load_preference":"mmap"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &manifest,
+            r#"{"embedding":{"type":"sha256","encoding":"raster","commitment":"abc"}}"#,
+        )
+        .unwrap();
+
+        let key = materialization_key_from_stage_files::<String>(&input, &manifest, "embedding")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(key.param, "embedding");
+        assert_eq!(key.path, PathBuf::from("/tmp/embedding.rastered"));
+        assert_eq!(key.index_path, PathBuf::from("/tmp/embedding.rindex"));
+        assert_eq!(key.commitment, "abc");
+        assert_eq!(key.type_name, std::any::type_name::<String>());
+
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn cache_rejects_stale_commitment() {
@@ -360,6 +592,23 @@ mod tests {
     }
 
     #[test]
+    fn stage_output_cache_returns_shared_values() {
+        let mut cache = StageOutputCache::default();
+        cache.insert(
+            "producer",
+            vec![0xde, 0xad],
+            CachedStageValue::PromptTokenization(prompt_input::PromptTokenization {
+                token_ids: List::from(vec![1, 2, 3]),
+            }),
+        );
+
+        let first = cache.get("producer", &[0xde, 0xad]).unwrap().unwrap();
+        let second = cache.get("producer", &[0xde, 0xad]).unwrap().unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn cached_prompt_converts_to_embedding_input() {
         let cached = CachedStageValue::PromptTokenization(prompt_input::PromptTokenization {
             token_ids: List::from(vec![7, 8]),
@@ -368,5 +617,16 @@ mod tests {
         let prompt = cached.as_embedding_prompt().unwrap();
 
         assert_eq!(prompt.token_ids.as_slice(), &[7, 8]);
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "staged-infer-cache-{label}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 }

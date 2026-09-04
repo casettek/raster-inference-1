@@ -1,5 +1,4 @@
 use decode_select_token::input::{DecodeEdge, LogitEntry, PrefillLogits};
-use direct_native::{kernels, routines};
 use input_embedding::input::{EmbeddingTable, PromptTokenization};
 use output_finalize::input::{DecoderTable, DecoderToken};
 use prefill_finalize::input::{FinalHead, FinalHeadParams};
@@ -7,6 +6,7 @@ use prefill_prepare_aux::input::{PleLayer, PleLayerParams};
 use prompt_prepare::input::{BpePieces, MergeBucket, PromptTokenizer, TokenEntry, VocabBucket};
 use raster::{Bytes, List};
 use serde::Serialize;
+use staged_infer::{kernels, routines};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -107,7 +107,7 @@ fn cached_runner_executes_without_writing_output_artifact() {
 
     assert!(matches!(
         output.output,
-        direct_native::cache::CachedStageValue::DecodeEdge(_)
+        staged_infer::cache::CachedStageValue::DecodeEdge(_)
     ));
     assert!(!base.join("output.bin").exists());
     fs::remove_dir_all(base).unwrap();
@@ -132,7 +132,8 @@ fn decode_embed_uses_selected_decode_position() {
                 values: paged(&[0, 0, ONE, 2 * ONE]),
             }
             .values,
-        },
+        }
+        .into(),
     };
     let output = routines::decode_embed::run_direct(&inputs).unwrap();
     let kernel_output = kernels::decode_embed::run_decode_embed_direct(
@@ -156,7 +157,7 @@ fn temp_dir(label: &str) -> std::path::PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "direct-native-routines-{label}-{}-{nanos}",
+        "staged-infer-routines-{label}-{}-{nanos}",
         std::process::id()
     ))
 }
@@ -243,7 +244,8 @@ fn input_embedding_gathers_and_scales_rows() {
             hidden_size: 2,
             embedding_scale: ONE,
             values: paged(&[0, 0, ONE, 2 * ONE]),
-        },
+        }
+        .into(),
     };
     let output = routines::input_embedding::run_direct(&inputs).unwrap();
     let kernel_output = kernels::input_embedding::run_input_embedding_direct(
@@ -381,7 +383,8 @@ fn prefill_finalize_scores_projection_rows() {
                 norm_weights: norm,
             },
             projection: paged(&[ONE, 0, 0, ONE]),
-        },
+        }
+        .into(),
     };
     let output = routines::prefill_finalize::run_direct(&inputs).unwrap();
     let kernel_output = kernels::prefill_finalize::run_prefill_finalize_direct(

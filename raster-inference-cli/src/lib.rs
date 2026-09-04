@@ -5,23 +5,22 @@ use std::process::{Command as ProcessCommand, ExitCode, ExitStatus};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-mod artifacts;
 mod challenge;
 mod claim;
 mod infer;
 
-pub use artifacts::{
-    build_checkpoint_trace, write_claim_artifacts, ChallengeBundle, ChallengeTrace, Checkpoint,
-    CheckpointTrace, ClaimBundle, ClaimEndpoint, Divergence, DivergenceReason, ReplayPackage,
-    CHALLENGE_BUNDLE_JSON, CHALLENGE_TRACE_JSON, CHECKPOINT_HASHES_TXT, CHECKPOINT_TRACE_JSON,
-    CLAIM_BUNDLE_JSON, DIVERGENCE_JSON, REPLAY_PACKAGE_JSON,
-};
 pub use challenge::{
     build_challenge, ChallengeBuildOptions, ChallengeBuildOutcome, ChallengeBuildResult,
     ChallengeInput,
 };
 pub use claim::{build_claim, ClaimBuildOptions, ClaimBuildResult};
 pub use infer::run_infer;
+pub use inference_artifacts::{
+    build_checkpoint_trace, write_claim_artifacts, ChallengeBundle, ChallengeTrace, Checkpoint,
+    CheckpointTrace, ClaimBundle, ClaimEndpoint, Divergence, DivergenceReason, ReplayPackage,
+    CHALLENGE_BUNDLE_JSON, CHALLENGE_TRACE_JSON, CHECKPOINT_HASHES_TXT, CHECKPOINT_TRACE_JSON,
+    CLAIM_BUNDLE_JSON, DIVERGENCE_JSON, REPLAY_PACKAGE_JSON,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "raster-inference")]
@@ -29,7 +28,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Run one direct-native stage and publish its canonical output artifact.
+    /// Run one staged-infer stage and publish its canonical output artifact.
     #[arg(long = "run-stage", alias = "run-prefill-range-stage", hide = true)]
     run_stage: Option<PathBuf>,
 
@@ -100,15 +99,15 @@ struct ModelImportArgs {
 
 #[derive(Debug, Subcommand)]
 enum ClaimCommand {
-    /// Build a direct-native checkpoint claim.
+    /// Build a staged-infer checkpoint claim.
     Build(ClaimBuildArgs),
 }
 
 #[derive(Debug, Args)]
 struct ClaimBuildArgs {
-    /// Use the previous per-stage child-process direct-native runner.
-    #[arg(long = "direct-subprocess", hide = true)]
-    direct_subprocess: bool,
+    /// Use the previous per-stage child-process staged-infer runner.
+    #[arg(long = "staged-subprocess", alias = "direct-subprocess", hide = true)]
+    staged_subprocess: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -149,7 +148,7 @@ where
 fn execute(cli: Cli) -> Result<ExitCode> {
     if let Some(stage_dir) = cli.run_stage.as_ref() {
         require_input_args(&cli)?;
-        direct_native::shadow::run_hidden_stage_direct(stage_dir)?;
+        staged_infer::shadow::run_hidden_stage_direct(stage_dir)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -158,7 +157,7 @@ fn execute(cli: Cli) -> Result<ExitCode> {
             let status = run_hidden_compare(&stage_dir)?;
             return finish_shadow_run(status, &stage_dir);
         }
-        let report = direct_native::shadow::run_hidden_stage_compare(&stage_dir)?;
+        let report = staged_infer::shadow::run_hidden_stage_compare(&stage_dir)?;
         return Ok(if report.matched {
             ExitCode::SUCCESS
         } else {
@@ -186,8 +185,9 @@ fn execute(cli: Cli) -> Result<ExitCode> {
         }
         Some(Commands::Infer) => {
             warn_if_debug_build("infer");
-            let result = run_infer()?;
-            print_infer_result(&result);
+            let report = run_infer()?;
+            print_infer_result(&report.result);
+            print_infer_timing_summary(&report.timings);
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Challenge { command }) => match command {
@@ -215,7 +215,7 @@ fn warn_if_debug_build(workflow: &str) {
     eprintln!(
         "warning: raster-inference {workflow} is running from a debug build; \
          use `cargo run --release --manifest-path raster-inference-cli/Cargo.toml -- {workflow}` \
-         for the optimized direct-native path"
+         for the optimized staged-infer path"
     );
 }
 
@@ -228,9 +228,9 @@ struct ChallengeBuildArgs {
     #[arg(long)]
     trace: PathBuf,
 
-    /// Use the previous per-stage child-process direct-native runner.
-    #[arg(long = "direct-subprocess", hide = true)]
-    direct_subprocess: bool,
+    /// Use the previous per-stage child-process staged-infer runner.
+    #[arg(long = "staged-subprocess", alias = "direct-subprocess", hide = true)]
+    staged_subprocess: bool,
 }
 
 fn require_input_args(cli: &Cli) -> Result<()> {
@@ -277,7 +277,7 @@ fn print_challenge_result(result: &ChallengeBuildResult) {
     }
 }
 
-fn print_infer_result(result: &direct_native::InferenceResult) {
+fn print_infer_result(result: &staged_infer::InferenceResult) {
     println!("generated token count: {}", result.generated_token_count);
     println!("generated token ids: {:?}", result.generated_token_ids);
     println!(
@@ -289,8 +289,63 @@ fn print_infer_result(result: &direct_native::InferenceResult) {
     println!("{}", result.generated_text);
 }
 
+fn print_infer_timing_summary(timings: &staged_infer::InferenceTimings) {
+    eprintln!("infer timing:");
+    eprintln!("  total: {}", format_duration(timings.total_duration));
+    if !timings.aux_waves.is_empty() {
+        for wave in &timings.aux_waves {
+            eprintln!(
+                "  aux wave {}: {} stages, parallelism {}, wall {}, stage-sum {}",
+                wave.name,
+                wave.stage_count,
+                wave.parallelism,
+                format_duration(wave.wall_duration),
+                format_duration(wave.stage_duration_sum)
+            );
+        }
+    }
+
+    let synthesis = timings
+        .stages
+        .iter()
+        .map(|stage| stage.input_synthesis_duration)
+        .sum();
+    let input_load = timings
+        .stages
+        .iter()
+        .map(|stage| stage.input_load_duration)
+        .sum();
+    let kernel = timings
+        .stages
+        .iter()
+        .map(|stage| stage.kernel_duration)
+        .sum();
+    let encode = timings
+        .stages
+        .iter()
+        .map(|stage| stage.encode_duration)
+        .sum();
+    eprintln!("  stages: {}", timings.stages.len());
+    eprintln!("  input synthesis: {}", format_duration(synthesis));
+    eprintln!("  input load: {}", format_duration(input_load));
+    eprintln!("  kernels: {}", format_duration(kernel));
+    eprintln!("  encode: {}", format_duration(encode));
+}
+
+fn format_duration(duration: std::time::Duration) -> String {
+    if duration.as_secs() >= 1 {
+        format!("{:.2}s", duration.as_secs_f64())
+    } else if duration.as_millis() >= 1 {
+        format!("{}ms", duration.as_millis())
+    } else if duration.as_micros() >= 1 {
+        format!("{}us", duration.as_micros())
+    } else {
+        format!("{}ns", duration.as_nanos())
+    }
+}
+
 fn finish_shadow_run(status: ExitStatus, stage_dir: &Path) -> Result<ExitCode> {
-    match direct_native::shadow::read_shadow_report(stage_dir) {
+    match staged_infer::shadow::read_shadow_report(stage_dir) {
         Ok(report) => {
             let chain_dir = stage_dir
                 .parent()
@@ -305,17 +360,17 @@ fn finish_shadow_run(status: ExitStatus, stage_dir: &Path) -> Result<ExitCode> {
 
 fn render_timing_summary_or_warning(
     chain_dir: &Path,
-    report: &direct_native::shadow::ShadowReport,
+    report: &staged_infer::shadow::ShadowReport,
 ) -> String {
-    direct_native::shadow::read_chain_execution_times(chain_dir)
-        .and_then(|timings| direct_native::shadow::render_timing_summary(&timings, report))
+    staged_infer::shadow::read_chain_execution_times(chain_dir)
+        .and_then(|timings| staged_infer::shadow::render_timing_summary(&timings, report))
         .unwrap_or_else(|error| format!("\ntiming summary unavailable: {error:#}\n"))
 }
 
 fn run_hidden_compare(stage_dir: &Path) -> Result<ExitStatus> {
     let input = stage_dir.join("input.json");
     let input_manifest = stage_dir.join("input_manifest.json");
-    let prior_report = direct_native::shadow::parity_dir(stage_dir).join("report.json");
+    let prior_report = staged_infer::shadow::parity_dir(stage_dir).join("report.json");
     if let Err(error) = fs::remove_file(&prior_report) {
         if error.kind() != std::io::ErrorKind::NotFound {
             return Err(error)
@@ -325,7 +380,7 @@ fn run_hidden_compare(stage_dir: &Path) -> Result<ExitStatus> {
     let exe = std::env::current_exe().context("failed to locate current executable")?;
     let status = comparison_command(&exe, stage_dir, &input, &input_manifest)
         .status()
-        .context("failed to start direct-native comparison child")?;
+        .context("failed to start staged-infer comparison child")?;
     Ok(status)
 }
 
@@ -379,12 +434,12 @@ impl ModelImportArgs {
 impl ClaimBuildArgs {
     fn into_options(self) -> Result<ClaimBuildOptions> {
         let current_exe = std::env::current_exe().context("failed to locate current executable")?;
-        let direct_backend = if self.direct_subprocess {
-            direct_native::hybrid::DirectStageBackend::Subprocess
+        let staged_backend = if self.staged_subprocess {
+            staged_infer::hybrid::StagedExecutionBackend::Subprocess
         } else {
-            direct_native::hybrid::DirectStageBackend::InProcess
+            staged_infer::hybrid::StagedExecutionBackend::InProcess
         };
-        ClaimBuildOptions::from_current_dir(current_exe, direct_backend)
+        ClaimBuildOptions::from_current_dir(current_exe, staged_backend)
     }
 }
 
@@ -392,12 +447,12 @@ impl ChallengeBuildArgs {
     fn into_options(self) -> Result<ChallengeBuildOptions> {
         let input = ChallengeInput::Trace(self.trace);
         let current_exe = std::env::current_exe().context("failed to locate current executable")?;
-        let direct_backend = if self.direct_subprocess {
-            direct_native::hybrid::DirectStageBackend::Subprocess
+        let staged_backend = if self.staged_subprocess {
+            staged_infer::hybrid::StagedExecutionBackend::Subprocess
         } else {
-            direct_native::hybrid::DirectStageBackend::InProcess
+            staged_infer::hybrid::StagedExecutionBackend::InProcess
         };
-        ChallengeBuildOptions::from_current_dir(current_exe, direct_backend, input)
+        ChallengeBuildOptions::from_current_dir(current_exe, staged_backend, input)
     }
 }
 

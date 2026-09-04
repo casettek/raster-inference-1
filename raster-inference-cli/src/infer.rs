@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use direct_native::{
-    InferenceResult, UnconstrainedInferenceConfig, UnconstrainedInferenceExecutor,
+use staged_infer::{
+    ArtifactlessStagedInferenceConfig, ArtifactlessStagedInferenceExecutor, InferenceRunReport,
 };
 
-pub fn run_infer() -> Result<InferenceResult> {
-    UnconstrainedInferenceExecutor.run(
-        UnconstrainedInferenceConfig::from_current_dir()
+pub fn run_infer() -> Result<InferenceRunReport> {
+    ArtifactlessStagedInferenceExecutor.run_with_report(
+        ArtifactlessStagedInferenceConfig::from_current_dir()
             .context("failed to build infer configuration")?,
     )
 }

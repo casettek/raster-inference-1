@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
-use direct_native::hybrid::DirectStageBackend;
-use direct_native::{CheckpointedInferenceConfig, CheckpointedInferenceExecutor, ParityPolicy};
+use staged_infer::hybrid::StagedExecutionBackend;
+use staged_infer::{CheckpointedInferenceConfig, CheckpointedInferenceExecutor, ParityPolicy};
 
-use crate::artifacts::{
+use inference_artifacts::{
     build_checkpoint_trace, read_challenge_bundle, read_checkpoint_trace,
     write_challenge_artifacts, write_checkpoint_trace_artifact, ChallengeBundle, Checkpoint,
     CheckpointTrace, Divergence, DivergenceReason, ReplayPackage,
@@ -22,7 +22,7 @@ pub struct ChallengeBuildOptions {
     pub base_dir: PathBuf,
     pub manifest_path: PathBuf,
     pub current_exe: PathBuf,
-    pub direct_backend: DirectStageBackend,
+    pub staged_backend: StagedExecutionBackend,
     pub input: ChallengeInput,
 }
 
@@ -56,7 +56,7 @@ pub fn build_challenge(options: ChallengeBuildOptions) -> Result<ChallengeBuildR
         base_dir: options.base_dir.clone(),
         manifest_path: options.manifest_path.clone(),
         current_exe: options.current_exe,
-        direct_backend: options.direct_backend,
+        staged_backend: options.staged_backend,
         parity_policy: ParityPolicy::Skip,
     })?;
     let recomputed_trace = build_checkpoint_trace(&recomputed.chain_dir, &options.manifest_path)?;
@@ -310,7 +310,7 @@ fn sanitize_stage_name(stage: &str) -> String {
 impl ChallengeBuildOptions {
     pub fn from_current_dir(
         current_exe: PathBuf,
-        direct_backend: DirectStageBackend,
+        staged_backend: StagedExecutionBackend,
         input: ChallengeInput,
     ) -> Result<Self> {
         let base_dir = std::env::current_dir().context("failed to read current directory")?;
@@ -318,7 +318,7 @@ impl ChallengeBuildOptions {
             manifest_path: base_dir.join("Raster.toml"),
             base_dir,
             current_exe,
-            direct_backend,
+            staged_backend,
             input,
         })
     }

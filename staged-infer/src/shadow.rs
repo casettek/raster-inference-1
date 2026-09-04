@@ -9,9 +9,9 @@ use sha2::{Digest, Sha256};
 
 use crate::routines::{self, StageKind};
 
-const PARITY_DIR: &str = "direct-native-parity";
-const DIRECT_OUTPUT_BIN: &str = "direct-native-output.bin";
-const DIRECT_OUTPUT_RINDEX: &str = "direct-native-output.rindex";
+const PARITY_DIR: &str = "staged-infer-parity";
+const DIRECT_OUTPUT_BIN: &str = "staged-infer-output.bin";
+const DIRECT_OUTPUT_RINDEX: &str = "staged-infer-output.rindex";
 const REPORT_TXT: &str = "report.txt";
 const REPORT_JSON: &str = "report.json";
 pub const EXECUTION_TIMES_JSON: &str = "execution-times.json";
@@ -138,7 +138,7 @@ pub fn run_hidden_stage_direct(stage_dir: &Path) -> Result<()> {
 
     let direct = routines::run_and_publish(&kind)?;
     println!(
-        "direct-native {stage_name}: output {} structural={} stage={}",
+        "staged-infer {stage_name}: output {} structural={} stage={}",
         direct.artifact.data_path.display(),
         direct.artifact.commitment,
         format_duration_ns(direct.timings.direct_stage_duration.as_nanos())
@@ -224,7 +224,7 @@ fn allowed_no_auth_roots() -> Result<Vec<PathBuf>> {
             .join("chains-no-auth"),
         current_dir
             .join("target")
-            .join("direct-native")
+            .join("staged-infer")
             .join("chains-no-auth"),
     ];
     Ok(roots
@@ -298,14 +298,14 @@ fn render_report(
 ) -> String {
     match comparison {
         ByteComparison::Match => format!(
-            "NON-AUTHORITATIVE direct-native computational parity {stage}: MATCH\n\
+            "NON-AUTHORITATIVE staged-infer computational parity {stage}: MATCH\n\
              Raster source mode: unauthenticated (--no-auth)\n\
              output.bin bytes: {raster_len}\n\
              raster sha256: {raster_sha}\n\
-             direct-native sha256: {direct_sha}\n\
+             staged-infer sha256: {direct_sha}\n\
              structural commitment: {raster_structural}\n\
-             direct-native stage: {}\n\
-             direct-native kernel: {}\n",
+             staged-infer stage: {}\n\
+             staged-infer kernel: {}\n",
             format_duration_ns(result.direct_stage_duration_ns),
             format_duration_ns(result.kernel_duration_ns),
         ),
@@ -314,21 +314,21 @@ fn render_report(
             raster,
             direct,
         } => format!(
-            "NON-AUTHORITATIVE direct-native computational parity {stage}: MISMATCH\n\
+            "NON-AUTHORITATIVE staged-infer computational parity {stage}: MISMATCH\n\
              Raster source mode: unauthenticated (--no-auth)\n\
              raster bytes: {raster_len}\n\
-             direct-native bytes: {direct_len}\n\
+             staged-infer bytes: {direct_len}\n\
              first differing byte offset: {offset}\n\
              raster byte: {}\n\
-             direct-native byte: {}\n\
+             staged-infer byte: {}\n\
              raster sha256: {raster_sha}\n\
-             direct-native sha256: {direct_sha}\n\
+             staged-infer sha256: {direct_sha}\n\
              raster structural commitment: {raster_structural}\n\
-             direct-native structural commitment: {direct_structural}\n\
+             staged-infer structural commitment: {direct_structural}\n\
              raster artifact: {}\n\
-             direct-native artifact: {}\n\
-             direct-native stage: {}\n\
-             direct-native kernel: {}\n",
+             staged-infer artifact: {}\n\
+             staged-infer stage: {}\n\
+             staged-infer kernel: {}\n",
             render_byte(*raster),
             render_byte(*direct),
             raster_artifact.display(),
@@ -363,7 +363,7 @@ pub fn read_shadow_report(stage_dir: &Path) -> Result<ShadowReport> {
     .with_context(|| format!("failed to decode {}", path.display()))?;
     if report.version != 3 {
         bail!(
-            "unsupported direct-native report version {} in {}",
+            "unsupported staged-infer report version {} in {}",
             report.version,
             path.display()
         );
@@ -481,7 +481,7 @@ pub fn render_timing_summary(
     }
     writeln!(
         output,
-        "direct-native shadow overhead: {}",
+        "staged-infer shadow overhead: {}",
         format_duration_ns(shadow.direct_stage_duration_ns)
     )?;
     Ok(output)
