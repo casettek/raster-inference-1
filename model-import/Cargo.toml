@@ -10,9 +10,11 @@ name = "model-import"
 path = "src/main.rs"
 
 [dependencies]
+inference-artifacts = { path = "../inference-artifacts" }
 raster = { path = "../../../raster/crates/raster" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 # Only for the bucket hash. The stage types stay duplicated in `externals.rs`
 # (see its header), but the hash must NOT be: it is the one function the host
 # and the replay guest have to agree on byte-for-byte, and two copies of it is

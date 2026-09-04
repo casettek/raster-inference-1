@@ -980,9 +980,22 @@ name = "direct-infer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "decode-embed",
+ "decode-select-token",
  "det-num",
  "inference-artifacts",
+ "input-embedding",
+ "memmap2",
+ "output-finalize",
+ "prefill-finalize",
+ "prefill-prepare-aux",
+ "prefill-range",
+ "prompt-prepare",
+ "raster",
  "serde",
+ "serde_json",
+ "sha2",
+ "staged-infer",
 ]
 
 [[package]]
@@ -2045,11 +2058,13 @@ dependencies = [
 name = "model-import"
 version = "0.1.0"
 dependencies = [
+ "inference-artifacts",
  "prompt-prepare",
  "raster",
  "raster-inference",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

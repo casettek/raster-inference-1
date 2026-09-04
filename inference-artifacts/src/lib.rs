@@ -14,6 +14,8 @@ pub const CHALLENGE_TRACE_JSON: &str = "challenge_trace.json";
 pub const REPLAY_PACKAGE_JSON: &str = "replay_package.json";
 pub const CHALLENGE_BUNDLE_JSON: &str = "challenge_bundle.json";
 pub const EXECUTION_TIMES_JSON: &str = "execution-times.json";
+pub const DIRECT_INFER_ARTIFACTS_DIR: &str = "direct-infer-artifacts";
+pub const DIRECT_INFER_MANIFEST_JSON: &str = "manifest.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InferenceResult {
@@ -22,6 +24,71 @@ pub struct InferenceResult {
     pub generated_token_ids_sha256: String,
     pub generated_text: String,
     pub stop_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectInferManifest {
+    pub version: u32,
+    pub bundle: DirectInferBundle,
+    pub import: DirectInferImportSettings,
+    pub prompt: DirectInferPrompt,
+    pub shape: DirectInferShape,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<DirectInferProvenance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectInferBundle {
+    pub model_detwgt_path: PathBuf,
+    pub model_detwgt_sha256: String,
+    pub config_path: PathBuf,
+    pub config_sha256: String,
+    pub tokenizer_path: PathBuf,
+    pub tokenizer_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectInferImportSettings {
+    pub prompt: String,
+    pub raw_prompt: bool,
+    pub tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectInferPrompt {
+    pub rendered_prompt: String,
+    pub initial_pieces: Vec<String>,
+    pub eos_token_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectInferShape {
+    pub hidden_size: u32,
+    pub num_hidden_layers: u32,
+    pub num_attention_heads: u32,
+    pub num_key_value_heads: u32,
+    pub head_dim: u32,
+    pub global_head_dim: u32,
+    pub vocab_size: u32,
+    pub hidden_size_per_layer_input: u32,
+    pub sliding_window: u32,
+    pub layer_types: Vec<String>,
+    pub num_kv_shared_layers: u32,
+    pub norm_eps: i64,
+    pub rope_base_sliding: i64,
+    pub rope_base_full: i64,
+    pub full_partial_rotary_factor_q16: i32,
+    pub embedding_scale: i32,
+    pub ple_embedding_scale: i32,
+    pub ple_projection_scalar: i32,
+    pub ple_input_scale: i32,
+    pub final_logit_softcap: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectInferProvenance {
+    pub raster_manifest_path: PathBuf,
+    pub raster_manifest_sha256: String,
 }
 
 /// Ordered routine-boundary checkpoints from one checkpointed inference run.
@@ -349,7 +416,7 @@ impl From<ExecutionTimesDocument> for ExecutionTimesIndex {
     }
 }
 
-fn read_json<T>(path: &Path) -> Result<T>
+pub fn read_json<T>(path: &Path) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -359,7 +426,11 @@ where
     .with_context(|| format!("failed to parse {}", path.display()))
 }
 
-fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
     fs::write(
         path,
         serde_json::to_vec_pretty(value).context("failed to encode JSON artifact")?,
@@ -472,6 +543,63 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<ClaimBundle>(&serde_json::to_vec(&bundle).unwrap()).unwrap(),
             bundle
+        );
+    }
+
+    #[test]
+    fn direct_infer_manifest_round_trips_as_json() {
+        let manifest = DirectInferManifest {
+            version: 1,
+            bundle: DirectInferBundle {
+                model_detwgt_path: PathBuf::from("../model.detwgt"),
+                model_detwgt_sha256: String::from("model-sha"),
+                config_path: PathBuf::from("../config.json"),
+                config_sha256: String::from("config-sha"),
+                tokenizer_path: PathBuf::from("../tokenizer.json"),
+                tokenizer_sha256: String::from("tokenizer-sha"),
+            },
+            import: DirectInferImportSettings {
+                prompt: String::from("hello"),
+                raw_prompt: true,
+                tokens: 2,
+            },
+            prompt: DirectInferPrompt {
+                rendered_prompt: String::from("hello"),
+                initial_pieces: vec![String::from("hello"), String::from("</w>")],
+                eos_token_ids: vec![1, 2],
+            },
+            shape: DirectInferShape {
+                hidden_size: 4,
+                num_hidden_layers: 1,
+                num_attention_heads: 2,
+                num_key_value_heads: 1,
+                head_dim: 2,
+                global_head_dim: 2,
+                vocab_size: 8,
+                hidden_size_per_layer_input: 2,
+                sliding_window: 16,
+                layer_types: vec![String::from("sliding_attention")],
+                num_kv_shared_layers: 0,
+                norm_eps: 0,
+                rope_base_sliding: 10_000_i64 << 32,
+                rope_base_full: 1_000_000_i64 << 32,
+                full_partial_rotary_factor_q16: 1 << 16,
+                embedding_scale: 1 << 16,
+                ple_embedding_scale: 1 << 16,
+                ple_projection_scalar: 1 << 16,
+                ple_input_scale: 1 << 16,
+                final_logit_softcap: 0,
+            },
+            provenance: Some(DirectInferProvenance {
+                raster_manifest_path: PathBuf::from("../Raster.toml"),
+                raster_manifest_sha256: String::from("raster-sha"),
+            }),
+        };
+
+        assert_eq!(
+            serde_json::from_slice::<DirectInferManifest>(&serde_json::to_vec(&manifest).unwrap())
+                .unwrap(),
+            manifest
         );
     }
 

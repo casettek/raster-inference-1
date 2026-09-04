@@ -1717,6 +1717,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "inference-artifacts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "inventory"
 version = "0.3.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1991,11 +2002,13 @@ dependencies = [
 name = "model-import"
 version = "0.1.0"
 dependencies = [
+ "inference-artifacts",
  "prompt-prepare",
  "raster",
  "raster-inference",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -437,10 +437,11 @@ pub fn run_cached_from_paths_with_caches(
         ),
         StageKind::PrefillPrepareAux { .. } => cache(
             || {
-                prefill_prepare_aux::load_inputs_from_paths(
+                prefill_prepare_aux::load_inputs_from_paths_with_cache(
                     input_path,
                     input_manifest_path,
                     cached_inputs,
+                    caches.materializations,
                 )
             },
             prefill_prepare_aux::run_direct,
@@ -449,10 +450,11 @@ pub fn run_cached_from_paths_with_caches(
         ),
         StageKind::PrefillRange { .. } => cache(
             || {
-                prefill_range::load_inputs_from_paths(
+                prefill_range::load_inputs_from_paths_with_cache(
                     input_path,
                     input_manifest_path,
                     cached_inputs,
+                    caches.materializations,
                 )
             },
             |inputs| {

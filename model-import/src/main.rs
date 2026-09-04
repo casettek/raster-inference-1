@@ -16,6 +16,7 @@
 //! requantises.
 
 mod detwgt;
+mod direct_manifest;
 mod externals;
 
 use externals::*;
@@ -78,6 +79,9 @@ pub struct ImportConfig {
     pub only_embedding: bool,
     /// Rewrite only the PLE layer externals (`prefill-prepare-aux`).
     pub only_ple: bool,
+    /// Write only the host-side direct-infer manifest, without regenerating
+    /// committed Raster stage externals.
+    pub only_direct: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +110,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<ImportConfi
     let mut only_layers = false;
     let mut only_embedding = false;
     let mut only_ple = false;
+    let mut only_direct = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -124,8 +129,12 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<ImportConfi
             "--only-layers" => only_layers = true,
             "--only-embedding" => only_embedding = true,
             "--only-ple" => only_ple = true,
+            "--only-direct" => only_direct = true,
             other => return Err(format!("unknown argument '{other}'").into()),
         }
+    }
+    if only_direct && (only_tokenizer || only_layers || only_embedding || only_ple) {
+        return Err("--only-direct cannot be combined with other --only-* modes".into());
     }
     Ok(ImportConfig {
         model_dir: model_dir.ok_or("--model <bundle-dir> is required")?,
@@ -137,6 +146,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<ImportConfi
         only_layers,
         only_embedding,
         only_ple,
+        only_direct,
     })
 }
 
@@ -145,6 +155,36 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
         serde_json::from_slice(&fs::read(args.model_dir.join("tokenizer.json"))?)?;
 
     let eos_ids = load_eos_ids(&args.model_dir);
+
+    if args.only_direct {
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(args.model_dir.join("config.json"))?)?;
+        let text = config
+            .get("text_config")
+            .ok_or("config.json has no text_config")?;
+        let shape = Shape::from_config(text)?;
+        let raster_manifest_text = match args.manifest.as_ref() {
+            Some(path) if path.is_file() => Some(fs::read_to_string(path)?),
+            _ => None,
+        };
+        let raster_manifest = args
+            .manifest
+            .as_deref()
+            .zip(raster_manifest_text.as_deref());
+        direct_manifest::write_direct_manifest(
+            &args,
+            &tokenizer,
+            &eos_ids,
+            &shape,
+            text,
+            raster_manifest,
+        )?;
+        return Ok(ImportResult {
+            manifest_path: None,
+            manifest_text: None,
+            stage_count: 0,
+        });
+    }
 
     if args.only_tokenizer {
         let mut stages = Vec::new();
@@ -166,6 +206,7 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
             "{}",
             external_line("decoder", "output-finalize", "decoder", &decoder_commitment)
         );
+        direct_manifest::warn_partial_direct_manifest_not_refreshed();
         return Ok(ImportResult {
             manifest_path: None,
             manifest_text: None,
@@ -190,6 +231,7 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
             println!();
             print!("{stage}");
         }
+        direct_manifest::warn_partial_direct_manifest_not_refreshed();
         return Ok(ImportResult {
             manifest_path: None,
             manifest_text: None,
@@ -207,6 +249,7 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
             println!();
             print!("{stage}");
         }
+        direct_manifest::warn_partial_direct_manifest_not_refreshed();
         return Ok(ImportResult {
             manifest_path: None,
             manifest_text: None,
@@ -224,6 +267,7 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
             println!();
             print!("{stage}");
         }
+        direct_manifest::warn_partial_direct_manifest_not_refreshed();
         return Ok(ImportResult {
             manifest_path: None,
             manifest_text: None,
@@ -267,15 +311,24 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
         &stages,
     )?);
     let stage_count = stages.len();
-    if let Some(path) = args.manifest {
-        fs::write(&path, &manifest)?;
+    if let Some(path) = args.manifest.as_ref() {
+        fs::write(path, &manifest)?;
         println!("wrote {}", path.display());
+        direct_manifest::write_direct_manifest(
+            &args,
+            &tokenizer,
+            &eos_ids,
+            &shape,
+            text,
+            Some((path, &manifest)),
+        )?;
         Ok(ImportResult {
-            manifest_path: Some(path),
+            manifest_path: Some(path.clone()),
             manifest_text: None,
             stage_count,
         })
     } else {
+        direct_manifest::write_direct_manifest(&args, &tokenizer, &eos_ids, &shape, text, None)?;
         println!();
         println!("# ---- root Raster.toml ----");
         print!("{manifest}");
@@ -1503,8 +1556,49 @@ mod tests {
                 only_layers: false,
                 only_embedding: true,
                 only_ple: false,
+                only_direct: false,
             }
         );
+    }
+
+    #[test]
+    fn parse_args_accepts_only_direct() {
+        let config = parse_args_from(
+            [
+                "--model",
+                "fixtures/model",
+                "--prompt",
+                "hello",
+                "--tokens",
+                "3",
+                "--only-direct",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+
+        assert!(config.only_direct);
+        assert!(!config.only_tokenizer);
+        assert!(!config.only_layers);
+        assert!(!config.only_embedding);
+        assert!(!config.only_ple);
+    }
+
+    #[test]
+    fn parse_args_rejects_only_direct_with_other_partial_modes() {
+        let error = parse_args_from(
+            [
+                "--model",
+                "fixtures/model",
+                "--only-direct",
+                "--only-tokenizer",
+            ]
+            .map(String::from),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("--only-direct cannot be combined"));
     }
 
     #[test]

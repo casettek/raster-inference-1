@@ -291,7 +291,8 @@ fn prefill_prepare_aux_publishes_one_row() {
             },
             embeddings: paged(&[ONE, 0]),
             projection: paged(&[ONE, 0, 0, ONE]),
-        },
+        }
+        .into(),
     };
     let output = routines::prefill_prepare_aux::run_direct(&inputs).unwrap();
     let kernel_output = kernels::prefill_prepare_aux::run_prefill_prepare_aux_direct(
@@ -337,7 +338,7 @@ fn prefill_prepare_aux_preserves_prompt_row_order() {
                 kv: List::new(),
                 start_position: 0,
             },
-            layer: layer(),
+            layer: layer().into(),
         })
         .unwrap()
     };

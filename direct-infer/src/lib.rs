@@ -1,4 +1,5 @@
 pub mod config;
+pub mod detwgt;
 pub mod executor;
 pub mod model;
 pub mod state;

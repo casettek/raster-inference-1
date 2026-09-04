@@ -1,0 +1,508 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use direct_infer::detwgt::MmapDetwgt;
+use direct_infer::{DirectInferenceConfig, DirectInferenceExecutor};
+use inference_artifacts::{
+    write_json, DirectInferBundle, DirectInferImportSettings, DirectInferManifest,
+    DirectInferPrompt, DirectInferShape, DIRECT_INFER_ARTIFACTS_DIR, DIRECT_INFER_MANIFEST_JSON,
+};
+use input_embedding::input::EmbeddingTable;
+use output_finalize::input::{DecoderTable, DecoderToken};
+use prefill_finalize::input::{FinalHead, FinalHeadParams};
+use prompt_prepare::input::{
+    vocab_bucket_of, BpePieces, MergeBucket, PromptTokenizer, TokenEntry, VocabBucket,
+};
+use raster::{Bytes, List};
+use sha2::{Digest, Sha256};
+use staged_infer::{ArtifactlessStagedInferenceConfig, ArtifactlessStagedInferenceExecutor};
+
+const ONE: i32 = 1 << 16;
+
+#[test]
+fn direct_executor_reports_missing_direct_manifest_message() {
+    let dir = std::env::temp_dir().join(format!(
+        "direct-infer-missing-manifest-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).expect("temp dir should create");
+
+    let error = DirectInferenceExecutor
+        .run(DirectInferenceConfig {
+            base_dir: dir.clone(),
+            direct_manifest_path: dir
+                .join(DIRECT_INFER_ARTIFACTS_DIR)
+                .join(DIRECT_INFER_MANIFEST_JSON),
+        })
+        .expect_err("missing manifest should fail");
+
+    assert!(!format!("{error:#}").contains("scaffolded"));
+    assert!(format!("{error:#}").contains("raster-inference model import"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn mmap_detwgt_validates_digest_and_sign_extends_i16() {
+    let dir = temp_dir("loader");
+    fs::create_dir_all(&dir).unwrap();
+    let detwgt = dir.join("model.detwgt");
+    write_detwgt(
+        &detwgt,
+        &[TensorFixture {
+            name: "tiny",
+            dims: vec![2],
+            element_width: 16,
+            values: vec![-1, 2],
+        }],
+    );
+    let digest = sha256_file(&detwgt);
+
+    let model = MmapDetwgt::open(&detwgt, &digest).unwrap();
+    assert_eq!(model.values("tiny").unwrap(), vec![-1, 2]);
+    assert!(MmapDetwgt::open(&detwgt, "not-the-digest")
+        .unwrap_err()
+        .to_string()
+        .contains("digest mismatch"));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn direct_executor_runs_from_direct_manifest_without_raster_toml() {
+    let dir = temp_dir("runtime");
+    let artifact_dir = dir.join(DIRECT_INFER_ARTIFACTS_DIR);
+    fs::create_dir_all(&artifact_dir).unwrap();
+
+    let detwgt = dir.join("model.detwgt");
+    write_detwgt(
+        &detwgt,
+        &[
+            TensorFixture {
+                name: "model.language_model.embed_tokens.weight",
+                dims: vec![3, 2],
+                element_width: 32,
+                values: vec![0, 0, ONE, 0, 0, ONE],
+            },
+            TensorFixture {
+                name: "model.language_model.lm_head.weight",
+                dims: vec![3, 2],
+                element_width: 32,
+                values: vec![0, 0, 0, 0, ONE, 0],
+            },
+            TensorFixture {
+                name: "model.language_model.norm.weight",
+                dims: vec![2],
+                element_width: 32,
+                values: vec![ONE, ONE],
+            },
+        ],
+    );
+    let config = dir.join("config.json");
+    fs::write(&config, r#"{"text_config":{"tie_word_embeddings":false}}"#).unwrap();
+    let tokenizer = dir.join("tokenizer.json");
+    fs::write(
+        &tokenizer,
+        r#"{"model":{"vocab":{"<pad>":0,"hello":1,"Hi":2},"merges":[]},"added_tokens":[]}"#,
+    )
+    .unwrap();
+
+    let manifest_path = artifact_dir.join(DIRECT_INFER_MANIFEST_JSON);
+    write_json(
+        &manifest_path,
+        &DirectInferManifest {
+            version: 1,
+            bundle: DirectInferBundle {
+                model_detwgt_path: PathBuf::from("../model.detwgt"),
+                model_detwgt_sha256: sha256_file(&detwgt),
+                config_path: PathBuf::from("../config.json"),
+                config_sha256: sha256_file(&config),
+                tokenizer_path: PathBuf::from("../tokenizer.json"),
+                tokenizer_sha256: sha256_file(&tokenizer),
+            },
+            import: DirectInferImportSettings {
+                prompt: String::from("hello"),
+                raw_prompt: true,
+                tokens: 1,
+            },
+            prompt: DirectInferPrompt {
+                rendered_prompt: String::from("hello"),
+                initial_pieces: vec![String::from("hello"), String::from("</w>")],
+                eos_token_ids: Vec::new(),
+            },
+            shape: DirectInferShape {
+                hidden_size: 2,
+                num_hidden_layers: 0,
+                num_attention_heads: 1,
+                num_key_value_heads: 1,
+                head_dim: 2,
+                global_head_dim: 2,
+                vocab_size: 3,
+                hidden_size_per_layer_input: 1,
+                sliding_window: 0,
+                layer_types: Vec::new(),
+                num_kv_shared_layers: 0,
+                norm_eps: 0,
+                rope_base_sliding: 10_000_i64 << 32,
+                rope_base_full: 1_000_000_i64 << 32,
+                full_partial_rotary_factor_q16: ONE,
+                embedding_scale: ONE,
+                ple_embedding_scale: ONE,
+                ple_projection_scalar: ONE,
+                ple_input_scale: ONE,
+                final_logit_softcap: 0,
+            },
+            provenance: None,
+        },
+    )
+    .unwrap();
+
+    let result = DirectInferenceExecutor
+        .run(DirectInferenceConfig {
+            base_dir: dir.clone(),
+            direct_manifest_path: manifest_path,
+        })
+        .unwrap();
+
+    assert_eq!(result.generated_token_ids, vec![2]);
+    assert_eq!(
+        result.generated_token_ids_sha256,
+        format!("{:x}", Sha256::digest(b"[2]"))
+    );
+    assert_eq!(result.generated_text, "Hi");
+    assert_eq!(result.stop_reason, "max_new_tokens");
+    assert!(!dir.join("Raster.toml").exists());
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn direct_executor_matches_artifactless_staged_result() {
+    let dir = temp_dir("parity");
+    fs::create_dir_all(&dir).unwrap();
+    let manifest_path = write_direct_fixture(&dir);
+    write_staged_fixture(&dir);
+
+    let direct = DirectInferenceExecutor
+        .run(DirectInferenceConfig {
+            base_dir: dir.clone(),
+            direct_manifest_path: manifest_path,
+        })
+        .unwrap();
+    let staged = ArtifactlessStagedInferenceExecutor
+        .run(ArtifactlessStagedInferenceConfig {
+            base_dir: dir.clone(),
+            manifest_path: dir.join("Raster.toml"),
+        })
+        .unwrap();
+
+    assert_eq!(direct, staged);
+    assert_eq!(direct.generated_token_ids, vec![2]);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+struct TensorFixture {
+    name: &'static str,
+    dims: Vec<u64>,
+    element_width: u32,
+    values: Vec<i32>,
+}
+
+fn write_detwgt(path: &Path, tensors: &[TensorFixture]) {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"DNWGTV0\0");
+    bytes.extend_from_slice(&2_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u32.to_le_bytes());
+    bytes.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    for tensor in tensors {
+        bytes.extend_from_slice(&(tensor.name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(tensor.name.as_bytes());
+        bytes.extend_from_slice(&(tensor.dims.len() as u32).to_le_bytes());
+        for dim in &tensor.dims {
+            bytes.extend_from_slice(&dim.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(tensor.values.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&tensor.element_width.to_le_bytes());
+        let payload_len = tensor.values.len() * (tensor.element_width as usize / 8);
+        bytes.extend_from_slice(&(payload_len as u64).to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        while bytes.len() % 64 != 0 {
+            bytes.push(0);
+        }
+        match tensor.element_width {
+            16 => {
+                for value in &tensor.values {
+                    bytes.extend_from_slice(&(*value as i16).to_le_bytes());
+                }
+            }
+            32 => {
+                for value in &tensor.values {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            other => panic!("unsupported fixture width {other}"),
+        }
+    }
+    fs::write(path, bytes).unwrap();
+}
+
+fn write_direct_fixture(dir: &Path) -> PathBuf {
+    let artifact_dir = dir.join(DIRECT_INFER_ARTIFACTS_DIR);
+    fs::create_dir_all(&artifact_dir).unwrap();
+    let detwgt = dir.join("model.detwgt");
+    write_tiny_model_detwgt(&detwgt);
+    let config = dir.join("config.json");
+    fs::write(&config, r#"{"text_config":{"tie_word_embeddings":false}}"#).unwrap();
+    let tokenizer = dir.join("tokenizer.json");
+    fs::write(&tokenizer, tiny_tokenizer_json()).unwrap();
+    let manifest_path = artifact_dir.join(DIRECT_INFER_MANIFEST_JSON);
+    write_json(
+        &manifest_path,
+        &tiny_direct_manifest(&detwgt, &config, &tokenizer),
+    )
+    .unwrap();
+    manifest_path
+}
+
+fn write_tiny_model_detwgt(path: &Path) {
+    write_detwgt(
+        path,
+        &[
+            TensorFixture {
+                name: "model.language_model.embed_tokens.weight",
+                dims: vec![3, 2],
+                element_width: 32,
+                values: vec![0, 0, ONE, 0, 0, ONE],
+            },
+            TensorFixture {
+                name: "model.language_model.lm_head.weight",
+                dims: vec![3, 2],
+                element_width: 32,
+                values: vec![0, 0, 0, 0, ONE, 0],
+            },
+            TensorFixture {
+                name: "model.language_model.norm.weight",
+                dims: vec![2],
+                element_width: 32,
+                values: vec![ONE, ONE],
+            },
+        ],
+    );
+}
+
+fn tiny_direct_manifest(detwgt: &Path, config: &Path, tokenizer: &Path) -> DirectInferManifest {
+    DirectInferManifest {
+        version: 1,
+        bundle: DirectInferBundle {
+            model_detwgt_path: PathBuf::from("../model.detwgt"),
+            model_detwgt_sha256: sha256_file(detwgt),
+            config_path: PathBuf::from("../config.json"),
+            config_sha256: sha256_file(config),
+            tokenizer_path: PathBuf::from("../tokenizer.json"),
+            tokenizer_sha256: sha256_file(tokenizer),
+        },
+        import: DirectInferImportSettings {
+            prompt: String::from("hello"),
+            raw_prompt: true,
+            tokens: 1,
+        },
+        prompt: DirectInferPrompt {
+            rendered_prompt: String::from("hello"),
+            initial_pieces: vec![String::from("hello"), String::from("</w>")],
+            eos_token_ids: Vec::new(),
+        },
+        shape: DirectInferShape {
+            hidden_size: 2,
+            num_hidden_layers: 0,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            global_head_dim: 2,
+            vocab_size: 3,
+            hidden_size_per_layer_input: 1,
+            sliding_window: 0,
+            layer_types: Vec::new(),
+            num_kv_shared_layers: 0,
+            norm_eps: 0,
+            rope_base_sliding: 10_000_i64 << 32,
+            rope_base_full: 1_000_000_i64 << 32,
+            full_partial_rotary_factor_q16: ONE,
+            embedding_scale: ONE,
+            ple_embedding_scale: ONE,
+            ple_projection_scalar: ONE,
+            ple_input_scale: ONE,
+            final_logit_softcap: 0,
+        },
+        provenance: None,
+    }
+}
+
+fn write_staged_fixture(dir: &Path) {
+    let tokenizer = tiny_prompt_tokenizer();
+    let pieces = BpePieces {
+        pieces: List::from(vec![String::from("hello"), String::from("</w>")]),
+    };
+    let embedding = EmbeddingTable {
+        hidden_size: 2,
+        embedding_scale: ONE,
+        values: paged(&[0, 0, ONE, 0, 0, ONE]),
+    };
+    let head = FinalHead {
+        params: FinalHeadParams {
+            hidden_size: 2,
+            norm_eps: 0,
+            softcap: 0,
+            norm_weights: pack_i32_page(&[ONE, ONE]),
+        },
+        projection: paged(&[0, 0, 0, 0, ONE, 0]),
+    };
+    let decoder = DecoderTable {
+        tokens: List::from(vec![
+            DecoderToken {
+                token: String::from("<pad>"),
+                special: false,
+                terminal: false,
+            },
+            DecoderToken {
+                token: String::from("hello"),
+                special: false,
+                terminal: false,
+            },
+            DecoderToken {
+                token: String::from("Hi"),
+                special: false,
+                terminal: false,
+            },
+        ]),
+    };
+
+    let tokenizer_commitment =
+        write_staged_external(dir, "prompt-prepare", "tokenizer", &tokenizer);
+    let pieces_commitment = write_staged_external(dir, "prompt-prepare", "initial_pieces", &pieces);
+    let embedding_commitment =
+        write_staged_external(dir, "input-embedding", "embedding", &embedding);
+    let head_commitment = write_staged_external(dir, "prefill-finalize", "head", &head);
+    let decoder_commitment = write_staged_external(dir, "output-finalize", "decoder", &decoder);
+
+    fs::write(
+        dir.join("Raster.toml"),
+        format!(
+            r#"[chain]
+name = "direct-parity"
+version = "0.1.0"
+
+[[chain.stage]]
+name = "prompt_prepare"
+project = "prompt-prepare"
+inputs.tokenizer = {{ external = {{ path = "prompt-prepare/tokenizer.rastered", index_path = "prompt-prepare/tokenizer.rindex", commitment = "{tokenizer_commitment}" }} }}
+inputs.initial_pieces = {{ external = {{ path = "prompt-prepare/initial_pieces.rastered", index_path = "prompt-prepare/initial_pieces.rindex", commitment = "{pieces_commitment}" }} }}
+
+[[chain.stage]]
+name = "input_embedding"
+project = "input-embedding"
+inputs.prompt = {{ from = "prompt_prepare" }}
+inputs.embedding = {{ external = {{ path = "input-embedding/embedding.rastered", index_path = "input-embedding/embedding.rindex", commitment = "{embedding_commitment}" }} }}
+
+[[chain.stage]]
+name = "prefill_finalize"
+project = "prefill-finalize"
+inputs.activations = {{ from = "input_embedding" }}
+inputs.head = {{ external = {{ path = "prefill-finalize/head.rastered", index_path = "prefill-finalize/head.rindex", commitment = "{head_commitment}" }} }}
+
+[[chain.stage]]
+name = "decode_init"
+project = "decode-init"
+
+[[chain.stage]]
+name = "decode_select_token"
+project = "decode-select-token"
+inputs.logits = {{ from = "prefill_finalize" }}
+inputs.prior = {{ from = "decode_init" }}
+
+[[chain.stage]]
+name = "output_finalize"
+project = "output-finalize"
+inputs.edge = {{ from = "decode_select_token" }}
+inputs.decoder = {{ external = {{ path = "output-finalize/decoder.rastered", index_path = "output-finalize/decoder.rindex", commitment = "{decoder_commitment}" }} }}
+"#
+        ),
+    )
+    .unwrap();
+}
+
+fn write_staged_external<T: serde::Serialize>(
+    base: &Path,
+    stage_dir: &str,
+    name: &str,
+    value: &T,
+) -> String {
+    let dir = base.join(stage_dir);
+    fs::create_dir_all(&dir).unwrap();
+    raster::write_raster_files(
+        value,
+        &dir.join(format!("{name}.rastered")),
+        &dir.join(format!("{name}.rindex")),
+    )
+    .unwrap()
+}
+
+fn tiny_prompt_tokenizer() -> PromptTokenizer {
+    PromptTokenizer {
+        vocab_bucket_count: 1,
+        merge_bucket_count: 1,
+        vocab_buckets: List::from(vec![VocabBucket {
+            entries: List::from(
+                [("<pad>", 0), ("hello", 1), ("Hi", 2)]
+                    .into_iter()
+                    .map(|(token, id)| TokenEntry {
+                        token: token.to_string(),
+                        id,
+                    })
+                    .filter(|entry| vocab_bucket_of(&entry.token, 1) == 0)
+                    .collect::<Vec<_>>(),
+            ),
+        }]),
+        merge_buckets: List::from(vec![MergeBucket { rules: List::new() }]),
+    }
+}
+
+fn tiny_tokenizer_json() -> &'static str {
+    r#"{"model":{"vocab":{"<pad>":0,"hello":1,"Hi":2},"merges":[]},"added_tokens":[]}"#
+}
+
+fn paged(values: &[i32]) -> Bytes<196_608> {
+    Bytes::<196_608>::paged(bytes_of_i32s(values)).unwrap()
+}
+
+fn pack_i32_page(values: &[i32]) -> raster::BytesPage {
+    raster::BytesPage::__from_parts(0, 0, bytes_of_i32s(values))
+}
+
+fn bytes_of_i32s(values: &[i32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn sha256_file(path: &Path) -> String {
+    format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+}
+
+fn temp_dir(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "direct-infer-{label}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}

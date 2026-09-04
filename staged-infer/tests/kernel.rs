@@ -128,7 +128,7 @@ fn direct_prefill_returns_activation_and_own_kv() {
 
     let wrapper_output = routines::prefill_range::run_direct(&routines::prefill_range::Inputs {
         activations,
-        layer,
+        layer: layer.into(),
         layer_cache_key: None,
         prior_kv: donor.clone(),
         donor_a_kv: donor.clone(),
@@ -167,7 +167,7 @@ fn donor_layer_carries_prior_kv_and_publishes_own_kv() {
 
     let wrapper_output = routines::prefill_range::run_direct(&routines::prefill_range::Inputs {
         activations,
-        layer,
+        layer: layer.into(),
         layer_cache_key: None,
         prior_kv: donor.clone(),
         donor_a_kv: donor.clone(),

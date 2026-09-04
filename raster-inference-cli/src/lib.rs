@@ -95,6 +95,8 @@ struct ModelImportArgs {
     only_embedding: bool,
     #[arg(long = "only-ple")]
     only_ple: bool,
+    #[arg(long = "only-direct")]
+    only_direct: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -427,6 +429,7 @@ impl ModelImportArgs {
             only_layers: self.only_layers,
             only_embedding: self.only_embedding,
             only_ple: self.only_ple,
+            only_direct: self.only_direct,
         }
     }
 }
@@ -484,13 +487,22 @@ mod tests {
         ])
         .unwrap();
         parse_for_test(["raster-inference", "infer"]).unwrap();
+        parse_for_test([
+            "raster-inference",
+            "model",
+            "import",
+            "--model",
+            "fixtures/model",
+            "--only-direct",
+        ])
+        .unwrap();
     }
 
     #[test]
     fn infer_requires_an_imported_workspace() {
         let error = execute_from(["raster-inference", "infer"]).unwrap_err();
 
-        assert!(error.to_string().contains("imported workspace"));
+        assert!(format!("{error:#}").contains("raster-inference model import"));
     }
 
     #[test]
@@ -505,6 +517,7 @@ mod tests {
             only_layers: false,
             only_embedding: true,
             only_ple: false,
+            only_direct: false,
         }
         .into_import_config();
 
@@ -520,6 +533,7 @@ mod tests {
                 only_layers: false,
                 only_embedding: true,
                 only_ple: false,
+                only_direct: false,
             }
         );
     }
