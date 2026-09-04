@@ -994,7 +994,6 @@ dependencies = [
  "raster",
  "serde",
  "serde_json",
- "sha2",
  "staged-infer",
 ]
 

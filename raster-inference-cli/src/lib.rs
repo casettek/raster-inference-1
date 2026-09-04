@@ -292,18 +292,31 @@ fn print_infer_result(result: &staged_infer::InferenceResult) {
 }
 
 fn print_infer_timing_summary(timings: &staged_infer::InferenceTimings) {
-    eprintln!("infer timing:");
-    eprintln!("  total: {}", format_duration(timings.total_duration));
+    eprint!("{}", render_infer_timing_summary(timings));
+}
+
+fn render_infer_timing_summary(timings: &staged_infer::InferenceTimings) -> String {
+    if is_direct_infer_timing(timings) {
+        return render_direct_infer_timing_summary(timings);
+    }
+
+    let mut out = String::new();
+    out.push_str("infer timing:\n");
+    out.push_str(&format!(
+        "  total: {}\n",
+        format_duration(timings.total_duration)
+    ));
     if !timings.aux_waves.is_empty() {
         for wave in &timings.aux_waves {
-            eprintln!(
+            out.push_str(&format!(
                 "  aux wave {}: {} stages, parallelism {}, wall {}, stage-sum {}",
                 wave.name,
                 wave.stage_count,
                 wave.parallelism,
                 format_duration(wave.wall_duration),
                 format_duration(wave.stage_duration_sum)
-            );
+            ));
+            out.push('\n');
         }
     }
 
@@ -327,11 +340,79 @@ fn print_infer_timing_summary(timings: &staged_infer::InferenceTimings) {
         .iter()
         .map(|stage| stage.encode_duration)
         .sum();
-    eprintln!("  stages: {}", timings.stages.len());
-    eprintln!("  input synthesis: {}", format_duration(synthesis));
-    eprintln!("  input load: {}", format_duration(input_load));
-    eprintln!("  kernels: {}", format_duration(kernel));
-    eprintln!("  encode: {}", format_duration(encode));
+    out.push_str(&format!("  stages: {}\n", timings.stages.len()));
+    out.push_str(&format!(
+        "  input synthesis: {}\n",
+        format_duration(synthesis)
+    ));
+    out.push_str(&format!("  input load: {}\n", format_duration(input_load)));
+    out.push_str(&format!("  kernels: {}\n", format_duration(kernel)));
+    out.push_str(&format!("  encode: {}\n", format_duration(encode)));
+    out
+}
+
+fn is_direct_infer_timing(timings: &staged_infer::InferenceTimings) -> bool {
+    !timings.stages.is_empty()
+        && timings
+            .stages
+            .iter()
+            .all(|stage| stage.routine == "direct-infer")
+}
+
+fn render_direct_infer_timing_summary(timings: &staged_infer::InferenceTimings) -> String {
+    let named = |name: &str| {
+        timings
+            .stages
+            .iter()
+            .find(|stage| stage.stage == name)
+            .map(|stage| stage.total_duration)
+            .unwrap_or_default()
+    };
+    let accounted = named("load_direct_model")
+        + named("prompt_prepare")
+        + named("input_embedding")
+        + named("prefill")
+        + named("decode")
+        + named("output_finalize");
+    let kernel_records = timings
+        .stages
+        .iter()
+        .filter(|stage| !matches!(stage.stage.as_str(), "prefill" | "decode"))
+        .count();
+
+    let mut out = String::new();
+    out.push_str("direct-infer timing:\n");
+    out.push_str(&format!(
+        "  total: {}\n",
+        format_duration(timings.total_duration)
+    ));
+    out.push_str(&format!("  phase records: {kernel_records}\n"));
+    out.push_str(&format!(
+        "  model load: {}\n",
+        format_duration(named("load_direct_model"))
+    ));
+    out.push_str(&format!(
+        "  prompt prepare: {}\n",
+        format_duration(named("prompt_prepare"))
+    ));
+    out.push_str(&format!(
+        "  input embedding: {}\n",
+        format_duration(named("input_embedding"))
+    ));
+    out.push_str(&format!(
+        "  prefill: {}\n",
+        format_duration(named("prefill"))
+    ));
+    out.push_str(&format!("  decode: {}\n", format_duration(named("decode"))));
+    out.push_str(&format!(
+        "  output finalize: {}\n",
+        format_duration(named("output_finalize"))
+    ));
+    out.push_str(&format!(
+        "  accounted phase time: {}\n",
+        format_duration(accounted)
+    ));
+    out
 }
 
 fn format_duration(duration: std::time::Duration) -> String {
@@ -506,6 +587,35 @@ mod tests {
     }
 
     #[test]
+    fn direct_infer_timing_summary_uses_phase_language() {
+        let timings = staged_infer::InferenceTimings {
+            total_duration: std::time::Duration::from_millis(10),
+            stages: vec![
+                direct_timing("load_direct_model", 1),
+                direct_timing("prompt_prepare", 1),
+                direct_timing("input_embedding", 1),
+                direct_timing("prefill_layer", 3),
+                direct_timing("prefill", 3),
+                direct_timing("decode_layer", 2),
+                direct_timing("decode", 2),
+                direct_timing("output_finalize", 1),
+            ],
+            aux_waves: Vec::new(),
+        };
+
+        let summary = render_infer_timing_summary(&timings);
+
+        assert!(summary.contains("direct-infer timing:"));
+        assert!(summary.contains("model load: 1ms"));
+        assert!(summary.contains("phase records: 6"));
+        assert!(summary.contains("accounted phase time: 9ms"));
+        assert!(!summary.contains("validation"));
+        assert!(!summary.contains("stages:"));
+        assert!(!summary.contains("input synthesis:"));
+        assert!(!summary.contains("encode:"));
+    }
+
+    #[test]
     fn model_import_args_build_typed_config() {
         let config = ModelImportArgs {
             model_dir: PathBuf::from("model"),
@@ -536,5 +646,18 @@ mod tests {
                 only_direct: false,
             }
         );
+    }
+
+    fn direct_timing(stage: &str, millis: u64) -> staged_infer::InferStageTiming {
+        let duration = std::time::Duration::from_millis(millis);
+        staged_infer::InferStageTiming {
+            stage: stage.to_string(),
+            routine: String::from("direct-infer"),
+            input_synthesis_duration: std::time::Duration::ZERO,
+            input_load_duration: std::time::Duration::ZERO,
+            kernel_duration: duration,
+            encode_duration: std::time::Duration::ZERO,
+            total_duration: duration,
+        }
     }
 }

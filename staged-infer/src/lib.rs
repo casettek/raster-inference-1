@@ -7,7 +7,7 @@ pub mod kernels;
 pub mod prefill_range;
 pub mod routines;
 pub mod shadow;
-mod tensor;
+pub mod tensor;
 
 pub use artifactless::{
     ArtifactlessStagedInferenceConfig, ArtifactlessStagedInferenceExecutor, InferAuxWaveTiming,

@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use direct_infer::detwgt::MmapDetwgt;
+use direct_infer::model::DirectFinalHead;
+use direct_infer::view_kernels::score_next_token_view;
 use direct_infer::{DirectInferenceConfig, DirectInferenceExecutor};
 use inference_artifacts::{
     write_json, DirectInferBundle, DirectInferImportSettings, DirectInferManifest,
@@ -16,6 +18,7 @@ use prompt_prepare::input::{
 };
 use raster::{Bytes, List};
 use sha2::{Digest, Sha256};
+use staged_infer::tensor::{dot_bits, matvec_from_source, Matrix, MatrixSource};
 use staged_infer::{ArtifactlessStagedInferenceConfig, ArtifactlessStagedInferenceExecutor};
 
 const ONE: i32 = 1 << 16;
@@ -48,7 +51,7 @@ fn direct_executor_reports_missing_direct_manifest_message() {
 }
 
 #[test]
-fn mmap_detwgt_validates_digest_and_sign_extends_i16() {
+fn mmap_detwgt_parses_directory_and_sign_extends_i16() {
     let dir = temp_dir("loader");
     fs::create_dir_all(&dir).unwrap();
     let detwgt = dir.join("model.detwgt");
@@ -61,14 +64,116 @@ fn mmap_detwgt_validates_digest_and_sign_extends_i16() {
             values: vec![-1, 2],
         }],
     );
-    let digest = sha256_file(&detwgt);
-
-    let model = MmapDetwgt::open(&detwgt, &digest).unwrap();
+    let model = MmapDetwgt::open(&detwgt).unwrap();
     assert_eq!(model.values("tiny").unwrap(), vec![-1, 2]);
-    assert!(MmapDetwgt::open(&detwgt, "not-the-digest")
-        .unwrap_err()
-        .to_string()
-        .contains("digest mismatch"));
+    assert_eq!(model.slice("tiny").unwrap().value_at(0).unwrap(), -1);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn detwgt_matrix_view_matches_eager_matrix_matvec() {
+    let dir = temp_dir("matrix-view");
+    fs::create_dir_all(&dir).unwrap();
+    let detwgt = dir.join("model.detwgt");
+    let values = vec![ONE, 0, 0, 0, ONE, ONE];
+    write_detwgt(
+        &detwgt,
+        &[TensorFixture {
+            name: "matrix",
+            dims: vec![2, 3],
+            element_width: 32,
+            values: values.clone(),
+        }],
+    );
+    let model = MmapDetwgt::open(&detwgt).unwrap();
+    let view = model.matrix("matrix", 2, 3).unwrap();
+    let eager = Matrix::from_region("matrix", &paged(&values), 2, 3).unwrap();
+    let input = [ONE, 2 * ONE, 3 * ONE];
+
+    assert_eq!(
+        matvec_from_source(&view, &input).unwrap(),
+        matvec_from_source(&eager, &input).unwrap()
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn row_dot_matches_dot_bits_for_i16_and_i32() {
+    let dir = temp_dir("row-dot");
+    fs::create_dir_all(&dir).unwrap();
+    let detwgt = dir.join("model.detwgt");
+    write_detwgt(
+        &detwgt,
+        &[
+            TensorFixture {
+                name: "i16_matrix",
+                dims: vec![2, 2],
+                element_width: 16,
+                values: vec![1, -2, 3, 4],
+            },
+            TensorFixture {
+                name: "i32_matrix",
+                dims: vec![2, 2],
+                element_width: 32,
+                values: vec![ONE, 0, 0, ONE],
+            },
+        ],
+    );
+    let model = MmapDetwgt::open(&detwgt).unwrap();
+
+    let i16_view = model.matrix("i16_matrix", 2, 2).unwrap();
+    assert_eq!(
+        i16_view.row_dot(0, &[5, 6]).unwrap(),
+        dot_bits(&[5, 6], &[1, -2])
+    );
+    let i32_view = model.matrix("i32_matrix", 2, 2).unwrap();
+    assert_eq!(
+        i32_view.row_dot(1, &[7, 8]).unwrap(),
+        dot_bits(&[7, 8], &[0, ONE])
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn final_head_streaming_selection_matches_eager_tie_break() {
+    let dir = temp_dir("stream-final-head");
+    fs::create_dir_all(&dir).unwrap();
+    let detwgt = dir.join("model.detwgt");
+    let projection = vec![ONE, 0, ONE, 0, 0, 0];
+    write_detwgt(
+        &detwgt,
+        &[TensorFixture {
+            name: "projection",
+            dims: vec![3, 2],
+            element_width: 32,
+            values: projection.clone(),
+        }],
+    );
+    let model = MmapDetwgt::open(&detwgt).unwrap();
+    let head = DirectFinalHead {
+        params: FinalHeadParams {
+            hidden_size: 2,
+            norm_eps: 0,
+            softcap: 0,
+            norm_weights: pack_i32_page(&[ONE, ONE]),
+        },
+        projection: model.matrix("projection", 3, 2).unwrap(),
+    };
+    let activations = prefill_range::input::ActivationSequence {
+        rows: List::from(vec![prefill_range::input::ActivationRow {
+            token_id: 1,
+            values: pack_i32_page(&[ONE, 0]),
+        }]),
+        errors: List::new(),
+        kv: List::new(),
+        start_position: 0,
+    };
+    let score = score_next_token_view(&activations, &head).unwrap();
+
+    assert_eq!(score.token_id, 0, "equal scores keep the earliest token");
 
     fs::remove_dir_all(dir).unwrap();
 }

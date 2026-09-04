@@ -1,12 +1,15 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use decode_embed::input as decode_embed_input;
 use inference_artifacts::InferenceResult;
 use staged_infer::cache::CachedStageValue;
 use staged_infer::{InferStageTiming, InferenceRunReport, InferenceTimings};
 
 use crate::model::DirectInferenceModel;
+use crate::view_kernels::{
+    advance_decode_edge, run_decode_embed_view, run_input_embedding_view, run_ple_prepare_view,
+    run_prefill_range_view, score_next_token_view, NextTokenScore,
+};
 use crate::DirectInferenceConfig;
 
 #[derive(Debug, Default)]
@@ -28,24 +31,14 @@ impl DirectInferenceExecutor {
 
         let prompt_started = Instant::now();
         let prompt = model.prompt_inputs()?;
-        let prompt_value = CachedStageValue::PromptTokenization(prompt);
         timings.push(phase_timing("prompt_prepare", prompt_started.elapsed()));
 
         let embedding_started = Instant::now();
-        let embedding = model.embedding_table()?;
-        let embedding_prompt = prompt_value.as_embedding_prompt()?;
-        let embedded = staged_infer::kernels::input_embedding::run_input_embedding_direct(
-            staged_infer::kernels::input_embedding::InputEmbeddingDirectInputs {
-                prompt: &embedding_prompt,
-                embedding: &embedding,
-            },
-        )?;
-        let embedded_value = CachedStageValue::EmbeddedActivations(embedded);
-        let empty_or_embedding = embedded_value.as_range_activation_sequence()?;
+        let empty_or_embedding = run_input_embedding_view(&model, &prompt)?;
         timings.push(phase_timing("input_embedding", embedding_started.elapsed()));
 
         let prefill_started = Instant::now();
-        let (mut prior_layers, mut logits) = run_layers_and_finalize(
+        let (mut prior_layers, mut score) = run_layers_and_score(
             &model,
             empty_or_embedding.clone(),
             empty_or_embedding.clone(),
@@ -60,24 +53,12 @@ impl DirectInferenceExecutor {
             staged_infer::kernels::decode_init::DecodeInitDirectInputs,
         )?;
         for token_idx in 0..model.manifest.import.tokens {
-            let select_logits = CachedStageValue::PrefillLogits(logits).as_decode_logits()?;
-            edge = staged_infer::kernels::decode_select_token::run_decode_select_token_direct(
-                staged_infer::kernels::decode_select_token::DecodeSelectTokenDirectInputs {
-                    logits: &select_logits,
-                    prior: &edge,
-                },
-            )?;
-            let selected = CachedStageValue::DecodeEdge(edge.clone()).as_decode_embed_edge()?;
-            let decode_embedding = decode_embedding(&embedding);
-            let decoded = staged_infer::kernels::decode_embed::run_decode_embed_direct(
-                staged_infer::kernels::decode_embed::DecodeEmbedDirectInputs {
-                    selected: &selected,
-                    embedding: &decode_embedding,
-                },
-            )?;
-            let decode_seed =
-                CachedStageValue::DecodeActivations(decoded).as_range_activation_sequence()?;
-            let (next_prior_layers, next_logits) = run_layers_and_finalize(
+            edge = advance_decode_edge(score, &edge);
+            if token_idx + 1 == model.manifest.import.tokens {
+                break;
+            }
+            let decode_seed = run_decode_embed_view(&model, &edge)?;
+            let (next_prior_layers, next_score) = run_layers_and_score(
                 &model,
                 decode_seed,
                 empty_or_embedding.clone(),
@@ -86,7 +67,7 @@ impl DirectInferenceExecutor {
                 &format!("decode_t{token_idx}"),
             )?;
             prior_layers = next_prior_layers;
-            logits = next_logits;
+            score = next_score;
         }
         timings.push(phase_timing("decode", decode_started.elapsed()));
 
@@ -119,7 +100,7 @@ impl DirectInferenceExecutor {
     }
 }
 
-fn run_layers_and_finalize(
+fn run_layers_and_score(
     model: &DirectInferenceModel,
     seed: prefill_range::input::ActivationSequence,
     empty_or_embedding: prefill_range::input::ActivationSequence,
@@ -128,29 +109,21 @@ fn run_layers_and_finalize(
     label: &str,
 ) -> Result<(
     Vec<prefill_range::input::ActivationSequence>,
-    prefill_finalize::input::PrefillLogits,
+    NextTokenScore,
 )> {
     let mut current = seed;
     let mut layer_outputs = Vec::with_capacity(model.shape().num_hidden_layers as usize);
     for layer_idx in 0..model.shape().num_hidden_layers as usize {
         let aux_started = Instant::now();
-        let embedded =
-            CachedStageValue::RangeActivations(current.clone()).as_aux_activation_sequence()?;
-        let ple_layer = model.ple_layer(layer_idx)?;
-        let ple = staged_infer::kernels::prefill_prepare_aux::run_prefill_prepare_aux_direct(
-            staged_infer::kernels::prefill_prepare_aux::PrefillPrepareAuxDirectInputs {
-                embedded: &embedded,
-                layer: &ple_layer,
-            },
-        )?;
+        let ple_layer = model.direct_ple_layer(layer_idx)?;
+        let ple = run_ple_prepare_view(&current, &ple_layer)?;
         timings.push(phase_timing(
             &format!("{label}_prefill_prepare_aux_l{layer_idx}"),
             aux_started.elapsed(),
         ));
 
         let range_started = Instant::now();
-        let range_ple = CachedStageValue::PleLayerInputs(ple).as_range_ple_inputs()?;
-        let layer = model.transformer_layer(layer_idx)?;
+        let layer = model.direct_transformer_layer(layer_idx)?;
         let prior_kv = prior_layers
             .and_then(|layers| layers.get(layer_idx))
             .cloned()
@@ -165,17 +138,8 @@ fn run_layers_and_finalize(
             layer.params.donor_b_layer,
             &empty_or_embedding,
         );
-        current = staged_infer::kernels::prefill_range::run_prefill_range_direct(
-            staged_infer::kernels::prefill_range::PrefillRangeDirectInputs {
-                activations: &current,
-                layer: &layer,
-                layer_cache_key: None,
-                prior_kv: &prior_kv,
-                donor_a_kv: &donor_a_kv,
-                donor_b_kv: &donor_b_kv,
-                ple: &range_ple,
-            },
-        )?;
+        current =
+            run_prefill_range_view(&current, &layer, &prior_kv, &donor_a_kv, &donor_b_kv, &ple)?;
         layer_outputs.push(current.clone());
         timings.push(phase_timing(
             &format!("{label}_prefill_range_l{layer_idx}"),
@@ -184,20 +148,13 @@ fn run_layers_and_finalize(
     }
 
     let finalize_started = Instant::now();
-    let final_activations =
-        CachedStageValue::RangeActivations(current).as_finalize_activation_sequence()?;
-    let head = model.final_head()?;
-    let logits = staged_infer::kernels::prefill_finalize::run_prefill_finalize_direct(
-        staged_infer::kernels::prefill_finalize::PrefillFinalizeDirectInputs {
-            activations: &final_activations,
-            head: &head,
-        },
-    )?;
+    let head = model.direct_final_head()?;
+    let score = score_next_token_view(&current, &head)?;
     timings.push(phase_timing(
         &format!("{label}_prefill_finalize"),
         finalize_started.elapsed(),
     ));
-    Ok((layer_outputs, logits))
+    Ok((layer_outputs, score))
 }
 
 fn donor_input(
@@ -212,16 +169,6 @@ fn donor_input(
         .get(donor_layer as usize)
         .cloned()
         .unwrap_or_else(|| fallback.clone())
-}
-
-fn decode_embedding(
-    embedding: &input_embedding::input::EmbeddingTable,
-) -> decode_embed_input::EmbeddingTable {
-    decode_embed_input::EmbeddingTable {
-        hidden_size: embedding.hidden_size,
-        embedding_scale: embedding.embedding_scale,
-        values: embedding.values.clone(),
-    }
 }
 
 fn phase_timing(stage: &str, duration: Duration) -> InferStageTiming {
