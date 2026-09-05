@@ -66,7 +66,7 @@ pub struct DirectTimings {
 
 impl StageKind {
     pub fn from_stage_spec(project: &str, name: &str) -> Result<Self> {
-        match project {
+        match project_basename(project) {
             "prompt-prepare" if name == "prompt_prepare" => Ok(Self::PromptPrepare),
             "input-embedding" if name == "input_embedding" => Ok(Self::InputEmbedding),
             "prefill-prepare-aux" => Ok(Self::PrefillPrepareAux {
@@ -642,4 +642,29 @@ fn parse_trailing_layer_index(name: &str) -> Result<usize> {
         .ok_or_else(|| anyhow::anyhow!("stage `{name}` has no trailing `_lN` layer index"))?;
     raw.parse::<usize>()
         .with_context(|| format!("failed to parse layer index from `{name}`"))
+}
+
+fn project_basename(project: &str) -> &str {
+    Path::new(project)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(project)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_kind_accepts_nested_project_paths() {
+        assert_eq!(
+            StageKind::from_stage_spec("raster-stages/prefill-range", "prefill_range_l13").unwrap(),
+            StageKind::PrefillRange { layer: 13 }
+        );
+        assert_eq!(
+            StageKind::from_stage_spec("raster-stages/decode-select-token", "decode_select_t1")
+                .unwrap(),
+            StageKind::DecodeSelectToken
+        );
+    }
 }

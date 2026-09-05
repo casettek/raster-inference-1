@@ -114,17 +114,17 @@ version = "0.1.0"
 
 [[chain.stage]]
 name = "decode_init"
-project = "decode-init"
+project = "raster-stages/decode-init"
 
 [[chain.stage]]
 name = "decode_select_token"
-project = "decode-select-token"
+project = "raster-stages/decode-select-token"
 inputs.logits = {{ external = {{ path = "logits.rastered", index_path = "logits.rindex", commitment = "{logits_commitment}" }} }}
 inputs.prior = {{ from = "decode_init" }}
 
 [[chain.stage]]
 name = "output_finalize"
-project = "output-finalize"
+project = "raster-stages/output-finalize"
 inputs.edge = {{ from = "decode_select_token" }}
 inputs.decoder = {{ external = {{ path = "decoder.rastered", index_path = "decoder.rindex", commitment = "{decoder_commitment}" }} }}
 "#

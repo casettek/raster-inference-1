@@ -488,12 +488,23 @@ fn write_staged_fixture(dir: &Path) {
     };
 
     let tokenizer_commitment =
-        write_staged_external(dir, "prompt-prepare", "tokenizer", &tokenizer);
-    let pieces_commitment = write_staged_external(dir, "prompt-prepare", "initial_pieces", &pieces);
-    let embedding_commitment =
-        write_staged_external(dir, "input-embedding", "embedding", &embedding);
-    let head_commitment = write_staged_external(dir, "prefill-finalize", "head", &head);
-    let decoder_commitment = write_staged_external(dir, "output-finalize", "decoder", &decoder);
+        write_staged_external(dir, "raster-stages/prompt-prepare", "tokenizer", &tokenizer);
+    let pieces_commitment = write_staged_external(
+        dir,
+        "raster-stages/prompt-prepare",
+        "initial_pieces",
+        &pieces,
+    );
+    let embedding_commitment = write_staged_external(
+        dir,
+        "raster-stages/input-embedding",
+        "embedding",
+        &embedding,
+    );
+    let head_commitment =
+        write_staged_external(dir, "raster-stages/prefill-finalize", "head", &head);
+    let decoder_commitment =
+        write_staged_external(dir, "raster-stages/output-finalize", "decoder", &decoder);
 
     fs::write(
         dir.join("Raster.toml"),
@@ -504,37 +515,37 @@ version = "0.1.0"
 
 [[chain.stage]]
 name = "prompt_prepare"
-project = "prompt-prepare"
-inputs.tokenizer = {{ external = {{ path = "prompt-prepare/tokenizer.rastered", index_path = "prompt-prepare/tokenizer.rindex", commitment = "{tokenizer_commitment}" }} }}
-inputs.initial_pieces = {{ external = {{ path = "prompt-prepare/initial_pieces.rastered", index_path = "prompt-prepare/initial_pieces.rindex", commitment = "{pieces_commitment}" }} }}
+project = "raster-stages/prompt-prepare"
+inputs.tokenizer = {{ external = {{ path = "raster-stages/prompt-prepare/tokenizer.rastered", index_path = "raster-stages/prompt-prepare/tokenizer.rindex", commitment = "{tokenizer_commitment}" }} }}
+inputs.initial_pieces = {{ external = {{ path = "raster-stages/prompt-prepare/initial_pieces.rastered", index_path = "raster-stages/prompt-prepare/initial_pieces.rindex", commitment = "{pieces_commitment}" }} }}
 
 [[chain.stage]]
 name = "input_embedding"
-project = "input-embedding"
+project = "raster-stages/input-embedding"
 inputs.prompt = {{ from = "prompt_prepare" }}
-inputs.embedding = {{ external = {{ path = "input-embedding/embedding.rastered", index_path = "input-embedding/embedding.rindex", commitment = "{embedding_commitment}" }} }}
+inputs.embedding = {{ external = {{ path = "raster-stages/input-embedding/embedding.rastered", index_path = "raster-stages/input-embedding/embedding.rindex", commitment = "{embedding_commitment}" }} }}
 
 [[chain.stage]]
 name = "prefill_finalize"
-project = "prefill-finalize"
+project = "raster-stages/prefill-finalize"
 inputs.activations = {{ from = "input_embedding" }}
-inputs.head = {{ external = {{ path = "prefill-finalize/head.rastered", index_path = "prefill-finalize/head.rindex", commitment = "{head_commitment}" }} }}
+inputs.head = {{ external = {{ path = "raster-stages/prefill-finalize/head.rastered", index_path = "raster-stages/prefill-finalize/head.rindex", commitment = "{head_commitment}" }} }}
 
 [[chain.stage]]
 name = "decode_init"
-project = "decode-init"
+project = "raster-stages/decode-init"
 
 [[chain.stage]]
 name = "decode_select_token"
-project = "decode-select-token"
+project = "raster-stages/decode-select-token"
 inputs.logits = {{ from = "prefill_finalize" }}
 inputs.prior = {{ from = "decode_init" }}
 
 [[chain.stage]]
 name = "output_finalize"
-project = "output-finalize"
+project = "raster-stages/output-finalize"
 inputs.edge = {{ from = "decode_select_token" }}
-inputs.decoder = {{ external = {{ path = "output-finalize/decoder.rastered", index_path = "output-finalize/decoder.rindex", commitment = "{decoder_commitment}" }} }}
+inputs.decoder = {{ external = {{ path = "raster-stages/output-finalize/decoder.rastered", index_path = "raster-stages/output-finalize/decoder.rindex", commitment = "{decoder_commitment}" }} }}
 "#
         ),
     )

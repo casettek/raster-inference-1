@@ -49,7 +49,7 @@ links stages by structural commitment. That is what lets `prefill_range`
 instances chain into each other.
 
 The root `Raster.toml` holds the `[chain]` table and no `[program]` table;
-`prompt-prepare/` and `input-embedding/` are ordinary Raster programs (own
+`raster-stages/prompt-prepare/` and `raster-stages/input-embedding/` are ordinary Raster programs (own
 `Cargo.toml` + `Raster.lock`, no per-member `Raster.toml`). Stage 2's `prompt`
 parameter is bound `from = "prompt_prepare"`, so the two `PromptTokenization`
 definitions must stay field-for-field identical — the link is by structural
@@ -392,22 +392,23 @@ inference-artifacts/        # shared inference/claim/challenge artifact contract
 staged-infer/               # Raster-shaped native executor used by claim/challenge
 direct-infer/               # future true direct inference runtime scaffold
 model-import/               # host-side bundle -> committed externals
-prompt-prepare/
-  src/input.rs              # Rastered data types (List<T> fields, Selectable)
-  src/lib.rs                # no_std tile library — all computation
-  src/main.rs               # sequences + #[sequence] fn main
-  input.json                # private: entry arg -> file paths
-  input_manifest.json       # public: entry arg -> commitment
-  *.rastered / *.rindex     # committed input values
-  Raster.lock               # program identity claim — commit it
-input-embedding/            # same layout, minus input.json / input_manifest.json:
+raster-stages/
+  prompt-prepare/
+    src/input.rs            # Rastered data types (List<T> fields, Selectable)
+    src/lib.rs              # no_std tile library — all computation
+    src/main.rs             # sequences + #[sequence] fn main
+    input.json              # private: entry arg -> file paths
+    input_manifest.json     # public: entry arg -> commitment
+    *.rastered / *.rindex   # committed input values
+    Raster.lock             # program identity claim — commit it
+  input-embedding/          # same layout, minus input.json / input_manifest.json:
                             # `embedding` is this stage's own external, and
                             # `prompt` is bound from stage 1's output
-prefill-prepare-aux/        # one program, instantiated once per PLE layer;
+  prefill-prepare-aux/      # one program, instantiated once per PLE layer;
                             # layer<N>.rastered is that instance's external
-prefill-range/              # one program, instantiated once per transformer
+  prefill-range/            # one program, instantiated once per transformer
                             # layer; instances chain into each other
-prefill-finalize/           # the output head — one instance
+  prefill-finalize/         # the output head — one instance
 ```
 
 ## Commands
@@ -465,13 +466,13 @@ The older commands below are lower-level development and verification surfaces:
 cargo run --manifest-path model-import/Cargo.toml -- \
   --model ../raster-inference/assets/tiny-gemma-dev --prompt "hello raster"
 
-# any stage (from prompt-prepare/ or input-embedding/) — no inputs needed
+# any stage (from raster-stages/prompt-prepare/ or raster-stages/input-embedding/) — no inputs needed
 cargo check && cargo check --lib --no-default-features
 cargo raster cfs
 cargo raster build --backend risc0   # rebuild guests, re-lock Raster.lock
 cargo raster program --verify
 
-# stage 1 only — the stage that owns its inputs (from prompt-prepare/)
+# stage 1 only — the stage that owns its inputs (from raster-stages/prompt-prepare/)
 cargo raster run --input input.json --input-manifest input_manifest.json
 cargo raster run --input input.json --input-manifest input_manifest.json \
   --commit commit.bin --fraud-proof-window-size 32
@@ -556,9 +557,11 @@ prints "Build complete!" while writing no image ids, after which the chain refus
 run with advice that does not fix it:
 
 ```sh
-for d in prompt-prepare input-embedding prefill-prepare-aux prefill-range \
-         prefill-finalize decode-init decode-select-token decode-embed \
-         output-finalize; do
+for d in raster-stages/prompt-prepare raster-stages/input-embedding \
+         raster-stages/prefill-prepare-aux raster-stages/prefill-range \
+         raster-stages/prefill-finalize raster-stages/decode-init \
+         raster-stages/decode-select-token raster-stages/decode-embed \
+         raster-stages/output-finalize; do
   (cd $d && cargo raster build --backend risc0)
 done
 

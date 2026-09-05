@@ -204,7 +204,12 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
         println!();
         println!(
             "{}",
-            external_line("decoder", "output-finalize", "decoder", &decoder_commitment)
+            external_line(
+                "decoder",
+                "raster-stages/output-finalize",
+                "decoder",
+                &decoder_commitment
+            )
         );
         direct_manifest::warn_partial_direct_manifest_not_refreshed();
         return Ok(ImportResult {
@@ -394,8 +399,12 @@ fn indexed_model_inputs(shape: &Shape, stages: &[String]) -> Result<String, Box<
     };
     Ok(format!(
         "{}{}",
-        render("aux_layer", "prefill-prepare-aux", &aux),
-        render("transformer_layer", "prefill-range", &transformer)
+        render("aux_layer", "raster-stages/prefill-prepare-aux", &aux),
+        render(
+            "transformer_layer",
+            "raster-stages/prefill-range",
+            &transformer
+        )
     ))
 }
 
@@ -427,7 +436,7 @@ fn generation_stages(
     let donor_b = donors.get(1).copied();
 
     let mut out = String::from(
-        "\n[[chain.stage]]\nname = \"decode_init\"\nproject = \"decode-init\"\n\
+        "\n[[chain.stage]]\nname = \"decode_init\"\nproject = \"raster-stages/decode-init\"\n\
          \n[[chain.repeat]]\nname = \"decode\"\nindex = \"t\"\n",
     );
     out.push_str(&format!("count = {tokens}\n"));
@@ -440,23 +449,23 @@ fn generation_stages(
          entry = \"prefill_finalize\"\n\
          \n  [[chain.repeat.stage]]\n\
          name = \"decode_select_t{t}\"\n\
-         project = \"decode-select-token\"\n\
+         project = \"raster-stages/decode-select-token\"\n\
          inputs.logits = { from = \"decode_finalize_t{t-1}\", first = \"prefill_finalize\" }\n\
          inputs.prior = { from = \"decode_select_t{t-1}\", first = \"decode_init\" }\n\
          \n  [[chain.repeat.stage]]\n\
          name = \"decode_embed_t{t}\"\n\
-         project = \"decode-embed\"\n\
+         project = \"raster-stages/decode-embed\"\n\
          inputs.selected = { from = \"decode_select_t{t}\" }\n",
     );
     out.push_str(&format!(
-        "  inputs.embedding = {{ external = {{ path = \"input-embedding/embedding.rastered\", index_path = \"input-embedding/embedding.rindex\", commitment = \"{embedding}\" }} }}\n"
+        "  inputs.embedding = {{ external = {{ path = \"raster-stages/input-embedding/embedding.rastered\", index_path = \"raster-stages/input-embedding/embedding.rindex\", commitment = \"{embedding}\" }} }}\n"
     ));
     out.push_str(&format!(
         "\n  [[chain.repeat.stage]]\n\
          name = \"decode_aux_t{{t}}_l{{l}}\"\n\
          index = \"l\"\n\
          count = {}\n\
-         project = \"prefill-prepare-aux\"\n\
+         project = \"raster-stages/prefill-prepare-aux\"\n\
          inputs.embedded = {{ from = \"decode_embed_t{{t}}\" }}\n\
          inputs.layer = {{ input = \"aux_layer_{{l}}\" }}\n",
         shape.layers
@@ -469,7 +478,7 @@ fn generation_stages(
              index = \"l\"\n\
              start = 0\n\
              count = {first_shared}\n\
-             project = \"prefill-range\"\n\
+             project = \"raster-stages/prefill-range\"\n\
              inputs.activations = {{ from = \"decode_range_t{{t}}_l{{l-1}}\", first = \"decode_embed_t{{t}}\" }}\n\
              inputs.prior_kv = {{ from = \"decode_range_t{{t-1}}_l{{l}}\", first = \"prefill_range_l{{l}}\" }}\n\
              inputs.donor_a_kv = {{ from = \"input_embedding\" }}\n\
@@ -492,7 +501,7 @@ fn generation_stages(
              index = \"l\"\n\
              start = {first_shared}\n\
              count = {}\n\
-             project = \"prefill-range\"\n\
+             project = \"raster-stages/prefill-range\"\n\
              inputs.activations = {{ from = \"decode_range_t{{t}}_l{{l-1}}\", first = \"decode_range_t{{t}}_l{}\" }}\n\
              inputs.prior_kv = {{ from = \"decode_range_t{{t-1}}_l{{l}}\", first = \"prefill_range_l{{l}}\" }}\n\
              inputs.donor_a_kv = {{ from = \"{donor_a_from}\" }}\n\
@@ -507,18 +516,18 @@ fn generation_stages(
     out.push_str(&format!(
         "\n  [[chain.repeat.stage]]\n\
          name = \"decode_finalize_t{{t}}\"\n\
-         project = \"prefill-finalize\"\n\
+         project = \"raster-stages/prefill-finalize\"\n\
          inputs.activations = {{ from = \"decode_range_t{{t}}_l{}\" }}\n\
-         inputs.head = {{ external = {{ path = \"prefill-finalize/head.rastered\", index_path = \"prefill-finalize/head.rindex\", commitment = \"{head}\" }} }}\n\
+         inputs.head = {{ external = {{ path = \"raster-stages/prefill-finalize/head.rastered\", index_path = \"raster-stages/prefill-finalize/head.rindex\", commitment = \"{head}\" }} }}\n\
          \n[[chain.stage]]\n\
          name = \"output_finalize\"\n\
-         project = \"output-finalize\"\n\
+         project = \"raster-stages/output-finalize\"\n\
          inputs.edge = {{ from = \"decode.edge\" }}\n\
          {}",
         shape.layers - 1,
         external_line(
             "decoder",
-            "output-finalize",
+            "raster-stages/output-finalize",
             "decoder",
             decoder_commitment
         )
@@ -824,7 +833,7 @@ fn write_tokenizer(
         &DecoderTable {
             tokens: decoder_tokens.into(),
         },
-        "output-finalize",
+        "raster-stages/output-finalize",
         "decoder",
     )?;
 
@@ -892,14 +901,14 @@ fn write_tokenizer(
             vocab_buckets: vocab_buckets.into(),
             merge_buckets: merge_buckets.into(),
         },
-        "prompt-prepare",
+        "raster-stages/prompt-prepare",
         "tokenizer",
     )?;
     let pieces_commitment = write_external(
         &BpePieces {
             pieces: pieces.into(),
         },
-        "prompt-prepare",
+        "raster-stages/prompt-prepare",
         "initial_pieces",
     )?;
 
@@ -907,7 +916,7 @@ fn write_tokenizer(
     // only one that can be run standalone; keep its fixtures in step with the
     // externals just written.
     write_stage_fixtures(
-        "prompt-prepare",
+        "raster-stages/prompt-prepare",
         &[
             ("tokenizer", "tokenizer", &tokenizer_commitment),
             ("initial_pieces", "initial_pieces", &pieces_commitment),
@@ -918,19 +927,19 @@ fn write_tokenizer(
         concat!(
             "[[chain.stage]]\n",
             "name = \"prompt_prepare\"\n",
-            "project = \"prompt-prepare\"\n",
+            "project = \"raster-stages/prompt-prepare\"\n",
             "{}",
             "{}"
         ),
         external_line(
             "tokenizer",
-            "prompt-prepare",
+            "raster-stages/prompt-prepare",
             "tokenizer",
             &tokenizer_commitment
         ),
         external_line(
             "initial_pieces",
-            "prompt-prepare",
+            "raster-stages/prompt-prepare",
             "initial_pieces",
             &pieces_commitment
         ),
@@ -1123,7 +1132,7 @@ fn write_embedding(
             .to_bits(),
             values: paged_i32s(&values).map_err(|error| error.to_string())?,
         },
-        "input-embedding",
+        "raster-stages/input-embedding",
         "embedding",
     )?;
 
@@ -1131,11 +1140,16 @@ fn write_embedding(
         concat!(
             "[[chain.stage]]\n",
             "name = \"input_embedding\"\n",
-            "project = \"input-embedding\"\n",
+            "project = \"raster-stages/input-embedding\"\n",
             "inputs.prompt = {{ from = \"prompt_prepare\" }}\n",
             "{}"
         ),
-        external_line("embedding", "input-embedding", "embedding", &commitment)
+        external_line(
+            "embedding",
+            "raster-stages/input-embedding",
+            "embedding",
+            &commitment
+        )
     ));
     Ok(())
 }
@@ -1182,17 +1196,22 @@ fn write_ple_layers(
         };
 
         let name = format!("layer{layer_idx}");
-        let commitment = write_external(&layer, "prefill-prepare-aux", &name)?;
+        let commitment = write_external(&layer, "raster-stages/prefill-prepare-aux", &name)?;
         stages.push(format!(
             concat!(
                 "[[chain.stage]]\n",
                 "name = \"prefill_prepare_aux_l{idx}\"\n",
-                "project = \"prefill-prepare-aux\"\n",
+                "project = \"raster-stages/prefill-prepare-aux\"\n",
                 "inputs.embedded = {{ from = \"input_embedding\" }}\n",
                 "{line}"
             ),
             idx = layer_idx,
-            line = external_line("layer", "prefill-prepare-aux", &name, &commitment)
+            line = external_line(
+                "layer",
+                "raster-stages/prefill-prepare-aux",
+                &name,
+                &commitment
+            )
         ));
     }
     Ok(())
@@ -1347,7 +1366,7 @@ fn write_transformer_layers(
         };
 
         let name = format!("layer{layer_idx}");
-        let commitment = write_external(&layer, "prefill-range", &name)?;
+        let commitment = write_external(&layer, "raster-stages/prefill-range", &name)?;
         let upstream = if layer_idx == 0 {
             "input_embedding".to_string()
         } else {
@@ -1373,7 +1392,7 @@ fn write_transformer_layers(
             concat!(
                 "[[chain.stage]]\n",
                 "name = \"prefill_range_l{idx}\"\n",
-                "project = \"prefill-range\"\n",
+                "project = \"raster-stages/prefill-range\"\n",
                 "inputs.activations = {{ from = \"{upstream}\" }}\n",
                 // Prefill inherits an empty cache. Bound to `input_embedding`
                 // for every layer, the same stage the non-sharing layers use
@@ -1389,7 +1408,7 @@ fn write_transformer_layers(
             upstream = upstream,
             donor_a = donor_a,
             donor_b = donor_b,
-            line = external_line("layer", "prefill-range", &name, &commitment)
+            line = external_line("layer", "raster-stages/prefill-range", &name, &commitment)
         ));
     }
     Ok(())
@@ -1449,7 +1468,7 @@ fn write_head(
             },
             projection: paged_i32s(&rows).map_err(|error| error.to_string())?,
         },
-        "prefill-finalize",
+        "raster-stages/prefill-finalize",
         "head",
     )?;
 
@@ -1457,12 +1476,17 @@ fn write_head(
         concat!(
             "[[chain.stage]]\n",
             "name = \"prefill_finalize\"\n",
-            "project = \"prefill-finalize\"\n",
+            "project = \"raster-stages/prefill-finalize\"\n",
             "inputs.activations = {{ from = \"prefill_range_l{last}\" }}\n",
             "{line}"
         ),
         last = shape.layers - 1,
-        line = external_line("head", "prefill-finalize", "head", &commitment)
+        line = external_line(
+            "head",
+            "raster-stages/prefill-finalize",
+            "head",
+            &commitment
+        )
     ));
     Ok(())
 }

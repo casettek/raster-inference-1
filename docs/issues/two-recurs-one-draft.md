@@ -39,7 +39,7 @@ The consequence is a shape rule that is nowhere written down:
 > Every list in a stage output that is built by a recur is built by the *same* recur, over the
 > *same* input list — so they all have that list's length.
 
-`prefill-range` satisfies it by accident. `finish_layer` (`prefill-range/src/lib.rs:1008`) pushes
+`prefill-range` satisfies it by accident. `finish_layer` (`raster-stages/prefill-range/src/lib.rs:1008`) pushes
 exactly one `ActivationRow` and one `KeyRow` per query, so `rows` and `kv` are both `queries.len()`.
 
 ## Why decode needs to break it

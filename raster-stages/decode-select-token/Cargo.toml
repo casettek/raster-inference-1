@@ -10,5 +10,5 @@ std = ["raster/std"]
 profiling = ["raster/profiling"]
 
 [dependencies]
-raster = { path = "../../../raster/crates/raster", default-features = false }
+raster = { path = "../../../../raster/crates/raster", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
