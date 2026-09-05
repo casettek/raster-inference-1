@@ -1,15 +1,15 @@
 use anyhow::{bail, Result};
 use det_num::ops::{attention_softmax, rope_rotate_pairs_in_place};
 use det_num::{Acc, Act};
+use host_kernels::tensor::{
+    dot_bits, linear_slab_from_source, mac_weighted_value, matvec_from_source, requantize_acc,
+    MatrixSource, Slab,
+};
 use prefill_range::input::{
     add_row, gelu, rms_norm, scale_row, value_rms_norm, ActivationRow, ActivationSequence, KeyRow,
     LayerParams, PleLayerInputs, PleRow,
 };
 use raster::List;
-use staged_infer::tensor::{
-    dot_bits, linear_slab_from_source, mac_weighted_value, matvec_from_source, requantize_acc,
-    MatrixSource, Slab,
-};
 
 use crate::model::{DirectFinalHead, DirectInferenceModel, DirectPleLayer, DirectTransformerLayer};
 

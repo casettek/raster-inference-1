@@ -5,7 +5,9 @@ use output_finalize::input::{DecodeEdge, DecoderTable, GeneratedOutput};
 
 use crate::artifact_io::{with_main_sequence_scope, with_stage_sequence_scope};
 use crate::cache::CachedInputs;
-use crate::kernels::output_finalize::{run_output_finalize_direct, OutputFinalizeDirectInputs};
+use host_kernels::kernels::output_finalize::{
+    run_output_finalize_direct, OutputFinalizeDirectInputs,
+};
 
 pub struct Inputs {
     pub edge: DecodeEdge,

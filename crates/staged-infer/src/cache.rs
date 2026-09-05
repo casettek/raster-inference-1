@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
+pub use host_kernels::MaterializationCacheKey;
 use raster::List;
 use serde::Deserialize;
 
@@ -41,15 +42,6 @@ pub struct StageOutputCache {
 }
 
 pub type CachedInputs = BTreeMap<String, Arc<CachedStageValue>>;
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MaterializationCacheKey {
-    pub param: String,
-    pub path: PathBuf,
-    pub index_path: PathBuf,
-    pub commitment: String,
-    pub type_name: &'static str,
-}
 
 #[derive(Debug, Deserialize)]
 struct InputDocumentEntry {

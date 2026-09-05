@@ -4,22 +4,23 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+host-kernels = { path = "../host-kernels" }
 anyhow = "1.0"
-decode-embed = { path = "../raster-stages/decode-embed" }
-decode-select-token = { path = "../raster-stages/decode-select-token" }
+decode-embed = { path = "../../raster-stages/decode-embed" }
+decode-select-token = { path = "../../raster-stages/decode-select-token" }
 det-num = { path = "../det-num" }
-input-embedding = { path = "../raster-stages/input-embedding" }
+detwgt = { path = "../detwgt" }
+input-embedding = { path = "../../raster-stages/input-embedding" }
 inference-artifacts = { path = "../inference-artifacts" }
-memmap2 = "0.9"
-output-finalize = { path = "../raster-stages/output-finalize" }
-prefill-finalize = { path = "../raster-stages/prefill-finalize" }
-prefill-prepare-aux = { path = "../raster-stages/prefill-prepare-aux" }
-prefill-range = { path = "../raster-stages/prefill-range" }
-prompt-prepare = { path = "../raster-stages/prompt-prepare" }
-raster = { path = "../../../raster/crates/raster" }
+output-finalize = { path = "../../raster-stages/output-finalize" }
+prefill-finalize = { path = "../../raster-stages/prefill-finalize" }
+prefill-prepare-aux = { path = "../../raster-stages/prefill-prepare-aux" }
+prefill-range = { path = "../../raster-stages/prefill-range" }
+prompt-prepare = { path = "../../raster-stages/prompt-prepare" }
+raster = { path = "../../../../raster/crates/raster" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-staged-infer = { path = "../staged-infer" }
 
 [dev-dependencies]
 sha2 = "0.10"
+staged-infer = { path = "../staged-infer" }

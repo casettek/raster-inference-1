@@ -3,10 +3,7 @@ use std::fs::File;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use det_num::ops::{mac_bits, requantize};
-use det_num::Acc;
 use memmap2::Mmap;
-use staged_infer::tensor::MatrixSource;
 
 const MAGIC: &[u8; 8] = b"DNWGTV0\0";
 const DETWGT_VERSION: u32 = 2;
@@ -313,66 +310,6 @@ impl<'a> DetwgtMatrixView<'a> {
     pub fn row_values(&self, row_idx: usize) -> Result<Vec<i32>> {
         Ok(self.row(row_idx)?.values())
     }
-}
-
-impl MatrixSource for DetwgtMatrixView<'_> {
-    fn rows(&self) -> usize {
-        self.rows
-    }
-
-    fn cols(&self) -> usize {
-        self.cols
-    }
-
-    fn row_values_into(&self, row_idx: usize, out: &mut Vec<i32>) -> Result<()> {
-        self.row(row_idx)?.values_into(out);
-        Ok(())
-    }
-
-    fn row_dot(&self, row_idx: usize, input: &[i32]) -> Result<i32> {
-        if input.len() != self.cols {
-            bail!(
-                "deterministic linear input width mismatch: {} vs {}",
-                input.len(),
-                self.cols
-            );
-        }
-        if row_idx >= self.rows {
-            bail!(
-                "deterministic linear row index {row_idx} out of range for {} rows",
-                self.rows
-            );
-        }
-        dot_slice(input, self.row(row_idx)?)
-    }
-}
-
-fn dot_slice(input: &[i32], row: DetwgtSlice<'_>) -> Result<i32> {
-    if input.len() != row.len() {
-        bail!(
-            "deterministic linear input width mismatch: {} vs {}",
-            input.len(),
-            row.len()
-        );
-    }
-    let acc = match row.element_width {
-        16 => input
-            .iter()
-            .zip(row.bytes.chunks_exact(2))
-            .fold(0_i64, |acc, (left, bytes)| {
-                let right = i16::from_le_bytes([bytes[0], bytes[1]]) as i32;
-                mac_bits(acc, *left, right)
-            }),
-        32 => input
-            .iter()
-            .zip(row.bytes.chunks_exact(4))
-            .fold(0_i64, |acc, (left, bytes)| {
-                let right = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                mac_bits(acc, *left, right)
-            }),
-        other => bail!("unsupported detwgt element width {other}"),
-    };
-    Ok(requantize(Acc::from_bits(acc)).to_bits())
 }
 
 fn parse_directory(bytes: &[u8], path: &Path) -> Result<BTreeMap<String, TensorEntry>> {

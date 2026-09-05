@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use inference_artifacts::InferenceResult;
-use staged_infer::cache::CachedStageValue;
-use staged_infer::{InferStageTiming, InferenceRunReport, InferenceTimings};
+use inference_artifacts::{
+    InferStageTiming, InferenceResult, InferenceRunReport, InferenceTimings,
+};
 
 use crate::model::DirectInferenceModel;
 use crate::view_kernels::{
@@ -49,8 +49,8 @@ impl DirectInferenceExecutor {
         timings.push(phase_timing("prefill", prefill_started.elapsed()));
 
         let decode_started = Instant::now();
-        let mut edge = staged_infer::kernels::decode_init::run_decode_init_direct(
-            staged_infer::kernels::decode_init::DecodeInitDirectInputs,
+        let mut edge = host_kernels::kernels::decode_init::run_decode_init_direct(
+            host_kernels::kernels::decode_init::DecodeInitDirectInputs,
         )?;
         for token_idx in 0..model.manifest.import.tokens {
             edge = advance_decode_edge(score, &edge);
@@ -72,10 +72,16 @@ impl DirectInferenceExecutor {
         timings.push(phase_timing("decode", decode_started.elapsed()));
 
         let finalize_started = Instant::now();
-        let output_edge = CachedStageValue::DecodeEdge(edge).as_output_edge()?;
+        let output_edge = output_finalize::input::DecodeEdge {
+            has_selected: edge.has_selected,
+            decode_position: edge.decode_position,
+            token_id: edge.token_id,
+            value: edge.value,
+            generated_token_ids: edge.generated_token_ids.clone(),
+        };
         let decoder = model.decoder_table()?;
-        let output = staged_infer::kernels::output_finalize::run_output_finalize_direct(
-            staged_infer::kernels::output_finalize::OutputFinalizeDirectInputs {
+        let output = host_kernels::kernels::output_finalize::run_output_finalize_direct(
+            host_kernels::kernels::output_finalize::OutputFinalizeDirectInputs {
                 edge: &output_edge,
                 decoder: &decoder,
             },

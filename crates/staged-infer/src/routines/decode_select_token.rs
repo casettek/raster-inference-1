@@ -5,7 +5,7 @@ use decode_select_token::input::{DecodeEdge, PrefillLogits};
 
 use crate::artifact_io::{with_main_sequence_scope, with_stage_sequence_scope};
 use crate::cache::CachedInputs;
-use crate::kernels::decode_select_token::{
+use host_kernels::kernels::decode_select_token::{
     run_decode_select_token_direct, DecodeSelectTokenDirectInputs,
 };
 

@@ -10,7 +10,8 @@ use prompt_prepare::input::{merge_bucket_of, vocab_bucket_of, BpeMerge, BpePiece
 use prompt_prepare::input::{PromptTokenizer, TokenEntry, VocabBucket};
 use raster::{Bytes, List};
 
-use crate::detwgt::{DetwgtMatrixView, MmapDetwgt};
+use detwgt::{DetwgtMatrixView, DetwgtSlice, MmapDetwgt};
+use host_kernels::tensor::MatrixSource;
 
 const ONE: i32 = 1 << 16;
 const END_OF_WORD: &str = "</w>";
@@ -33,29 +34,71 @@ pub struct DirectInferenceModel {
     final_head_params: prefill_finalize::input::FinalHeadParams,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DirectMatrixView<'a> {
+    inner: DetwgtMatrixView<'a>,
+}
+
+impl<'a> DirectMatrixView<'a> {
+    pub fn new(inner: DetwgtMatrixView<'a>) -> Self {
+        Self { inner }
+    }
+
+    pub fn rows(&self) -> usize {
+        self.inner.rows()
+    }
+
+    pub fn cols(&self) -> usize {
+        self.inner.cols()
+    }
+
+    pub fn row(&self, row_idx: usize) -> Result<DetwgtSlice<'a>> {
+        self.inner.row(row_idx)
+    }
+
+    pub fn row_values(&self, row_idx: usize) -> Result<Vec<i32>> {
+        self.inner.row_values(row_idx)
+    }
+}
+
+impl MatrixSource for DirectMatrixView<'_> {
+    fn rows(&self) -> usize {
+        self.inner.rows()
+    }
+
+    fn cols(&self) -> usize {
+        self.inner.cols()
+    }
+
+    fn row_values_into(&self, row_idx: usize, out: &mut Vec<i32>) -> Result<()> {
+        self.inner.row(row_idx)?.values_into(out);
+        Ok(())
+    }
+}
+
 pub struct DirectPleLayer<'a> {
     pub params: prefill_prepare_aux::input::PleLayerParams,
-    pub embeddings: DetwgtMatrixView<'a>,
+    pub embeddings: DirectMatrixView<'a>,
     pub embedding_start: usize,
-    pub projection: DetwgtMatrixView<'a>,
+    pub projection: DirectMatrixView<'a>,
 }
 
 pub struct DirectTransformerLayer<'a> {
     pub params: prefill_range::input::LayerParams,
-    pub w_q: DetwgtMatrixView<'a>,
-    pub w_k: DetwgtMatrixView<'a>,
-    pub w_v: DetwgtMatrixView<'a>,
-    pub w_o: DetwgtMatrixView<'a>,
-    pub w_gate: DetwgtMatrixView<'a>,
-    pub w_up: DetwgtMatrixView<'a>,
-    pub w_down: DetwgtMatrixView<'a>,
-    pub ple_input_gate: DetwgtMatrixView<'a>,
-    pub ple_layer_projection: DetwgtMatrixView<'a>,
+    pub w_q: DirectMatrixView<'a>,
+    pub w_k: DirectMatrixView<'a>,
+    pub w_v: DirectMatrixView<'a>,
+    pub w_o: DirectMatrixView<'a>,
+    pub w_gate: DirectMatrixView<'a>,
+    pub w_up: DirectMatrixView<'a>,
+    pub w_down: DirectMatrixView<'a>,
+    pub ple_input_gate: DirectMatrixView<'a>,
+    pub ple_layer_projection: DirectMatrixView<'a>,
 }
 
 pub struct DirectFinalHead<'a> {
     pub params: prefill_finalize::input::FinalHeadParams,
-    pub projection: DetwgtMatrixView<'a>,
+    pub projection: DirectMatrixView<'a>,
 }
 
 impl DirectInferenceModel {
@@ -107,21 +150,25 @@ impl DirectInferenceModel {
             .join(DIRECT_INFER_MANIFEST_JSON)
     }
 
+    fn matrix_view(&self, name: &str, rows: usize, cols: usize) -> Result<DirectMatrixView<'_>> {
+        Ok(DirectMatrixView::new(self.detwgt.matrix(name, rows, cols)?))
+    }
+
     pub fn prompt_inputs(&self) -> Result<prompt_prepare::input::PromptTokenization> {
         let tokenizer = self.prompt_tokenizer()?;
         let pieces = BpePieces {
             pieces: List::from(self.manifest.prompt.initial_pieces.clone()),
         };
-        staged_infer::kernels::prompt_prepare::run_prompt_prepare_direct(
-            staged_infer::kernels::prompt_prepare::PromptPrepareDirectInputs {
+        host_kernels::kernels::prompt_prepare::run_prompt_prepare_direct(
+            host_kernels::kernels::prompt_prepare::PromptPrepareDirectInputs {
                 tokenizer: &tokenizer,
                 initial_pieces: &pieces,
             },
         )
     }
 
-    pub fn embedding_view(&self) -> Result<DetwgtMatrixView<'_>> {
-        self.detwgt.matrix(
+    pub fn embedding_view(&self) -> Result<DirectMatrixView<'_>> {
+        self.matrix_view(
             "model.language_model.embed_tokens.weight",
             self.shape().vocab_size as usize,
             self.shape().hidden_size as usize,
@@ -193,15 +240,15 @@ impl DirectInferenceModel {
         let embedding_start = layer_idx * shape.hidden_size_per_layer_input as usize;
         let embedding_width = shape.hidden_size_per_layer_input as usize;
         let embedding_cols = shape.num_hidden_layers as usize * embedding_width;
-        let projection = self.detwgt.matrix_rows(
+        let projection = DirectMatrixView::new(self.detwgt.matrix_rows(
             "model.language_model.per_layer_model_projection.weight",
             embedding_start,
             embedding_start + embedding_width,
             shape.hidden_size as usize,
-        )?;
+        )?);
         Ok(DirectPleLayer {
             params: self.ple_params[layer_idx].clone(),
-            embeddings: self.detwgt.matrix(
+            embeddings: self.matrix_view(
                 "model.language_model.embed_tokens_per_layer.weight",
                 shape.vocab_size as usize,
                 embedding_cols,
@@ -319,29 +366,19 @@ impl DirectInferenceModel {
 
         Ok(DirectTransformerLayer {
             params,
-            w_q: self
-                .detwgt
-                .matrix(&at("self_attn.q_proj.weight"), q_len, hidden)?,
-            w_k: self.detwgt.matrix(&k_name, kv_len, hidden)?,
-            w_v: self.detwgt.matrix(&v_tensor, kv_len, hidden)?,
-            w_o: self
-                .detwgt
-                .matrix(&at("self_attn.o_proj.weight"), hidden, q_len)?,
-            w_gate: self
-                .detwgt
-                .matrix(&at("mlp.gate_proj.weight"), ffn as usize, hidden)?,
-            w_up: self
-                .detwgt
-                .matrix(&at("mlp.up_proj.weight"), ffn as usize, hidden)?,
-            w_down: self
-                .detwgt
-                .matrix(&at("mlp.down_proj.weight"), hidden, ffn as usize)?,
-            ple_input_gate: self.detwgt.matrix(
+            w_q: self.matrix_view(&at("self_attn.q_proj.weight"), q_len, hidden)?,
+            w_k: self.matrix_view(&k_name, kv_len, hidden)?,
+            w_v: self.matrix_view(&v_tensor, kv_len, hidden)?,
+            w_o: self.matrix_view(&at("self_attn.o_proj.weight"), hidden, q_len)?,
+            w_gate: self.matrix_view(&at("mlp.gate_proj.weight"), ffn as usize, hidden)?,
+            w_up: self.matrix_view(&at("mlp.up_proj.weight"), ffn as usize, hidden)?,
+            w_down: self.matrix_view(&at("mlp.down_proj.weight"), hidden, ffn as usize)?,
+            ple_input_gate: self.matrix_view(
                 &at("per_layer_input_gate.weight"),
                 ple_width,
                 hidden,
             )?,
-            ple_layer_projection: self.detwgt.matrix(
+            ple_layer_projection: self.matrix_view(
                 &at("per_layer_projection.weight"),
                 hidden,
                 ple_width,
@@ -392,7 +429,7 @@ impl DirectInferenceModel {
         };
         Ok(DirectFinalHead {
             params: self.final_head_params.clone(),
-            projection: self.detwgt.matrix(
+            projection: self.matrix_view(
                 tensor,
                 shape.vocab_size as usize,
                 shape.hidden_size as usize,

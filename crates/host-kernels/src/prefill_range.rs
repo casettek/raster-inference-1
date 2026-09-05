@@ -7,11 +7,11 @@ use det_num::{Acc, Act};
 use raster::List;
 use rayon::prelude::*;
 
-use crate::cache::MaterializationCacheKey;
 use crate::tensor::{
     dot_bits, linear_slab, mac_weighted_value, pack_i32_page, requantize_acc, unpack_page_i32s,
     Matrix, Slab,
 };
+use crate::MaterializationCacheKey;
 use ::prefill_range::input::{
     add_row, gelu, rms_norm, scale_row, value_rms_norm, ActivationRow, ActivationSequence, KeyRow,
     LayerParams, PleLayerInputs, PleRow, TransformerLayer,

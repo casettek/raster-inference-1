@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use inference_artifacts::InferenceResult;
 
-use crate::artifactless::inference_result_from_generated;
 use crate::cache::CachedStageValue;
-use crate::hybrid::{self, StagedExecutionBackend};
+use crate::chain_runner::{self, StagedExecutionBackend};
+use crate::uncheckpointed::inference_result_from_generated;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParityPolicy {
@@ -40,7 +40,7 @@ impl CheckpointedInferenceExecutor {
             ParityPolicy::Skip => None,
             ParityPolicy::ReferenceStage(stage) => Some(stage.as_str()),
         };
-        let run = hybrid::run(raster_stage, &config.current_exe, config.staged_backend)?;
+        let run = chain_runner::run(raster_stage, &config.current_exe, config.staged_backend)?;
         let final_result = match run.final_output {
             Some(CachedStageValue::GeneratedOutput(output)) => {
                 Some(inference_result_from_generated(output))
@@ -133,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_path_must_match_current_hybrid_contract() {
+    fn manifest_path_must_match_current_chain_runner_contract() {
         let error =
             ensure_supported_manifest_path(Path::new("/repo"), Path::new("/repo/other.toml"))
                 .unwrap_err();

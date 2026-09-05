@@ -13,4 +13,4 @@ profiling = ["raster/profiling"]
 raster = { path = "../../../../raster/crates/raster", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 # Canonical fixed-point kernels, vendored verbatim from the reference.
-det-num = { path = "../../det-num" }
+det-num = { path = "../../crates/det-num" }

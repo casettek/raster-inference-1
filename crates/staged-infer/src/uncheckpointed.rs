@@ -6,63 +6,30 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use inference_artifacts::InferenceResult;
+use inference_artifacts::{
+    InferAuxWaveTiming, InferStageTiming, InferenceResult, InferenceRunReport, InferenceTimings,
+};
 use output_finalize::input::GeneratedOutput;
 use rayon::prelude::*;
 
 use crate::cache::{CachedInputs, CachedStageValue, MaterializationCache, StageOutputCache};
-use crate::hybrid::{self, InputBinding, StageSpec};
+use crate::chain_runner::{self, InputBinding, StageSpec};
 use crate::routines::{self, StageKind};
 
 #[derive(Debug, Clone)]
-pub struct ArtifactlessStagedInferenceConfig {
+pub struct UncheckpointedInferenceConfig {
     pub base_dir: PathBuf,
     pub manifest_path: PathBuf,
 }
 
 #[derive(Debug, Default)]
-pub struct ArtifactlessStagedInferenceExecutor;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InferenceRunReport {
-    pub result: InferenceResult,
-    pub timings: InferenceTimings,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InferenceTimings {
-    pub total_duration: Duration,
-    pub stages: Vec<InferStageTiming>,
-    pub aux_waves: Vec<InferAuxWaveTiming>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InferStageTiming {
-    pub stage: String,
-    pub routine: String,
-    pub input_synthesis_duration: Duration,
-    pub input_load_duration: Duration,
-    pub kernel_duration: Duration,
-    pub encode_duration: Duration,
-    pub total_duration: Duration,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InferAuxWaveTiming {
-    pub name: String,
-    pub first_stage: String,
-    pub last_stage: String,
-    pub stage_count: usize,
-    pub parallelism: usize,
-    pub wall_duration: Duration,
-    pub stage_duration_sum: Duration,
-}
+pub struct UncheckpointedInferenceExecutor;
 
 #[derive(Default)]
 struct InferRunCache {
     stage_outputs: StageOutputCache,
     materializations: MaterializationCache,
-    prefill_range_weights: crate::prefill_range::PrefillRangeWeightCache,
+    prefill_range_weights: host_kernels::prefill_range::PrefillRangeWeightCache,
 }
 
 struct InferRunState {
@@ -91,7 +58,7 @@ struct InferAuxStageJob<'a> {
     input_manifest_path: PathBuf,
     cached_inputs: CachedInputs,
     materialization_cache: &'a MaterializationCache,
-    prefill_range_weights: &'a crate::prefill_range::PrefillRangeWeightCache,
+    prefill_range_weights: &'a host_kernels::prefill_range::PrefillRangeWeightCache,
     input_synthesis_duration: Duration,
 }
 
@@ -106,20 +73,20 @@ struct InferAuxStageBatch {
     parallelism: usize,
 }
 
-impl ArtifactlessStagedInferenceExecutor {
-    pub fn run(&self, config: ArtifactlessStagedInferenceConfig) -> Result<InferenceResult> {
+impl UncheckpointedInferenceExecutor {
+    pub fn run(&self, config: UncheckpointedInferenceConfig) -> Result<InferenceResult> {
         Ok(self.run_with_report(config)?.result)
     }
 
     pub fn run_with_report(
         &self,
-        config: ArtifactlessStagedInferenceConfig,
+        config: UncheckpointedInferenceConfig,
     ) -> Result<InferenceRunReport> {
         ensure_manifest_exists(&config.manifest_path)?;
         let infer_started = Instant::now();
-        let manifest = hybrid::read_manifest(&config.manifest_path)?;
-        hybrid::validate_supported_stages(&manifest.chain.stage)?;
-        let stage_index = hybrid::build_stage_index(&manifest.chain.stage)?;
+        let manifest = chain_runner::read_manifest(&config.manifest_path)?;
+        chain_runner::validate_supported_stages(&manifest.chain.stage)?;
+        let stage_index = chain_runner::build_stage_index(&manifest.chain.stage)?;
         let temp_dir = InferenceTempDir::create()?;
 
         let mut state = InferRunState {
@@ -177,7 +144,7 @@ impl ArtifactlessStagedInferenceExecutor {
     }
 }
 
-impl ArtifactlessStagedInferenceConfig {
+impl UncheckpointedInferenceConfig {
     pub fn from_current_dir() -> Result<Self> {
         let base_dir = std::env::current_dir().context("failed to read current directory")?;
         Ok(Self {
@@ -205,7 +172,7 @@ fn run_stage(
     stage_index: &std::collections::BTreeMap<String, usize>,
     state: &mut InferRunState,
 ) -> Result<()> {
-    let cached_inputs = hybrid::cached_inputs_for_stage(
+    let cached_inputs = chain_runner::cached_inputs_for_stage(
         stage,
         stage_index,
         &state.output_commitments,
@@ -240,14 +207,14 @@ fn run_cached_stage(
     stage_index: &BTreeMap<String, usize>,
     cached_inputs: CachedInputs,
     materialization_cache: &MaterializationCache,
-    prefill_range_weights: &crate::prefill_range::PrefillRangeWeightCache,
+    prefill_range_weights: &host_kernels::prefill_range::PrefillRangeWeightCache,
 ) -> Result<InferStageRun> {
     fs::create_dir_all(stage_dir)
         .with_context(|| format!("failed to create {}", stage_dir.display()))?;
 
     let stage_started = Instant::now();
     let input_synthesis_started = Instant::now();
-    let (input_json_path, input_manifest_path) = hybrid::synthesize_inputs(
+    let (input_json_path, input_manifest_path) = chain_runner::synthesize_inputs(
         stage,
         stage_dir,
         base_dir,
@@ -361,7 +328,7 @@ fn prepare_aux_stage_job<'a>(
     stage_index: &BTreeMap<String, usize>,
     state: &'a InferRunState,
 ) -> Result<InferAuxStageJob<'a>> {
-    let cached_inputs = hybrid::cached_inputs_for_stage(
+    let cached_inputs = chain_runner::cached_inputs_for_stage(
         stage,
         stage_index,
         &state.output_commitments,
@@ -373,7 +340,7 @@ fn prepare_aux_stage_job<'a>(
         .with_context(|| format!("failed to create {}", stage_dir.display()))?;
 
     let input_synthesis_started = Instant::now();
-    let (input_json_path, input_manifest_path) = hybrid::synthesize_inputs(
+    let (input_json_path, input_manifest_path) = chain_runner::synthesize_inputs(
         stage,
         &stage_dir,
         base_dir,
@@ -571,7 +538,7 @@ mod tests {
     #[test]
     fn config_from_current_dir_points_at_root_manifest() {
         let cwd = std::env::current_dir().unwrap();
-        let config = ArtifactlessStagedInferenceConfig::from_current_dir().unwrap();
+        let config = UncheckpointedInferenceConfig::from_current_dir().unwrap();
 
         assert_eq!(config.base_dir, cwd);
         assert_eq!(config.manifest_path, cwd.join("Raster.toml"));
@@ -584,8 +551,8 @@ mod tests {
         fs::create_dir_all(&base_dir).unwrap();
         let manifest_path = base_dir.join("Raster.toml");
 
-        let error = ArtifactlessStagedInferenceExecutor
-            .run(ArtifactlessStagedInferenceConfig {
+        let error = UncheckpointedInferenceExecutor
+            .run(UncheckpointedInferenceConfig {
                 base_dir: base_dir.clone(),
                 manifest_path,
             })

@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use direct_infer::detwgt::MmapDetwgt;
-use direct_infer::model::DirectFinalHead;
+use direct_infer::model::{DirectFinalHead, DirectMatrixView};
 use direct_infer::view_kernels::score_next_token_view;
 use direct_infer::{DirectInferenceConfig, DirectInferenceExecutor};
+use host_kernels::tensor::{dot_bits, matvec_from_source, Matrix, MatrixSource};
 use inference_artifacts::{
     write_json, DirectInferBundle, DirectInferImportSettings, DirectInferManifest,
     DirectInferPrompt, DirectInferShape, DIRECT_INFER_ARTIFACTS_DIR, DIRECT_INFER_MANIFEST_JSON,
@@ -18,8 +19,7 @@ use prompt_prepare::input::{
 };
 use raster::{Bytes, List};
 use sha2::{Digest, Sha256};
-use staged_infer::tensor::{dot_bits, matvec_from_source, Matrix, MatrixSource};
-use staged_infer::{ArtifactlessStagedInferenceConfig, ArtifactlessStagedInferenceExecutor};
+use staged_infer::{UncheckpointedInferenceConfig, UncheckpointedInferenceExecutor};
 
 const ONE: i32 = 1 << 16;
 
@@ -87,7 +87,7 @@ fn detwgt_matrix_view_matches_eager_matrix_matvec() {
         }],
     );
     let model = MmapDetwgt::open(&detwgt).unwrap();
-    let view = model.matrix("matrix", 2, 3).unwrap();
+    let view = DirectMatrixView::new(model.matrix("matrix", 2, 3).unwrap());
     let eager = Matrix::from_region("matrix", &paged(&values), 2, 3).unwrap();
     let input = [ONE, 2 * ONE, 3 * ONE];
 
@@ -123,12 +123,12 @@ fn row_dot_matches_dot_bits_for_i16_and_i32() {
     );
     let model = MmapDetwgt::open(&detwgt).unwrap();
 
-    let i16_view = model.matrix("i16_matrix", 2, 2).unwrap();
+    let i16_view = DirectMatrixView::new(model.matrix("i16_matrix", 2, 2).unwrap());
     assert_eq!(
         i16_view.row_dot(0, &[5, 6]).unwrap(),
         dot_bits(&[5, 6], &[1, -2])
     );
-    let i32_view = model.matrix("i32_matrix", 2, 2).unwrap();
+    let i32_view = DirectMatrixView::new(model.matrix("i32_matrix", 2, 2).unwrap());
     assert_eq!(
         i32_view.row_dot(1, &[7, 8]).unwrap(),
         dot_bits(&[7, 8], &[0, ONE])
@@ -160,7 +160,7 @@ fn final_head_streaming_selection_matches_eager_tie_break() {
             softcap: 0,
             norm_weights: pack_i32_page(&[ONE, ONE]),
         },
-        projection: model.matrix("projection", 3, 2).unwrap(),
+        projection: DirectMatrixView::new(model.matrix("projection", 3, 2).unwrap()),
     };
     let activations = prefill_range::input::ActivationSequence {
         rows: List::from(vec![prefill_range::input::ActivationRow {
@@ -287,7 +287,7 @@ fn direct_executor_runs_from_direct_manifest_without_raster_toml() {
 }
 
 #[test]
-fn direct_executor_matches_artifactless_staged_result() {
+fn direct_executor_matches_uncheckpointed_staged_result() {
     let dir = temp_dir("parity");
     fs::create_dir_all(&dir).unwrap();
     let manifest_path = write_direct_fixture(&dir);
@@ -299,8 +299,8 @@ fn direct_executor_matches_artifactless_staged_result() {
             direct_manifest_path: manifest_path,
         })
         .unwrap();
-    let staged = ArtifactlessStagedInferenceExecutor
-        .run(ArtifactlessStagedInferenceConfig {
+    let staged = UncheckpointedInferenceExecutor
+        .run(UncheckpointedInferenceConfig {
             base_dir: dir.clone(),
             manifest_path: dir.join("Raster.toml"),
         })

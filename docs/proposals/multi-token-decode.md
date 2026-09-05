@@ -146,7 +146,7 @@ Keep `prefill-range` as the single transformer program. A decode stage is the sa
 non-empty prior cache and a one-row activation sequence; prefill is the degenerate case where the
 prior cache is empty. This is the property the repo already relies on for `donor_kv` — *"Every stage
 of this one program shares `main`'s signature, so every one needs a `donor_kv` binding"*
-(`model-import/src/main.rs:833`) — extended one step.
+(`crates/model-import/src/main.rs:833`) — extended one step.
 
 ### 4.1 `main` gains `prior_kv`
 
@@ -365,7 +365,7 @@ preference order:
    105 MiB/step against §7's 5.26 GB, so ~2%, but it is 35 copies of data that 34 layers do not read.
 
 3. **Keep generating the manifest.** `model-import` already writes the 20 donor bindings
-   (`model-import/src/main.rs:836`), so this works today with no upstream change — at the cost of a
+   (`crates/model-import/src/main.rs:836`), so this works today with no upstream change — at the cost of a
    `73 × max_new_tokens`-stage `Raster.toml` (4,672 stages at 64 tokens) and the generator staying a
    second source of truth for the pipeline's shape, which is what `chain-repeat` set out to remove.
 

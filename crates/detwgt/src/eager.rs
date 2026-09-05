@@ -138,7 +138,10 @@ pub fn load(path: &Path) -> Result<Artifact, Box<dyn Error>> {
             other => return Err(format!("tensor '{name}' has element width {other}").into()),
         };
 
-        if tensors.insert(name.clone(), Tensor { dims, values }).is_some() {
+        if tensors
+            .insert(name.clone(), Tensor { dims, values })
+            .is_some()
+        {
             return Err(format!("duplicate tensor '{name}' in artifact").into());
         }
     }

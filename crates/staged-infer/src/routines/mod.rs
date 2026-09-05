@@ -53,7 +53,7 @@ pub struct DirectCachedOutput {
 #[derive(Clone, Copy, Default)]
 pub struct RoutineRunCaches<'a> {
     pub materializations: Option<&'a MaterializationCache>,
-    pub prefill_range_weights: Option<&'a crate::prefill_range::PrefillRangeWeightCache>,
+    pub prefill_range_weights: Option<&'a host_kernels::prefill_range::PrefillRangeWeightCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

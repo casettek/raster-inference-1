@@ -2,15 +2,15 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use staged_infer::shadow::{
-    render_timing_summary, ChainExecutionTimes, ParityAuthority, RasterSourceMode, ShadowReport,
+use staged_infer::parity::{
+    render_timing_summary, ChainExecutionTimes, ParityAuthority, ParityReport, RasterSourceMode,
 };
 
 #[test]
 fn parity_artifacts_live_under_stage_directory() {
     let stage = Path::new("target/raster/chains/run/prefill_range_l3");
     assert_eq!(
-        staged_infer::shadow::parity_dir(stage),
+        staged_infer::parity::parity_dir(stage),
         stage.join("staged-infer-parity")
     );
 }
@@ -28,7 +28,7 @@ fn timing_summary_annotates_selected_stage() {
         }"#,
     )
     .unwrap();
-    let shadow = ShadowReport {
+    let parity = ParityReport {
         version: 3,
         stage: "prefill_range_l3".into(),
         routine: "prefill_range".into(),
@@ -41,19 +41,19 @@ fn timing_summary_annotates_selected_stage() {
         encode_write_duration_ns: 20_000_000,
         direct_stage_duration_ns: 250_000_000,
     };
-    let encoded = serde_json::to_vec(&shadow).unwrap();
+    let encoded = serde_json::to_vec(&parity).unwrap();
     let json = String::from_utf8(encoded.clone()).unwrap();
     assert!(json.contains(r#""authority":"non_authoritative""#));
     assert!(json.contains(r#""raster_source_mode":"unauthenticated""#));
-    let shadow: ShadowReport = serde_json::from_slice(&encoded).unwrap();
+    let parity: ParityReport = serde_json::from_slice(&encoded).unwrap();
 
-    let summary = render_timing_summary(&timings, &shadow).unwrap();
+    let summary = render_timing_summary(&timings, &parity).unwrap();
     assert!(summary.contains("prefill_range_l3"));
     assert!(summary.contains("250.00ms"));
     assert!(summary.contains("8.00x"));
     assert!(summary.contains("MATCH"));
     assert!(summary.contains("NON-AUTHORITATIVE"));
-    assert!(summary.contains("hybrid pipeline: --no-auth"));
+    assert!(summary.contains("chain runner: --no-auth"));
 }
 
 #[test]
@@ -79,7 +79,7 @@ fn timing_summary_reports_wall_time_and_aux_wave_speedup() {
         }"#,
     )
     .unwrap();
-    let shadow = ShadowReport {
+    let parity = ParityReport {
         version: 3,
         stage: "prefill_range_l3".into(),
         routine: "prefill_range".into(),
@@ -93,7 +93,7 @@ fn timing_summary_reports_wall_time_and_aux_wave_speedup() {
         direct_stage_duration_ns: 250_000_000,
     };
 
-    let summary = render_timing_summary(&timings, &shadow).unwrap();
+    let summary = render_timing_summary(&timings, &parity).unwrap();
 
     assert!(summary.contains("stage sum"));
     assert!(summary.contains("wall time"));
@@ -151,7 +151,7 @@ fn full_chain_binary() -> PathBuf {
         .join("staged-infer");
     assert!(
         release_binary.is_file(),
-        "build the release binary first with `cargo build --release --manifest-path staged-infer/Cargo.toml`, or set STAGED_INFER_FULL_CHAIN_BIN"
+        "build the release binary first with `cargo build --release -p staged-infer`, or set STAGED_INFER_FULL_CHAIN_BIN"
     );
     release_binary
 }

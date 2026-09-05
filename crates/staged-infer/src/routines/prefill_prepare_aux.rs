@@ -9,7 +9,7 @@ use crate::cache::{
     materialization_key_from_stage_files, materialize_with_cache, CachedInputs,
     MaterializationCache, MaterializationCacheKey,
 };
-use crate::kernels::prefill_prepare_aux::{
+use host_kernels::kernels::prefill_prepare_aux::{
     run_prefill_prepare_aux_direct, PrefillPrepareAuxDirectInputs,
 };
 

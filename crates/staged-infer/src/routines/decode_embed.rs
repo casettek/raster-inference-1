@@ -9,7 +9,7 @@ use crate::cache::{
     materialization_key_from_stage_files, materialize_with_cache, CachedInputs,
     MaterializationCache, MaterializationCacheKey,
 };
-use crate::kernels::decode_embed::{run_decode_embed_direct, DecodeEmbedDirectInputs};
+use host_kernels::kernels::decode_embed::{run_decode_embed_direct, DecodeEmbedDirectInputs};
 
 pub struct Inputs {
     pub selected: DecodeEdge,

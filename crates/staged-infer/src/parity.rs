@@ -29,7 +29,7 @@ pub enum RasterSourceMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ShadowReport {
+pub struct ParityReport {
     pub version: u32,
     pub stage: String,
     pub routine: String,
@@ -72,7 +72,7 @@ pub struct AuxWaveExecutionTime {
     pub stage_duration_sum_ns: u128,
 }
 
-pub fn run_hidden_stage_compare(stage_dir: &Path) -> Result<ShadowReport> {
+pub fn run_hidden_stage_compare(stage_dir: &Path) -> Result<ParityReport> {
     let stage_name = stage_name(stage_dir)?;
     let kind = StageKind::from_stage_name(&stage_name)?;
     validate_stage_artifacts(stage_dir)?;
@@ -95,7 +95,7 @@ pub fn run_hidden_stage_compare(stage_dir: &Path) -> Result<ShadowReport> {
     let direct_sha = sha256_hex(&direct.encoded.data);
     let raster_structural = structural_hex(&raster_bytes)?;
     let direct_structural = direct.encoded.structural_commitment;
-    let result = ShadowReport {
+    let result = ParityReport {
         version: 3,
         stage: stage_name,
         routine: kind.routine().to_string(),
@@ -294,7 +294,7 @@ fn render_report(
     direct_structural: &str,
     raster_artifact: &Path,
     direct_artifact: &Path,
-    result: &ShadowReport,
+    result: &ParityReport,
 ) -> String {
     match comparison {
         ByteComparison::Match => format!(
@@ -355,9 +355,9 @@ fn structural_hex(bytes: &[u8]) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("artifact is not a well-formed Raster payload"))
 }
 
-pub fn read_shadow_report(stage_dir: &Path) -> Result<ShadowReport> {
+pub fn read_parity_report(stage_dir: &Path) -> Result<ParityReport> {
     let path = parity_dir(stage_dir).join(REPORT_JSON);
-    let report: ShadowReport = serde_json::from_slice(
+    let report: ParityReport = serde_json::from_slice(
         &fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?,
     )
     .with_context(|| format!("failed to decode {}", path.display()))?;
@@ -389,7 +389,7 @@ pub fn read_chain_execution_times(chain_dir: &Path) -> Result<ChainExecutionTime
 
 pub fn render_timing_summary(
     timings: &ChainExecutionTimes,
-    shadow: &ShadowReport,
+    parity: &ParityReport,
 ) -> Result<String> {
     let stage_width = timings
         .stages
@@ -401,7 +401,7 @@ pub fn render_timing_summary(
     let mut output = String::new();
     writeln!(
         output,
-        "\nNON-AUTHORITATIVE timing comparison (hybrid pipeline: --no-auth; stage execution only)"
+        "\nNON-AUTHORITATIVE timing comparison (chain runner: --no-auth; stage execution only)"
     )?;
     writeln!(
         output,
@@ -411,14 +411,14 @@ pub fn render_timing_summary(
 
     let mut selected_count = 0usize;
     for timing in &timings.stages {
-        if timing.name == shadow.stage {
+        if timing.name == parity.stage {
             selected_count += 1;
-            let speedup = if shadow.direct_stage_duration_ns == 0 {
+            let speedup = if parity.direct_stage_duration_ns == 0 {
                 String::from("—")
             } else {
                 format!(
                     "{:.2}x",
-                    timing.exec_duration_ns as f64 / shadow.direct_stage_duration_ns as f64
+                    timing.exec_duration_ns as f64 / parity.direct_stage_duration_ns as f64
                 )
             };
             writeln!(
@@ -426,11 +426,11 @@ pub fn render_timing_summary(
                 "{:<stage_width$}  {:>12}  {:>12}  {:>12}  {:>12}  {:>8}  {:>8}",
                 timing.name,
                 format_duration_ns(timing.exec_duration_ns),
-                format_duration_ns(shadow.direct_stage_duration_ns),
-                format_duration_ns(shadow.kernel_duration_ns),
-                format_saved(timing.exec_duration_ns, shadow.direct_stage_duration_ns),
+                format_duration_ns(parity.direct_stage_duration_ns),
+                format_duration_ns(parity.kernel_duration_ns),
+                format_saved(timing.exec_duration_ns, parity.direct_stage_duration_ns),
                 speedup,
-                if shadow.matched { "MATCH" } else { "MISMATCH" },
+                if parity.matched { "MATCH" } else { "MISMATCH" },
             )?;
         } else {
             writeln!(
@@ -449,7 +449,7 @@ pub fn render_timing_summary(
     if selected_count != 1 {
         bail!(
             "expected exactly one timing for `{}`, found {selected_count}",
-            shadow.stage
+            parity.stage
         );
     }
     writeln!(
@@ -481,8 +481,8 @@ pub fn render_timing_summary(
     }
     writeln!(
         output,
-        "staged-infer shadow overhead: {}",
-        format_duration_ns(shadow.direct_stage_duration_ns)
+        "staged-infer parity overhead: {}",
+        format_duration_ns(parity.direct_stage_duration_ns)
     )?;
     Ok(output)
 }
@@ -540,7 +540,7 @@ mod tests {
                 .join("target")
                 .join("raster")
                 .join("chains-no-auth")
-                .join(format!("shadow-test-{}-{id}", std::process::id()));
+                .join(format!("parity-test-{}-{id}", std::process::id()));
             let stage_dir = run_dir.join(stage_name);
             fs::create_dir_all(&stage_dir).unwrap();
             for name in [

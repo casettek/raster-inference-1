@@ -7,10 +7,10 @@ use output_finalize::input::{DecoderTable, DecoderToken};
 use raster::List;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use staged_infer::hybrid::StagedExecutionBackend;
+use staged_infer::chain_runner::StagedExecutionBackend;
 use staged_infer::{
-    ArtifactlessStagedInferenceConfig, ArtifactlessStagedInferenceExecutor,
-    CheckpointedInferenceConfig, CheckpointedInferenceExecutor,
+    CheckpointedInferenceConfig, CheckpointedInferenceExecutor, UncheckpointedInferenceConfig,
+    UncheckpointedInferenceExecutor,
 };
 
 #[test]
@@ -51,8 +51,8 @@ fn infer_final_result_matches_checkpointed_claim_path() {
     let decoder_commitment = write_external(&base, "decoder", &decoder);
     write_manifest(&base, &logits_commitment, &decoder_commitment);
 
-    let infer_report = ArtifactlessStagedInferenceExecutor
-        .run_with_report(ArtifactlessStagedInferenceConfig {
+    let infer_report = UncheckpointedInferenceExecutor
+        .run_with_report(UncheckpointedInferenceConfig {
             base_dir: base.clone(),
             manifest_path: base.join("Raster.toml"),
         })

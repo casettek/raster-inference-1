@@ -9,7 +9,9 @@ use crate::cache::{
     materialization_key_from_stage_files, materialize_with_cache, CachedInputs,
     MaterializationCache, MaterializationCacheKey,
 };
-use crate::kernels::prefill_finalize::{run_prefill_finalize_direct, PrefillFinalizeDirectInputs};
+use host_kernels::kernels::prefill_finalize::{
+    run_prefill_finalize_direct, PrefillFinalizeDirectInputs,
+};
 
 pub struct Inputs {
     pub activations: ActivationSequence,

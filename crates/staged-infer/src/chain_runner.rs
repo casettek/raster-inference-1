@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::cache::{CachedInputs, CachedStageValue, StageOutputCache};
+use crate::parity::{parity_dir, EXECUTION_TIMES_JSON};
 use crate::routines::{self, StageKind};
-use crate::shadow::{parity_dir, EXECUTION_TIMES_JSON};
 
 #[derive(Debug)]
 pub struct HybridRun {
@@ -256,7 +256,7 @@ pub fn run(
     println!("  dir: {}", chain_dir.display());
     match raster_stage {
         Some(stage) => {
-            println!("  mode: unauthenticated hybrid (--no-auth; Raster reference: {stage})");
+            println!("  mode: unauthenticated chain runner (--no-auth; Raster reference: {stage})");
         }
         None => println!("  mode: unauthenticated staged-infer (--no-auth)"),
     }
@@ -1543,17 +1543,22 @@ mod tests {
     fn test_base_dir() -> PathBuf {
         let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "staged-infer-hybrid-test-{}-{id}",
+            "staged-infer-chain-runner-test-{}-{id}",
             std::process::id()
         ))
     }
 
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .to_path_buf()
+    }
+
     #[test]
     fn real_manifest_dispatches_one_reference_and_remaining_stages_native() {
-        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("Raster.toml");
+        let manifest_path = repo_root().join("Raster.toml");
         let manifest = read_manifest(&manifest_path).unwrap();
         let mut direct = 0usize;
         let mut reference = 0usize;
@@ -1572,10 +1577,7 @@ mod tests {
 
     #[test]
     fn real_manifest_dispatches_every_stage_native_without_reference() {
-        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("Raster.toml");
+        let manifest_path = repo_root().join("Raster.toml");
         let manifest = read_manifest(&manifest_path).unwrap();
         let mut direct = 0usize;
         let mut reference = 0usize;
@@ -1594,10 +1596,7 @@ mod tests {
 
     #[test]
     fn real_manifest_expands_decode_repeat_and_export() {
-        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("Raster.toml");
+        let manifest_path = repo_root().join("Raster.toml");
         let manifest = read_manifest(&manifest_path).unwrap();
         let index = build_stage_index(&manifest.chain.stage).unwrap();
 
@@ -1615,10 +1614,7 @@ mod tests {
 
     #[test]
     fn prefill_only_manifest_resolves_zero_count_decode_export() {
-        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("Raster.toml.prefill-only");
+        let manifest_path = repo_root().join("manifests/Raster.prefill-only.toml");
         let manifest = read_manifest(&manifest_path).unwrap();
         let index = build_stage_index(&manifest.chain.stage).unwrap();
 
@@ -1726,10 +1722,7 @@ mod tests {
 
     #[test]
     fn real_manifest_identifies_prefill_prepare_aux_wave() {
-        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("Raster.toml");
+        let manifest_path = repo_root().join("Raster.toml");
         let manifest = read_manifest(&manifest_path).unwrap();
 
         let range = aux_wave_range(&manifest.chain.stage, 2).unwrap();
@@ -1748,10 +1741,7 @@ mod tests {
 
     #[test]
     fn raster_reference_inside_aux_wave_dispatches_once() {
-        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("Raster.toml");
+        let manifest_path = repo_root().join("Raster.toml");
         let manifest = read_manifest(&manifest_path).unwrap();
         let range = aux_wave_range(&manifest.chain.stage, 2).unwrap();
         let mut direct = 0usize;

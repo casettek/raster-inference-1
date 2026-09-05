@@ -9,7 +9,9 @@ use crate::cache::{
     materialization_key_from_stage_files, materialize_with_cache, CachedInputs,
     MaterializationCache, MaterializationCacheKey,
 };
-use crate::kernels::input_embedding::{run_input_embedding_direct, InputEmbeddingDirectInputs};
+use host_kernels::kernels::input_embedding::{
+    run_input_embedding_direct, InputEmbeddingDirectInputs,
+};
 
 pub struct Inputs {
     pub prompt: PromptTokenization,

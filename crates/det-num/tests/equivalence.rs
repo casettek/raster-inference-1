@@ -41,7 +41,10 @@ fn sample_bits(seed: u64, len: usize) -> Vec<i32> {
 
 fn check(label: &str, rotary_dim: usize, freq_base_dim: usize, base: f32, position: usize) {
     let width = freq_base_dim.max(rotary_dim);
-    let bits = sample_bits((position as u64).wrapping_mul(0x9E37_79B9) ^ width as u64, width);
+    let bits = sample_bits(
+        (position as u64).wrapping_mul(0x9E37_79B9) ^ width as u64,
+        width,
+    );
 
     let up_base = upstream::f32_to_acc(base);
     let up_in: Vec<upstream::Act> = bits.iter().map(|b| upstream::Act::from_bits(*b)).collect();
@@ -179,7 +182,11 @@ fn value_rms_norm_matches_upstream() {
             let v_in: Vec<VAct> = vals.iter().map(|b| VAct::from_bits(*b)).collect();
             let v_out = vendored::value_rms_norm(&v_in, VAcc::from_bits(up_eps.to_bits()));
             for (i, (u, v)) in up_out.iter().zip(v_out.iter()).enumerate() {
-                assert_eq!(u.to_bits(), v.to_bits(), "width {width} eps {eps_f}: lane {i}");
+                assert_eq!(
+                    u.to_bits(),
+                    v.to_bits(),
+                    "width {width} eps {eps_f}: lane {i}"
+                );
             }
         }
     }

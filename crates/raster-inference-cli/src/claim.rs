@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use staged_infer::hybrid::StagedExecutionBackend;
+use staged_infer::chain_runner::StagedExecutionBackend;
 use staged_infer::{
     CheckpointedInferenceConfig, CheckpointedInferenceExecutor, CheckpointedInferenceResult,
     ParityPolicy,

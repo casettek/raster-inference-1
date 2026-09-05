@@ -1,7 +1,7 @@
 //! Import a Gemma model bundle into this chain's committed externals.
 //!
 //! ```sh
-//! cargo run --manifest-path model-import/Cargo.toml -- \
+//! cargo run -p model-import -- \
 //!   --model ../raster-inference/assets/tiny-gemma-dev \
 //!   --prompt "hello raster"
 //! ```
@@ -15,7 +15,6 @@
 //! patterns, which is the representation the stages compute in. Nothing here
 //! requantises.
 
-mod detwgt;
 mod direct_manifest;
 mod externals;
 
