@@ -534,11 +534,11 @@ fn generation_stages(
     Ok(out)
 }
 
-/// Q16.16 bits of an `f32`, through the reference's own conversion so the
+/// Q16.16 bits of an `f32`, through the local deterministic conversion so the
 /// committed scalar is the same value the deterministic path uses, not a
 /// near one.
 fn det_act_bits(value: f32) -> i32 {
-    raster_inference::shared::numerics::det_num::f32_to_act(value).to_bits()
+    det_num::f32_to_act(value).to_bits()
 }
 
 fn as_f64(value: &serde_json::Value) -> Option<f64> {
@@ -632,7 +632,7 @@ impl Shape {
     ///
     /// `base_bits` is the base as `Acc` (Q32.32) bits. Both bases this model
     /// declares are exact integers, so the encoding is a plain shift — asserted
-    /// against the reference's `f32_to_acc` in `det-num/tests/equivalence.rs`.
+    /// against local `f32_to_acc` in `det-num/tests/equivalence.rs`.
     ///
     /// `freq_base_dim` is the layer's `head_dim`, which is *not* `rotary_dim`
     /// once the rotation is partial: a full-attention head is 512 wide and
@@ -702,10 +702,10 @@ impl Shape {
                 .unwrap_or(0) as u32,
             layer_types,
             // `Acc` (Q32.32) bits, not Q16.16: the canonical `rms_norm` takes its
-            // epsilon in accumulator units. Encoded through the reference's own
+            // epsilon in accumulator units. Encoded through local
             // `f32_to_acc` so it is the same value, not a near one — 1e-6 in
             // Q16.16 rounds to zero, which is how this was silently disabled.
-            norm_eps: raster_inference::shared::numerics::det_num::f32_to_acc(
+            norm_eps: det_num::f32_to_acc(
                 text.get("rms_norm_eps")
                     .and_then(serde_json::Value::as_f64)
                     .unwrap_or(1e-6) as f32,
@@ -1123,12 +1123,9 @@ fn write_embedding(
         &EmbeddingTable {
             hidden_size: shape.hidden as u32,
             // Gemma scales token embeddings by sqrt(hidden) before layer 0. Converted
-            // by the reference's own `f32_to_act` so the committed bits match the
+            // by local `f32_to_act` so the committed bits match the
             // deterministic path exactly rather than approximately.
-            embedding_scale: raster_inference::shared::numerics::det_num::f32_to_act(
-                (shape.hidden as f32).sqrt(),
-            )
-            .to_bits(),
+            embedding_scale: det_num::f32_to_act((shape.hidden as f32).sqrt()).to_bits(),
             values: paged_i32s(&values).map_err(|error| error.to_string())?,
         },
         "raster-stages/input-embedding",

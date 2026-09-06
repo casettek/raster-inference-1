@@ -10,9 +10,10 @@ name = "model-import"
 path = "src/main.rs"
 
 [dependencies]
+det-num = { path = "../det-num" }
 detwgt = { path = "../detwgt" }
 inference-artifacts = { path = "../inference-artifacts" }
-raster = { path = "../../../../raster/crates/raster" }
+raster = { path = "../../../raster/crates/raster" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
@@ -21,7 +22,3 @@ sha2 = "0.10"
 # and the replay guest have to agree on byte-for-byte, and two copies of it is
 # exactly how they would silently drift into different buckets.
 prompt-prepare = { path = "../../raster-stages/prompt-prepare" }
-# Host-side only, and only for `f32_to_act`: the embedding scale must land on the
-# exact same Q16.16 bits the reference uses, and the conversion has rounding and
-# saturation rules worth not re-deriving. Not linked into any guest.
-raster-inference = { path = "../../../../raster-inference" }

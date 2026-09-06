@@ -11,7 +11,7 @@
   "import": {
     "prompt": "hello raster",
     "raw_prompt": false,
-    "tokens": 3
+    "tokens": 1
   },
   "prompt": {
     "rendered_prompt": "<bos><|turn>user\nhello raster<turn|>\n<|turn>model\n",
@@ -108,9 +108,5 @@
     "ple_projection_scalar": 1672,
     "ple_input_scale": 46341,
     "final_logit_softcap": 1966080
-  },
-  "provenance": {
-    "raster_manifest_path": "../Raster.toml",
-    "raster_manifest_sha256": "e61cfbf1fd63306e1c2ec5fa7a0910a39d22fb80b5d6170079f60391f75cb25c"
   }
 }
