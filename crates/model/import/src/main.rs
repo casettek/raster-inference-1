@@ -21,7 +21,7 @@ use externals::*;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Q16.16 one.
 const ONE: i32 = 1 << 16;
@@ -41,6 +41,11 @@ pub struct ImportConfig {
     pub model_dir: PathBuf,
     /// Write the complete chain manifest here instead of printing it.
     pub manifest: Option<PathBuf>,
+    /// Root directory for reusable imported model artifacts.
+    pub artifact_root: PathBuf,
+    /// Stable model-scoped artifact directory name. Defaults to the model bundle
+    /// directory name.
+    pub model_id: Option<String>,
     /// Rewrite only the tokenizer externals, leaving the weight externals
     /// alone. The weights are ~9 GB and depend on nothing the tokenizer
     /// touches, so a prompt or vocabulary-layout change has no reason to
@@ -80,6 +85,8 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<(), Box<d
 fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<ImportConfig, Box<dyn Error>> {
     let mut model_dir = None;
     let mut manifest = None;
+    let mut artifact_root = PathBuf::from(inference_artifacts::MODEL_ARTIFACTS_DIR);
+    let mut model_id = None;
     let mut only_tokenizer = false;
     let mut only_layers = false;
     let mut only_embedding = false;
@@ -90,6 +97,16 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<ImportConfi
         match arg.as_str() {
             "--model" => model_dir = args.next().map(PathBuf::from),
             "--manifest" => manifest = args.next().map(PathBuf::from),
+            "--artifact-root" => {
+                artifact_root = args
+                    .next()
+                    .map(PathBuf::from)
+                    .ok_or("--artifact-root <dir> is required")?
+            }
+            "--model-id" => {
+                let raw = args.next().ok_or("--model-id <id> is required")?;
+                model_id = Some(sanitize_model_id(&raw));
+            }
             "--only-tokenizer" => only_tokenizer = true,
             "--only-layers" => only_layers = true,
             "--only-embedding" => only_embedding = true,
@@ -104,6 +121,8 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<ImportConfi
     Ok(ImportConfig {
         model_dir: model_dir.ok_or("--model <bundle-dir> is required")?,
         manifest,
+        artifact_root,
+        model_id,
         only_tokenizer,
         only_layers,
         only_embedding,
@@ -112,7 +131,87 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<ImportConfi
     })
 }
 
+impl ImportConfig {
+    pub fn model_id(&self) -> String {
+        self.model_id
+            .clone()
+            .unwrap_or_else(|| default_model_id(&self.model_dir))
+    }
+
+    pub fn artifact_dir(&self) -> PathBuf {
+        self.artifact_root.join(self.model_id())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactLayout {
+    model_dir: PathBuf,
+}
+
+impl ArtifactLayout {
+    fn from_config(args: &ImportConfig) -> Self {
+        Self {
+            model_dir: args.artifact_dir(),
+        }
+    }
+
+    fn external_path(&self, stage_dir: &str, name: &str, extension: &str) -> PathBuf {
+        self.external_dir(stage_dir)
+            .join(format!("{name}.{extension}"))
+    }
+
+    fn external_dir(&self, stage_dir: &str) -> PathBuf {
+        self.model_dir
+            .join("raster")
+            .join(stage_artifact_dir_name(stage_dir))
+    }
+}
+
+fn default_model_id(model_dir: &Path) -> String {
+    let name = model_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model");
+    sanitize_model_id(name)
+}
+
+fn sanitize_model_id(raw: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in raw.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.') {
+            ch
+        } else {
+            '-'
+        };
+        if mapped == '-' {
+            if !last_dash {
+                out.push(mapped);
+            }
+            last_dash = true;
+        } else {
+            out.push(mapped);
+            last_dash = false;
+        }
+    }
+    let trimmed = out.trim_matches(&['-', '_', '.'][..]);
+    if trimmed.is_empty() {
+        String::from("model")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn stage_artifact_dir_name(stage_dir: &str) -> String {
+    Path::new(stage_dir)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(stage_dir)
+        .to_string()
+}
+
 pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> {
+    let layout = ArtifactLayout::from_config(&args);
     let tokenizer: serde_json::Value =
         serde_json::from_slice(&fs::read(args.model_dir.join("tokenizer.json"))?)?;
 
@@ -143,7 +242,7 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
 
     if args.only_tokenizer {
         let mut stages = Vec::new();
-        let decoder_commitment = write_tokenizer(&tokenizer, &eos_ids, &mut stages)?;
+        let decoder_commitment = write_tokenizer(&tokenizer, &eos_ids, &layout, &mut stages)?;
         println!();
         println!("# ---- replaces tokenizer and decoder externals in the root Raster.toml ----");
         for stage in &stages {
@@ -155,12 +254,13 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
             "{}",
             external_line(
                 "decoder",
+                &layout,
                 "raster-stages/output-finalize",
                 "decoder",
                 &decoder_commitment
             )
         );
-        direct_manifest::warn_partial_direct_manifest_not_refreshed();
+        direct_manifest::warn_partial_direct_manifest_not_refreshed(&args);
         return Ok(ImportResult {
             manifest_path: None,
             manifest_text: None,
@@ -178,14 +278,14 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
     if args.only_ple {
         let shape = Shape::from_config(text)?;
         let mut stages = Vec::new();
-        write_ple_layers(&weights, &shape, &mut stages)?;
+        write_ple_layers(&weights, &shape, &layout, &mut stages)?;
         println!();
         println!("# ---- replaces the prefill_prepare_aux_* stages in the root Raster.toml ----");
         for stage in &stages {
             println!();
             print!("{stage}");
         }
-        direct_manifest::warn_partial_direct_manifest_not_refreshed();
+        direct_manifest::warn_partial_direct_manifest_not_refreshed(&args);
         return Ok(ImportResult {
             manifest_path: None,
             manifest_text: None,
@@ -196,14 +296,14 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
     if args.only_embedding {
         let shape = Shape::from_config(text)?;
         let mut stages = Vec::new();
-        write_embedding(&weights, &shape, &mut stages)?;
+        write_embedding(&weights, &shape, &layout, &mut stages)?;
         println!();
         println!("# ---- replaces the input_embedding stage in the root Raster.toml ----");
         for stage in &stages {
             println!();
             print!("{stage}");
         }
-        direct_manifest::warn_partial_direct_manifest_not_refreshed();
+        direct_manifest::warn_partial_direct_manifest_not_refreshed(&args);
         return Ok(ImportResult {
             manifest_path: None,
             manifest_text: None,
@@ -214,14 +314,14 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
     if args.only_layers {
         let shape = Shape::from_config(text)?;
         let mut stages = Vec::new();
-        write_transformer_layers(&weights, &shape, &mut stages)?;
+        write_transformer_layers(&weights, &shape, &layout, &mut stages)?;
         println!();
         println!("# ---- replaces the prefill_range_* stages in the root Raster.toml ----");
         for stage in &stages {
             println!();
             print!("{stage}");
         }
-        direct_manifest::warn_partial_direct_manifest_not_refreshed();
+        direct_manifest::warn_partial_direct_manifest_not_refreshed(&args);
         return Ok(ImportResult {
             manifest_path: None,
             manifest_text: None,
@@ -239,20 +339,26 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
     println!();
 
     let mut stages = Vec::new();
-    let decoder_commitment = write_tokenizer(&tokenizer, &eos_ids, &mut stages)?;
-    write_embedding(&weights, &shape, &mut stages)?;
-    write_ple_layers(&weights, &shape, &mut stages)?;
-    write_transformer_layers(&weights, &shape, &mut stages)?;
-    write_head(&weights, &shape, text, &mut stages)?;
+    let decoder_commitment = write_tokenizer(&tokenizer, &eos_ids, &layout, &mut stages)?;
+    write_embedding(&weights, &shape, &layout, &mut stages)?;
+    write_ple_layers(&weights, &shape, &layout, &mut stages)?;
+    write_transformer_layers(&weights, &shape, &layout, &mut stages)?;
+    write_head(&weights, &shape, text, &layout, &mut stages)?;
 
     let mut manifest =
         String::from("[chain]\nname = \"raster-chain-inference\"\nversion = \"0.1.0\"\n");
-    manifest.push_str(&indexed_model_inputs(&shape, &stages)?);
+    manifest.push_str(&indexed_model_inputs(&shape, &layout, &stages)?);
     for stage in &stages {
         manifest.push('\n');
         manifest.push_str(stage);
     }
-    manifest.push_str(&generation_stages(&shape, &decoder_commitment, 0, &stages)?);
+    manifest.push_str(&generation_stages(
+        &shape,
+        &layout,
+        &decoder_commitment,
+        0,
+        &stages,
+    )?);
     let stage_count = stages.len();
     if let Some(path) = args.manifest.as_ref() {
         fs::write(path, &manifest)?;
@@ -310,7 +416,11 @@ fn stage_external_commitment(
 
 /// Declares model weights once so every decode iteration can bind them by its
 /// static layer index without copying commitments into the repeat block.
-fn indexed_model_inputs(shape: &Shape, stages: &[String]) -> Result<String, Box<dyn Error>> {
+fn indexed_model_inputs(
+    shape: &Shape,
+    layout: &ArtifactLayout,
+    stages: &[String],
+) -> Result<String, Box<dyn Error>> {
     let aux = (0..shape.layers)
         .map(|layer| {
             stage_external_commitment(stages, &format!("prefill_prepare_aux_l{layer}"), "layer")
@@ -326,11 +436,13 @@ fn indexed_model_inputs(shape: &Shape, stages: &[String]) -> Result<String, Box<
             .map(|(index, commitment)| format!("  \"{commitment}\", # l{index}"))
             .collect::<Vec<_>>()
             .join("\n");
+        let path = path_string(&layout.external_path(dir, "layer{l}", "rastered"));
+        let index_path = path_string(&layout.external_path(dir, "layer{l}", "rindex"));
         format!(
             "\n[chain.input.{name}]\n\
              index = \"l\"\n\
-             path = \"{dir}/layer{{l}}.rastered\"\n\
-             index_path = \"{dir}/layer{{l}}.rindex\"\n\
+             path = \"{path}\"\n\
+             index_path = \"{index_path}\"\n\
              commitments = [\n{entries}\n]\n"
         )
     };
@@ -349,6 +461,7 @@ fn indexed_model_inputs(shape: &Shape, stages: &[String]) -> Result<String, Box<
 /// Expansion still produces one auditable chain stage per program invocation.
 fn generation_stages(
     shape: &Shape,
+    layout: &ArtifactLayout,
     decoder_commitment: &str,
     tokens: u32,
     prefill_stages: &[String],
@@ -395,7 +508,9 @@ fn generation_stages(
          inputs.selected = { from = \"decode_select_t{t}\" }\n",
     );
     out.push_str(&format!(
-        "  inputs.embedding = {{ external = {{ path = \"raster-stages/input-embedding/embedding.rastered\", index_path = \"raster-stages/input-embedding/embedding.rindex\", commitment = \"{embedding}\" }} }}\n"
+        "  inputs.embedding = {{ external = {{ path = {:?}, index_path = {:?}, commitment = \"{embedding}\" }} }}\n",
+        path_string(&layout.external_path("raster-stages/input-embedding", "embedding", "rastered")),
+        path_string(&layout.external_path("raster-stages/input-embedding", "embedding", "rindex")),
     ));
     out.push_str(&format!(
         "\n  [[chain.repeat.stage]]\n\
@@ -455,15 +570,18 @@ fn generation_stages(
          name = \"decode_finalize_t{{t}}\"\n\
          project = \"raster-stages/prefill-finalize\"\n\
          inputs.activations = {{ from = \"decode_range_t{{t}}_l{}\" }}\n\
-         inputs.head = {{ external = {{ path = \"raster-stages/prefill-finalize/head.rastered\", index_path = \"raster-stages/prefill-finalize/head.rindex\", commitment = \"{head}\" }} }}\n\
+         inputs.head = {{ external = {{ path = {:?}, index_path = {:?}, commitment = \"{head}\" }} }}\n\
          \n[[chain.stage]]\n\
          name = \"output_finalize\"\n\
          project = \"raster-stages/output-finalize\"\n\
          inputs.edge = {{ from = \"decode.edge\" }}\n\
          {}",
         shape.layers - 1,
+        path_string(&layout.external_path("raster-stages/prefill-finalize", "head", "rastered")),
+        path_string(&layout.external_path("raster-stages/prefill-finalize", "head", "rindex")),
         external_line(
             "decoder",
+            layout,
             "raster-stages/output-finalize",
             "decoder",
             decoder_commitment
@@ -697,6 +815,7 @@ fn load_eos_ids(model_dir: &Path) -> std::collections::BTreeSet<u32> {
 fn write_tokenizer(
     tokenizer: &serde_json::Value,
     eos_ids: &std::collections::BTreeSet<u32>,
+    layout: &ArtifactLayout,
     stages: &mut Vec<String>,
 ) -> Result<String, Box<dyn Error>> {
     let model = tokenizer
@@ -750,6 +869,7 @@ fn write_tokenizer(
         &DecoderTable {
             tokens: decoder_tokens.into(),
         },
+        layout,
         "raster-stages/output-finalize",
         "decoder",
     )?;
@@ -786,11 +906,13 @@ fn write_tokenizer(
             vocab_buckets: vocab_buckets.into(),
             merge_buckets: merge_buckets.into(),
         },
+        layout,
         "raster-stages/prompt-prepare",
         "tokenizer",
     )?;
     write_stage_fixtures(
         "raster-stages/prompt-prepare",
+        layout,
         &[("tokenizer", "tokenizer", &tokenizer_commitment)],
     )?;
 
@@ -804,12 +926,14 @@ fn write_tokenizer(
         ),
         external_line(
             "tokenizer",
+            layout,
             "raster-stages/prompt-prepare",
             "tokenizer",
             &tokenizer_commitment
         ),
         external_line(
             "initial_pieces",
+            layout,
             "target/raster-inference/run-prompt-placeholder",
             "initial_pieces",
             INITIAL_PIECES_PLACEHOLDER_COMMITMENT
@@ -920,6 +1044,7 @@ fn parse_merge(rank: u32, entry: &serde_json::Value) -> Option<BpeMerge> {
 fn write_embedding(
     weights: &detwgt::Artifact,
     shape: &Shape,
+    layout: &ArtifactLayout,
     stages: &mut Vec<String>,
 ) -> Result<(), Box<dyn Error>> {
     let embed = weights.get("model.language_model.embed_tokens.weight")?;
@@ -937,6 +1062,7 @@ fn write_embedding(
             embedding_scale: det_num::f32_to_act((shape.hidden as f32).sqrt()).to_bits(),
             values: paged_i32s(&values).map_err(|error| error.to_string())?,
         },
+        layout,
         "raster-stages/input-embedding",
         "embedding",
     )?;
@@ -951,6 +1077,7 @@ fn write_embedding(
         ),
         external_line(
             "embedding",
+            layout,
             "raster-stages/input-embedding",
             "embedding",
             &commitment
@@ -966,6 +1093,7 @@ fn write_embedding(
 fn write_ple_layers(
     weights: &detwgt::Artifact,
     shape: &Shape,
+    layout: &ArtifactLayout,
     stages: &mut Vec<String>,
 ) -> Result<(), Box<dyn Error>> {
     let per_layer = weights.get("model.language_model.embed_tokens_per_layer.weight")?;
@@ -1001,7 +1129,8 @@ fn write_ple_layers(
         };
 
         let name = format!("layer{layer_idx}");
-        let commitment = write_external(&layer, "raster-stages/prefill-prepare-aux", &name)?;
+        let commitment =
+            write_external(&layer, layout, "raster-stages/prefill-prepare-aux", &name)?;
         stages.push(format!(
             concat!(
                 "[[chain.stage]]\n",
@@ -1013,6 +1142,7 @@ fn write_ple_layers(
             idx = layer_idx,
             line = external_line(
                 "layer",
+                layout,
                 "raster-stages/prefill-prepare-aux",
                 &name,
                 &commitment
@@ -1029,6 +1159,7 @@ fn write_ple_layers(
 fn write_transformer_layers(
     weights: &detwgt::Artifact,
     shape: &Shape,
+    layout: &ArtifactLayout,
     stages: &mut Vec<String>,
 ) -> Result<(), Box<dyn Error>> {
     // Report the two RoPE families once. These are the numbers that silently
@@ -1171,7 +1302,7 @@ fn write_transformer_layers(
         };
 
         let name = format!("layer{layer_idx}");
-        let commitment = write_external(&layer, "raster-stages/prefill-range", &name)?;
+        let commitment = write_external(&layer, layout, "raster-stages/prefill-range", &name)?;
         let upstream = if layer_idx == 0 {
             "input_embedding".to_string()
         } else {
@@ -1213,7 +1344,13 @@ fn write_transformer_layers(
             upstream = upstream,
             donor_a = donor_a,
             donor_b = donor_b,
-            line = external_line("layer", "raster-stages/prefill-range", &name, &commitment)
+            line = external_line(
+                "layer",
+                layout,
+                "raster-stages/prefill-range",
+                &name,
+                &commitment,
+            )
         ));
     }
     Ok(())
@@ -1239,6 +1376,7 @@ fn write_head(
     weights: &detwgt::Artifact,
     shape: &Shape,
     text: &serde_json::Value,
+    layout: &ArtifactLayout,
     stages: &mut Vec<String>,
 ) -> Result<(), Box<dyn Error>> {
     let tied = text
@@ -1273,6 +1411,7 @@ fn write_head(
             },
             projection: paged_i32s(&rows).map_err(|error| error.to_string())?,
         },
+        layout,
         "raster-stages/prefill-finalize",
         "head",
     )?;
@@ -1288,6 +1427,7 @@ fn write_head(
         last = shape.layers - 1,
         line = external_line(
             "head",
+            layout,
             "raster-stages/prefill-finalize",
             "head",
             &commitment
@@ -1300,17 +1440,21 @@ fn write_head(
 
 fn write_external<T: serde::Serialize>(
     value: &T,
+    layout: &ArtifactLayout,
     stage_dir: &str,
     name: &str,
 ) -> Result<String, Box<dyn Error>> {
-    let dir = Path::new(stage_dir);
-    fs::create_dir_all(dir)?;
+    let dir = layout.external_dir(stage_dir);
+    fs::create_dir_all(&dir)?;
     let commitment = raster::write_raster_files(
         value,
         &dir.join(format!("{name}.rastered")),
         &dir.join(format!("{name}.rindex")),
     )?;
-    println!("wrote {stage_dir}/{name}.rastered  commitment = {commitment}");
+    println!(
+        "wrote {}  commitment = {commitment}",
+        layout.external_path(stage_dir, name, "rastered").display()
+    );
     Ok(commitment)
 }
 
@@ -1318,6 +1462,7 @@ fn write_external<T: serde::Serialize>(
 /// on its own with `cargo raster run`.
 fn write_stage_fixtures(
     stage_dir: &str,
+    layout: &ArtifactLayout,
     params: &[(&str, &str, &String)],
 ) -> Result<(), Box<dyn Error>> {
     let entries = |render: &dyn Fn(&str, &str, &str) -> String| -> String {
@@ -1328,7 +1473,15 @@ fn write_stage_fixtures(
             .join(",\n")
     };
     let input_json = entries(&|param, name, _| {
-        format!("  \"{param}\": {{ \"path\": \"{name}.rastered\", \"index_path\": \"{name}.rindex\", \"load_preference\": \"read\" }}")
+        let data_path = layout.external_path(stage_dir, name, "rastered");
+        let index_path = layout.external_path(stage_dir, name, "rindex");
+        let stage_relative_data = path_from_dir(Path::new(stage_dir), &data_path);
+        let stage_relative_index = path_from_dir(Path::new(stage_dir), &index_path);
+        format!(
+            "  \"{param}\": {{ \"path\": {:?}, \"index_path\": {:?}, \"load_preference\": \"read\" }}",
+            path_string(&stage_relative_data),
+            path_string(&stage_relative_index)
+        )
     });
     let manifest_json = entries(&|param, _, commitment| {
         format!("  \"{param}\": {{ \"type\": \"sha256\", \"encoding\": \"raster\", \"commitment\": \"{commitment}\" }}")
@@ -1343,10 +1496,46 @@ fn write_stage_fixtures(
     Ok(())
 }
 
-fn external_line(param: &str, stage_dir: &str, name: &str, commitment: &str) -> String {
+fn external_line(
+    param: &str,
+    layout: &ArtifactLayout,
+    stage_dir: &str,
+    name: &str,
+    commitment: &str,
+) -> String {
+    let (data_path, index_path) = if stage_dir.starts_with("raster-stages/") {
+        (
+            layout.external_path(stage_dir, name, "rastered"),
+            layout.external_path(stage_dir, name, "rindex"),
+        )
+    } else {
+        (
+            Path::new(stage_dir).join(format!("{name}.rastered")),
+            Path::new(stage_dir).join(format!("{name}.rindex")),
+        )
+    };
     format!(
-        "inputs.{param} = {{ external = {{ path = \"{stage_dir}/{name}.rastered\", index_path = \"{stage_dir}/{name}.rindex\", commitment = \"{commitment}\" }} }}\n"
+        "inputs.{param} = {{ external = {{ path = {:?}, index_path = {:?}, commitment = \"{commitment}\" }} }}\n",
+        path_string(&data_path),
+        path_string(&index_path),
     )
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn path_from_dir(base_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let mut relative = PathBuf::new();
+    for component in base_dir.components() {
+        if matches!(component, Component::Normal(_)) {
+            relative.push("..");
+        }
+    }
+    relative.join(path)
 }
 
 #[cfg(test)]
@@ -1373,6 +1562,8 @@ mod tests {
             ImportConfig {
                 model_dir: PathBuf::from("fixtures/model"),
                 manifest: Some(PathBuf::from("Raster.toml")),
+                artifact_root: PathBuf::from(inference_artifacts::MODEL_ARTIFACTS_DIR),
+                model_id: None,
                 only_tokenizer: true,
                 only_layers: false,
                 only_embedding: true,
@@ -1393,6 +1584,116 @@ mod tests {
         assert!(!config.only_layers);
         assert!(!config.only_embedding);
         assert!(!config.only_ple);
+    }
+
+    #[test]
+    fn parse_args_accepts_artifact_layout_options() {
+        let config = parse_args_from(
+            [
+                "--model",
+                "fixtures/google/gemma-4",
+                "--artifact-root",
+                "runtime/models",
+                "--model-id",
+                "google/gemma 4",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+
+        assert_eq!(config.artifact_root, PathBuf::from("runtime/models"));
+        assert_eq!(config.model_id.as_deref(), Some("google-gemma-4"));
+        assert_eq!(
+            config.artifact_dir(),
+            PathBuf::from("runtime/models/google-gemma-4")
+        );
+    }
+
+    #[test]
+    fn external_lines_use_model_scoped_raster_paths() {
+        let config = ImportConfig {
+            model_dir: PathBuf::from("fixtures/model"),
+            manifest: None,
+            artifact_root: PathBuf::from("runtime/model-artifacts"),
+            model_id: Some(String::from("gemma")),
+            only_tokenizer: false,
+            only_layers: false,
+            only_embedding: false,
+            only_ple: false,
+            only_direct: false,
+        };
+        let layout = ArtifactLayout::from_config(&config);
+
+        let line = external_line(
+            "embedding",
+            &layout,
+            "raster-stages/input-embedding",
+            "embedding",
+            "abc",
+        );
+
+        assert!(line.contains(
+            r#"path = "runtime/model-artifacts/gemma/raster/input-embedding/embedding.rastered""#
+        ));
+        assert!(line.contains(
+            r#"index_path = "runtime/model-artifacts/gemma/raster/input-embedding/embedding.rindex""#
+        ));
+    }
+
+    #[test]
+    fn run_specific_prompt_placeholder_stays_outside_model_artifacts() {
+        let config = ImportConfig {
+            model_dir: PathBuf::from("fixtures/model"),
+            manifest: None,
+            artifact_root: PathBuf::from("runtime/model-artifacts"),
+            model_id: Some(String::from("gemma")),
+            only_tokenizer: false,
+            only_layers: false,
+            only_embedding: false,
+            only_ple: false,
+            only_direct: false,
+        };
+        let layout = ArtifactLayout::from_config(&config);
+
+        let line = external_line(
+            "initial_pieces",
+            &layout,
+            "target/raster-inference/run-prompt-placeholder",
+            "initial_pieces",
+            "abc",
+        );
+
+        assert!(line.contains(
+            r#"path = "target/raster-inference/run-prompt-placeholder/initial_pieces.rastered""#
+        ));
+        assert!(!line.contains("runtime/model-artifacts"));
+    }
+
+    #[test]
+    fn stage_fixture_paths_are_relative_to_stage_dir() {
+        let config = ImportConfig {
+            model_dir: PathBuf::from("fixtures/model"),
+            manifest: None,
+            artifact_root: PathBuf::from("runtime/model-artifacts"),
+            model_id: Some(String::from("gemma")),
+            only_tokenizer: false,
+            only_layers: false,
+            only_embedding: false,
+            only_ple: false,
+            only_direct: false,
+        };
+        let layout = ArtifactLayout::from_config(&config);
+        let path = path_from_dir(
+            Path::new("raster-stages/input-embedding"),
+            &layout.external_path("raster-stages/input-embedding", "embedding", "rastered"),
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "../../runtime/model-artifacts/gemma/raster/input-embedding/embedding.rastered"
+            )
+        );
     }
 
     #[test]

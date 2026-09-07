@@ -1,4 +1,12 @@
 {
-  "tokenizer": { "path": "tokenizer.rastered", "index_path": "tokenizer.rindex", "load_preference": "read" },
-  "initial_pieces": { "path": "initial_pieces.rastered", "index_path": "initial_pieces.rindex", "load_preference": "read" }
+  "tokenizer": {
+    "path": "../../runtime/model-artifacts/gemma-4-E2B-detwgt/raster/prompt-prepare/tokenizer.rastered",
+    "index_path": "../../runtime/model-artifacts/gemma-4-E2B-detwgt/raster/prompt-prepare/tokenizer.rindex",
+    "load_preference": "read"
+  },
+  "initial_pieces": {
+    "path": "../../runtime/prompt-fixtures/default/initial_pieces.rastered",
+    "index_path": "../../runtime/prompt-fixtures/default/initial_pieces.rindex",
+    "load_preference": "read"
+  }
 }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use inference_artifacts::{
     write_json, DirectInferBundle, DirectInferProvenance, DirectInferShape, ModelManifest,
-    MODEL_ARTIFACTS_DIR, MODEL_MANIFEST_JSON,
+    MODEL_MANIFEST_JSON,
 };
 use sha2::{Digest, Sha256};
 
@@ -18,7 +18,8 @@ pub fn write_model_manifest(
     text_config: &serde_json::Value,
     raster_manifest: Option<(&Path, &str)>,
 ) -> Result<PathBuf, Box<dyn Error>> {
-    let artifact_dir = PathBuf::from(MODEL_ARTIFACTS_DIR);
+    let artifact_dir = args.artifact_dir();
+    fs::create_dir_all(&artifact_dir)?;
     let manifest_path = artifact_dir.join(MODEL_MANIFEST_JSON);
     let model_detwgt = args.model_dir.join("model.detwgt");
     let config = args.model_dir.join("config.json");
@@ -73,10 +74,11 @@ pub fn write_model_manifest(
     Ok(manifest_path)
 }
 
-pub fn warn_partial_direct_manifest_not_refreshed() {
+pub fn warn_partial_direct_manifest_not_refreshed(args: &ImportConfig) {
     eprintln!(
         "model manifest not refreshed; run a full `raster-inference model import ...` \
-         to regenerate {MODEL_ARTIFACTS_DIR}/{MODEL_MANIFEST_JSON}"
+         to regenerate {}",
+        args.artifact_dir().join(MODEL_MANIFEST_JSON).display()
     );
 }
 

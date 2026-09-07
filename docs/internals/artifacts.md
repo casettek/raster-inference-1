@@ -4,12 +4,23 @@ The stable contract types and filenames live in `crates/inference/artifacts`.
 
 ## Model And Run Specs
 
-`model-artifacts/manifest.json` records reusable model setup:
+`runtime/model-artifacts/<model-id>/manifest.json` records reusable model setup:
 
 - Model, config, and tokenizer paths plus SHA-256 hashes.
 - Model shape and fixed-point scaling parameters.
 - EOS token ids.
 - Optional provenance pointing back to the prompt-free Raster manifest template used during import.
+
+The same model-scoped directory owns the imported Raster externals under
+`runtime/model-artifacts/<model-id>/raster/`. Stage program directories remain
+under `raster-stages/*`; chain manifests bind those programs to explicit
+external `path` / `index_path` entries in the model artifact directory.
+
+Prompt-specific inputs are not model artifacts. `initial_pieces` is generated
+from each run's prompt under `target/raster-inference/runs/<run-id>/prompt/`,
+and prompt-free chain templates use a `target/raster-inference/run-prompt-placeholder/`
+binding that run preparation replaces. The standalone prompt-prepare fixture
+can point at `runtime/prompt-fixtures/default/` for local stage smoke tests.
 
 `inference.toml` records run-time inputs:
 

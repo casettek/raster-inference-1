@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const MODEL_ARTIFACTS_DIR: &str = "model-artifacts";
+pub const MODEL_ARTIFACTS_DIR: &str = "runtime/model-artifacts";
 pub const MODEL_MANIFEST_JSON: &str = "manifest.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,6 +1,6 @@
 # Infer Workflow
 
-`infer` is the fast deterministic path. It uses `direct-infer`, reads a run spec such as `inference.toml`, loads the referenced `model-artifacts/manifest.json`, and does not write staged checkpoint artifacts.
+`infer` is the fast deterministic path. It uses `direct-infer`, reads a run spec such as `inference.toml`, loads the referenced `runtime/model-artifacts/<model-id>/manifest.json`, and does not write staged checkpoint artifacts.
 
 ```bash
 cargo run --release -p raster-inference-cli -- infer --run inference.toml

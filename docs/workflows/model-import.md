@@ -16,12 +16,18 @@ Inputs:
 Outputs:
 
 - Root `Raster.toml`, a prompt-free chain manifest template.
-- Stage externals under `raster-stages/*`, written as `.rastered` and `.rindex` pairs with manifest commitments.
-- `model-artifacts/manifest.json`, the prompt-free model manifest consumed by run specs.
+- Reusable Raster externals under `runtime/model-artifacts/<model-id>/raster/*`, written as `.rastered` and `.rindex` pairs with manifest commitments.
+- `runtime/model-artifacts/<model-id>/manifest.json`, the prompt-free model manifest consumed by run specs.
+
+By default, `<model-id>` is the sanitized model bundle directory name. Pass `--model-id <id>` to choose it explicitly, or `--artifact-root <dir>` to place model-scoped artifact directories somewhere other than `runtime/model-artifacts`.
+
+`initial_pieces` is deliberately not imported with the model. It is generated
+from each prompt during run preparation and written under that run's `prompt/`
+directory.
 
 Useful partial modes:
 
-- `--only-direct`: refresh only `model-artifacts/manifest.json`.
+- `--only-direct`: refresh only `runtime/model-artifacts/<model-id>/manifest.json`.
 - `--only-tokenizer`: refresh tokenizer/decoder externals.
 - `--only-layers`, `--only-embedding`, `--only-ple`: refresh targeted weight externals.
 

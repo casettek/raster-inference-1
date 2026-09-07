@@ -2,7 +2,7 @@
 
 `raster-chain-inference` runs Gemma inference in three developer-facing modes over the same imported model inputs:
 
-- `infer`: fast deterministic inference from a run spec and `model-artifacts/manifest.json`.
+- `infer`: fast deterministic inference from a run spec and `runtime/model-artifacts/<model-id>/manifest.json`.
 - `claim build`: a checkpointed deterministic rerun that emits a compact claim.
 - `challenge build`: verifier rerun from a claim trace, divergence detection, and Raster replay of the first divergent stage.
 
@@ -70,8 +70,9 @@ crates/
     kernels/                # shared deterministic inference kernels
   det-num/                  # deterministic numeric primitives
 raster-stages/              # verifiable Raster program crates
+runtime/                    # imported model artifacts, prompt fixtures, generated manifest examples
 manifests/                  # alternate generated manifests and examples
 docs/                       # workflow, internals, issues, proposals
 ```
 
-`raster-stages/*` are intentionally left outside `crates/`: each directory is a Raster program boundary with its own `Cargo.toml`, `Raster.lock`, no-std tile library, and sequence entry point. The root `Raster.toml` is a chain manifest with a `[chain]` table and no `[program]` table.
+`raster-stages/*` are intentionally left outside `crates/`: each directory is a Raster program boundary with its own `Cargo.toml`, `Raster.lock`, no-std tile library, and sequence entry point. Reusable imported model externals live under `runtime/model-artifacts/<model-id>/raster/`, prompt fixtures live under `runtime/prompt-fixtures/`, and generated chain manifests point each stage at the files it needs there. The root `Raster.toml` is a chain manifest with a `[chain]` table and no `[program]` table.

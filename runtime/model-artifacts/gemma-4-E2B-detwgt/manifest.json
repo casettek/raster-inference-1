@@ -71,7 +71,7 @@
     106
   ],
   "provenance": {
-    "raster_manifest_path": "../Raster.toml",
+    "raster_manifest_path": "../../../Raster.toml",
     "raster_manifest_sha256": "fixture"
   }
 }

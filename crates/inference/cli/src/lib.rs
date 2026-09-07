@@ -82,6 +82,10 @@ struct ModelImportArgs {
     model_dir: PathBuf,
     #[arg(long)]
     manifest: Option<PathBuf>,
+    #[arg(long = "artifact-root", default_value = inference_artifacts::MODEL_ARTIFACTS_DIR)]
+    artifact_root: PathBuf,
+    #[arg(long = "model-id")]
+    model_id: Option<String>,
     #[arg(long = "only-tokenizer")]
     only_tokenizer: bool,
     #[arg(long = "only-layers")]
@@ -720,6 +724,8 @@ impl ModelImportArgs {
         model_import::ImportConfig {
             model_dir: self.model_dir,
             manifest: self.manifest,
+            artifact_root: self.artifact_root,
+            model_id: self.model_id,
             only_tokenizer: self.only_tokenizer,
             only_layers: self.only_layers,
             only_embedding: self.only_embedding,
@@ -875,6 +881,8 @@ mod tests {
         let config = ModelImportArgs {
             model_dir: PathBuf::from("model"),
             manifest: Some(PathBuf::from("Raster.toml")),
+            artifact_root: PathBuf::from(inference_artifacts::MODEL_ARTIFACTS_DIR),
+            model_id: Some(String::from("gemma")),
             only_tokenizer: true,
             only_layers: false,
             only_embedding: true,
@@ -888,6 +896,8 @@ mod tests {
             model_import::ImportConfig {
                 model_dir: PathBuf::from("model"),
                 manifest: Some(PathBuf::from("Raster.toml")),
+                artifact_root: PathBuf::from(inference_artifacts::MODEL_ARTIFACTS_DIR),
+                model_id: Some(String::from("gemma")),
                 only_tokenizer: true,
                 only_layers: false,
                 only_embedding: true,

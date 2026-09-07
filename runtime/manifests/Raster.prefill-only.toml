@@ -28,7 +28,7 @@ commitments = [
 name = "prompt_prepare"
 project = "raster-stages/prompt-prepare"
 inputs.tokenizer = { external = { path = "raster-stages/prompt-prepare/tokenizer.rastered", index_path = "raster-stages/prompt-prepare/tokenizer.rindex", commitment = "104bec8091bc6d350e06c1697ef24e455a54f72a538e2e76e55f8233ee91fb02" } }
-inputs.initial_pieces = { external = { path = "raster-stages/prompt-prepare/initial_pieces.rastered", index_path = "raster-stages/prompt-prepare/initial_pieces.rindex", commitment = "06d581356d7a32bc4fe8b1be3520de2f42096e580c31bf3c421b61c285c6dbc1" } }
+inputs.initial_pieces = { external = { path = "target/raster-inference/run-prompt-placeholder/initial_pieces.rastered", index_path = "target/raster-inference/run-prompt-placeholder/initial_pieces.rindex", commitment = "0000000000000000000000000000000000000000000000000000000000000000" } }
 
 [[chain.stage]]
 name = "input_embedding"
