@@ -8,8 +8,8 @@ use direct_infer::view_kernels::score_next_token_view;
 use direct_infer::{DirectInferenceConfig, DirectInferenceExecutor};
 use host_kernels::tensor::{dot_bits, matvec_from_source, Matrix, MatrixSource};
 use inference_artifacts::{
-    write_json, DirectInferBundle, DirectInferImportSettings, DirectInferManifest,
-    DirectInferPrompt, DirectInferShape, DIRECT_INFER_ARTIFACTS_DIR, DIRECT_INFER_MANIFEST_JSON,
+    write_json, DirectInferBundle, DirectInferShape, InferenceRunSpec, ModelManifest,
+    INFERENCE_RUN_SPEC_TOML, MODEL_ARTIFACTS_DIR, MODEL_MANIFEST_JSON,
 };
 use input_embedding::input::EmbeddingTable;
 use output_finalize::input::{DecoderTable, DecoderToken};
@@ -38,14 +38,12 @@ fn direct_executor_reports_missing_direct_manifest_message() {
     let error = DirectInferenceExecutor
         .run(DirectInferenceConfig {
             base_dir: dir.clone(),
-            direct_manifest_path: dir
-                .join(DIRECT_INFER_ARTIFACTS_DIR)
-                .join(DIRECT_INFER_MANIFEST_JSON),
+            run_spec_path: dir.join(INFERENCE_RUN_SPEC_TOML),
         })
         .expect_err("missing manifest should fail");
 
     assert!(!format!("{error:#}").contains("scaffolded"));
-    assert!(format!("{error:#}").contains("raster-inference model import"));
+    assert!(format!("{error:#}").contains("failed to load run spec"));
 
     let _ = fs::remove_dir_all(dir);
 }
@@ -181,7 +179,7 @@ fn final_head_streaming_selection_matches_eager_tie_break() {
 #[test]
 fn direct_executor_runs_from_direct_manifest_without_raster_toml() {
     let dir = temp_dir("runtime");
-    let artifact_dir = dir.join(DIRECT_INFER_ARTIFACTS_DIR);
+    let artifact_dir = dir.join(MODEL_ARTIFACTS_DIR);
     fs::create_dir_all(&artifact_dir).unwrap();
 
     let detwgt = dir.join("model.detwgt");
@@ -213,15 +211,15 @@ fn direct_executor_runs_from_direct_manifest_without_raster_toml() {
     let tokenizer = dir.join("tokenizer.json");
     fs::write(
         &tokenizer,
-        r#"{"model":{"vocab":{"<pad>":0,"hello":1,"Hi":2},"merges":[]},"added_tokens":[]}"#,
+        r#"{"model":{"vocab":{"<pad>":0,"h":1,"Hi":2},"merges":[]},"added_tokens":[]}"#,
     )
     .unwrap();
 
-    let manifest_path = artifact_dir.join(DIRECT_INFER_MANIFEST_JSON);
+    let manifest_path = artifact_dir.join(MODEL_MANIFEST_JSON);
     write_json(
         &manifest_path,
-        &DirectInferManifest {
-            version: 1,
+        &ModelManifest {
+            version: 2,
             bundle: DirectInferBundle {
                 model_detwgt_path: PathBuf::from("../model.detwgt"),
                 model_detwgt_sha256: sha256_file(&detwgt),
@@ -229,16 +227,6 @@ fn direct_executor_runs_from_direct_manifest_without_raster_toml() {
                 config_sha256: sha256_file(&config),
                 tokenizer_path: PathBuf::from("../tokenizer.json"),
                 tokenizer_sha256: sha256_file(&tokenizer),
-            },
-            import: DirectInferImportSettings {
-                prompt: String::from("hello"),
-                raw_prompt: true,
-                tokens: 1,
-            },
-            prompt: DirectInferPrompt {
-                rendered_prompt: String::from("hello"),
-                initial_pieces: vec![String::from("hello"), String::from("</w>")],
-                eos_token_ids: Vec::new(),
             },
             shape: DirectInferShape {
                 hidden_size: 2,
@@ -262,15 +250,17 @@ fn direct_executor_runs_from_direct_manifest_without_raster_toml() {
                 ple_input_scale: ONE,
                 final_logit_softcap: 0,
             },
+            eos_token_ids: Vec::new(),
             provenance: None,
         },
     )
     .unwrap();
+    write_run_spec(&dir, &manifest_path, "h", 1);
 
     let result = DirectInferenceExecutor
         .run(DirectInferenceConfig {
             base_dir: dir.clone(),
-            direct_manifest_path: manifest_path,
+            run_spec_path: dir.join(INFERENCE_RUN_SPEC_TOML),
         })
         .unwrap();
 
@@ -290,13 +280,13 @@ fn direct_executor_runs_from_direct_manifest_without_raster_toml() {
 fn direct_executor_matches_uncheckpointed_staged_result() {
     let dir = temp_dir("parity");
     fs::create_dir_all(&dir).unwrap();
-    let manifest_path = write_direct_fixture(&dir);
+    let run_spec_path = write_direct_fixture(&dir);
     write_staged_fixture(&dir);
 
     let direct = DirectInferenceExecutor
         .run(DirectInferenceConfig {
             base_dir: dir.clone(),
-            direct_manifest_path: manifest_path,
+            run_spec_path,
         })
         .unwrap();
     let staged = UncheckpointedInferenceExecutor
@@ -358,7 +348,7 @@ fn write_detwgt(path: &Path, tensors: &[TensorFixture]) {
 }
 
 fn write_direct_fixture(dir: &Path) -> PathBuf {
-    let artifact_dir = dir.join(DIRECT_INFER_ARTIFACTS_DIR);
+    let artifact_dir = dir.join(MODEL_ARTIFACTS_DIR);
     fs::create_dir_all(&artifact_dir).unwrap();
     let detwgt = dir.join("model.detwgt");
     write_tiny_model_detwgt(&detwgt);
@@ -366,13 +356,13 @@ fn write_direct_fixture(dir: &Path) -> PathBuf {
     fs::write(&config, r#"{"text_config":{"tie_word_embeddings":false}}"#).unwrap();
     let tokenizer = dir.join("tokenizer.json");
     fs::write(&tokenizer, tiny_tokenizer_json()).unwrap();
-    let manifest_path = artifact_dir.join(DIRECT_INFER_MANIFEST_JSON);
+    let manifest_path = artifact_dir.join(MODEL_MANIFEST_JSON);
     write_json(
         &manifest_path,
         &tiny_direct_manifest(&detwgt, &config, &tokenizer),
     )
     .unwrap();
-    manifest_path
+    write_run_spec(dir, &manifest_path, "h", 1)
 }
 
 fn write_tiny_model_detwgt(path: &Path) {
@@ -401,9 +391,9 @@ fn write_tiny_model_detwgt(path: &Path) {
     );
 }
 
-fn tiny_direct_manifest(detwgt: &Path, config: &Path, tokenizer: &Path) -> DirectInferManifest {
-    DirectInferManifest {
-        version: 1,
+fn tiny_direct_manifest(detwgt: &Path, config: &Path, tokenizer: &Path) -> ModelManifest {
+    ModelManifest {
+        version: 2,
         bundle: DirectInferBundle {
             model_detwgt_path: PathBuf::from("../model.detwgt"),
             model_detwgt_sha256: sha256_file(detwgt),
@@ -411,16 +401,6 @@ fn tiny_direct_manifest(detwgt: &Path, config: &Path, tokenizer: &Path) -> Direc
             config_sha256: sha256_file(config),
             tokenizer_path: PathBuf::from("../tokenizer.json"),
             tokenizer_sha256: sha256_file(tokenizer),
-        },
-        import: DirectInferImportSettings {
-            prompt: String::from("hello"),
-            raw_prompt: true,
-            tokens: 1,
-        },
-        prompt: DirectInferPrompt {
-            rendered_prompt: String::from("hello"),
-            initial_pieces: vec![String::from("hello"), String::from("</w>")],
-            eos_token_ids: Vec::new(),
         },
         shape: DirectInferShape {
             hidden_size: 2,
@@ -444,14 +424,37 @@ fn tiny_direct_manifest(detwgt: &Path, config: &Path, tokenizer: &Path) -> Direc
             ple_input_scale: ONE,
             final_logit_softcap: 0,
         },
+        eos_token_ids: Vec::new(),
         provenance: None,
     }
+}
+
+fn write_run_spec(dir: &Path, manifest_path: &Path, prompt: &str, tokens: u32) -> PathBuf {
+    let path = dir.join(INFERENCE_RUN_SPEC_TOML);
+    let spec = InferenceRunSpec {
+        model_manifest: manifest_path.strip_prefix(dir).unwrap().to_path_buf(),
+        prompt: Some(prompt.to_string()),
+        prompt_file: None,
+        raw_prompt: true,
+        tokens,
+    };
+    fs::write(
+        &path,
+        format!(
+            "model_manifest = {:?}\nprompt = {:?}\nraw_prompt = true\ntokens = {}\n",
+            spec.model_manifest.to_string_lossy(),
+            prompt,
+            spec.tokens
+        ),
+    )
+    .unwrap();
+    path
 }
 
 fn write_staged_fixture(dir: &Path) {
     let tokenizer = tiny_prompt_tokenizer();
     let pieces = BpePieces {
-        pieces: List::from(vec![String::from("hello"), String::from("</w>")]),
+        pieces: List::from(vec![String::from("h"), String::from("</w>")]),
     };
     let embedding = EmbeddingTable {
         hidden_size: 2,
@@ -574,7 +577,7 @@ fn tiny_prompt_tokenizer() -> PromptTokenizer {
         merge_bucket_count: 1,
         vocab_buckets: List::from(vec![VocabBucket {
             entries: List::from(
-                [("<pad>", 0), ("hello", 1), ("Hi", 2)]
+                [("<pad>", 0), ("h", 1), ("Hi", 2)]
                     .into_iter()
                     .map(|(token, id)| TokenEntry {
                         token: token.to_string(),
@@ -589,7 +592,7 @@ fn tiny_prompt_tokenizer() -> PromptTokenizer {
 }
 
 fn tiny_tokenizer_json() -> &'static str {
-    r#"{"model":{"vocab":{"<pad>":0,"hello":1,"Hi":2},"merges":[]},"added_tokens":[]}"#
+    r#"{"model":{"vocab":{"<pad>":0,"h":1,"Hi":2},"merges":[]},"added_tokens":[]}"#
 }
 
 fn paged(values: &[i32]) -> Bytes<196_608> {

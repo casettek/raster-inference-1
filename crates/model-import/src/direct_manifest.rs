@@ -1,36 +1,31 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use inference_artifacts::{
-    write_json, DirectInferBundle, DirectInferImportSettings, DirectInferManifest,
-    DirectInferPrompt, DirectInferProvenance, DirectInferShape, DIRECT_INFER_ARTIFACTS_DIR,
-    DIRECT_INFER_MANIFEST_JSON,
+    write_json, DirectInferBundle, DirectInferProvenance, DirectInferShape, ModelManifest,
+    MODEL_ARTIFACTS_DIR, MODEL_MANIFEST_JSON,
 };
 use sha2::{Digest, Sha256};
 
-use super::{
-    det_act_bits, f32_to_q16, render_gemma_turns, split_prompt, supports_gemma_turns, ImportConfig,
-    Shape,
-};
+use super::{det_act_bits, f32_to_q16, ImportConfig, Shape};
 
-pub fn write_direct_manifest(
+pub fn write_model_manifest(
     args: &ImportConfig,
-    tokenizer: &serde_json::Value,
     eos_ids: &BTreeSet<u32>,
     shape: &Shape,
     text_config: &serde_json::Value,
     raster_manifest: Option<(&Path, &str)>,
 ) -> Result<PathBuf, Box<dyn Error>> {
-    let artifact_dir = PathBuf::from(DIRECT_INFER_ARTIFACTS_DIR);
-    let manifest_path = artifact_dir.join(DIRECT_INFER_MANIFEST_JSON);
+    let artifact_dir = PathBuf::from(MODEL_ARTIFACTS_DIR);
+    let manifest_path = artifact_dir.join(MODEL_MANIFEST_JSON);
     let model_detwgt = args.model_dir.join("model.detwgt");
     let config = args.model_dir.join("config.json");
     let tokenizer_path = args.model_dir.join("tokenizer.json");
 
-    let direct = DirectInferManifest {
-        version: 1,
+    let direct = ModelManifest {
+        version: 2,
         bundle: DirectInferBundle {
             model_detwgt_path: manifest_relative_path(&artifact_dir, &model_detwgt),
             model_detwgt_sha256: sha256_file(&model_detwgt)?,
@@ -39,12 +34,6 @@ pub fn write_direct_manifest(
             tokenizer_path: manifest_relative_path(&artifact_dir, &tokenizer_path),
             tokenizer_sha256: sha256_file(&tokenizer_path)?,
         },
-        import: DirectInferImportSettings {
-            prompt: args.prompt.clone(),
-            raw_prompt: args.raw_prompt,
-            tokens: args.tokens,
-        },
-        prompt: direct_prompt(tokenizer, &args.prompt, args.raw_prompt, eos_ids)?,
         shape: DirectInferShape {
             hidden_size: shape.hidden as u32,
             num_hidden_layers: shape.layers as u32,
@@ -71,6 +60,7 @@ pub fn write_direct_manifest(
                 .map(f32_to_q16)
                 .unwrap_or(0),
         },
+        eos_token_ids: eos_ids.iter().copied().collect(),
         provenance: raster_manifest.map(|(path, text)| DirectInferProvenance {
             raster_manifest_path: manifest_relative_path(&artifact_dir, path),
             raster_manifest_sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
@@ -85,62 +75,9 @@ pub fn write_direct_manifest(
 
 pub fn warn_partial_direct_manifest_not_refreshed() {
     eprintln!(
-        "direct-infer artifacts not refreshed; run a full `raster-inference model import ...` \
-         to regenerate {DIRECT_INFER_ARTIFACTS_DIR}/{DIRECT_INFER_MANIFEST_JSON}"
+        "model manifest not refreshed; run a full `raster-inference model import ...` \
+         to regenerate {MODEL_ARTIFACTS_DIR}/{MODEL_MANIFEST_JSON}"
     );
-}
-
-fn direct_prompt(
-    tokenizer: &serde_json::Value,
-    prompt: &str,
-    raw_prompt: bool,
-    eos_ids: &BTreeSet<u32>,
-) -> Result<DirectInferPrompt, Box<dyn Error>> {
-    let model = tokenizer
-        .get("model")
-        .ok_or("tokenizer.json has no model")?;
-    let vocab: BTreeMap<String, u32> = model
-        .get("vocab")
-        .and_then(serde_json::Value::as_object)
-        .ok_or("tokenizer.json has no vocab")?
-        .iter()
-        .map(|(token, id)| {
-            let id = id.as_u64().unwrap_or_default() as u32;
-            (token.clone(), id)
-        })
-        .collect();
-    let mut special_tokens: Vec<String> = tokenizer
-        .get("added_tokens")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|entry| {
-            entry
-                .get("special")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-        })
-        .filter_map(|entry| entry.get("content").and_then(serde_json::Value::as_str))
-        .map(str::to_string)
-        .collect();
-    special_tokens.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-
-    let templated = !raw_prompt && supports_gemma_turns(&vocab);
-    let rendered_prompt = if templated {
-        render_gemma_turns(prompt)
-    } else {
-        prompt.to_string()
-    };
-    let initial_pieces = if templated {
-        split_prompt(&rendered_prompt, &vocab, &special_tokens)
-    } else {
-        split_prompt(&rendered_prompt, &vocab, &[])
-    };
-    Ok(DirectInferPrompt {
-        rendered_prompt,
-        initial_pieces,
-        eos_token_ids: eos_ids.iter().copied().collect(),
-    })
 }
 
 fn manifest_relative_path(artifact_dir: &Path, source: &Path) -> PathBuf {

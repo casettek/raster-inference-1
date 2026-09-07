@@ -1,18 +1,18 @@
 # Infer Workflow
 
-`infer` is the fast deterministic path. It uses `direct-infer`, reads `direct-infer-artifacts/manifest.json`, and does not write staged checkpoint artifacts.
+`infer` is the fast deterministic path. It uses `direct-infer`, reads a run spec such as `inference.toml`, loads the referenced `model-artifacts/manifest.json`, and does not write staged checkpoint artifacts.
 
 ```bash
-cargo run --release -p raster-inference-cli -- infer
+cargo run --release -p raster-inference-cli -- infer --run inference.toml
 # or
-just infer
+just infer inference.toml
 ```
 
 Flow:
 
 1. `raster-inference-cli` dispatches `infer` to `direct_infer::DirectInferenceExecutor`.
-2. `direct-infer` loads the direct manifest, tokenizer metadata, and mmap-backed DETWGT weights.
-3. The executor runs prompt preparation, embedding, prefill layers, decode, and output finalization in host memory.
+2. `direct-infer` loads the run spec, prompt-free model manifest, tokenizer metadata, and mmap-backed DETWGT weights.
+3. The executor prepares prompt pieces from the run spec, then runs embedding, prefill layers, decode, and output finalization in host memory.
 4. The command prints an `InferenceResult` and timing summary.
 
 Output:

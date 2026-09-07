@@ -3,17 +3,17 @@ set positional-arguments
 default:
     just --list
 
-import model prompt="hello raster" tokens="1":
-    cargo run --release -p raster-inference-cli -- model import --model "{{model}}" --prompt "{{prompt}}" --tokens "{{tokens}}"
+import model:
+    cargo run --release -p raster-inference-cli -- model import --model "{{model}}"
 
-infer:
-    cargo run --release -p raster-inference-cli -- infer
+infer run="inference.toml":
+    cargo run --release -p raster-inference-cli -- infer --run "{{run}}"
 
-claim:
-    cargo run --release -p raster-inference-cli -- claim build
+claim run="inference.toml":
+    cargo run --release -p raster-inference-cli -- claim build --run "{{run}}"
 
-challenge trace:
-    cargo run --release -p raster-inference-cli -- challenge build --trace "{{trace}}"
+challenge claim:
+    cargo run --release -p raster-inference-cli -- challenge build --claim "{{claim}}"
 
 test-workspace:
     cargo test --workspace

@@ -3,17 +3,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
+use sha2::Digest;
 use staged_infer::chain_runner::StagedExecutionBackend;
 use staged_infer::{CheckpointedInferenceConfig, CheckpointedInferenceExecutor, ParityPolicy};
 
 use inference_artifacts::{
-    build_checkpoint_trace, read_challenge_bundle, read_checkpoint_trace,
+    build_checkpoint_trace, read_challenge_bundle, read_checkpoint_trace, read_claim_bundle,
     write_challenge_artifacts, write_checkpoint_trace_artifact, ChallengeBundle, Checkpoint,
-    CheckpointTrace, Divergence, DivergenceReason, ReplayPackage,
+    CheckpointTrace, Divergence, DivergenceReason, PreparedRun, ReplayPackage,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChallengeInput {
+    Claim(PathBuf),
     Trace(PathBuf),
 }
 
@@ -50,28 +52,33 @@ pub enum ChallengeBuildOutcome {
 }
 
 pub fn build_challenge(options: ChallengeBuildOptions) -> Result<ChallengeBuildResult> {
-    let (claimed_trace_path, claimed_trace) = load_claimed_trace(&options.input)?;
+    let claimed_input = load_claimed_input(&options.input)?;
+    let manifest_path = claimed_input
+        .prepared_run
+        .as_ref()
+        .and_then(|prepared| prepared.run_manifest_path.clone())
+        .unwrap_or_else(|| options.manifest_path.clone());
     let executor = CheckpointedInferenceExecutor;
     let recomputed = executor.run(CheckpointedInferenceConfig {
         base_dir: options.base_dir.clone(),
-        manifest_path: options.manifest_path.clone(),
+        manifest_path: manifest_path.clone(),
         current_exe: options.current_exe,
         staged_backend: options.staged_backend,
         parity_policy: ParityPolicy::Skip,
     })?;
-    let recomputed_trace = build_checkpoint_trace(&recomputed.chain_dir, &options.manifest_path)?;
+    let recomputed_trace = build_checkpoint_trace(&recomputed.chain_dir, &manifest_path)?;
     let recomputed_trace_path =
         write_checkpoint_trace_artifact(&recomputed.chain_dir, &recomputed_trace)?;
 
     let Some(divergence) = locate_divergence(
-        &claimed_trace_path,
-        &claimed_trace,
+        &claimed_input.trace_path,
+        &claimed_input.trace,
         &recomputed_trace_path,
         &recomputed_trace,
     ) else {
         return Ok(ChallengeBuildResult {
             outcome: ChallengeBuildOutcome::NoDivergence {
-                claimed_trace_path,
+                claimed_trace_path: claimed_input.trace_path,
                 recomputed_trace_path,
                 recomputed_chain_dir: recomputed.chain_dir,
             },
@@ -103,11 +110,16 @@ pub fn build_challenge(options: ChallengeBuildOptions) -> Result<ChallengeBuildR
         divergence.checkpoint_index,
         &replay_run_dir,
     )?;
-    let replay_package = run_raster_replay(&options.base_dir, &replay_run_dir, &divergence.stage)?;
+    let replay_package = run_raster_replay(
+        &options.base_dir,
+        &manifest_path,
+        &replay_run_dir,
+        &divergence.stage,
+    )?;
     let (divergence_path, replay_package_path, challenge_trace_path, challenge_bundle_path) =
         write_challenge_artifacts(
             &challenge_dir,
-            &claimed_trace_path,
+            &claimed_input.trace_path,
             &recomputed_trace_path,
             &divergence,
             &replay_package,
@@ -186,21 +198,106 @@ fn divergence_reason(
     }
 }
 
-fn load_claimed_trace(input: &ChallengeInput) -> Result<(PathBuf, CheckpointTrace)> {
+struct ClaimedInput {
+    trace_path: PathBuf,
+    trace: CheckpointTrace,
+    prepared_run: Option<PreparedRun>,
+}
+
+fn load_claimed_input(input: &ChallengeInput) -> Result<ClaimedInput> {
     match input {
+        ChallengeInput::Claim(path) => {
+            let bundle = read_claim_bundle(path)?;
+            let bundle_dir = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("claim bundle has no parent directory"))?;
+            let trace_path = resolve_bundle_path(bundle_dir, &bundle.checkpoint_trace_path);
+            let trace = read_checkpoint_trace(&trace_path)?;
+            let prepared_run = bundle
+                .prepared_run_path
+                .as_ref()
+                .map(|path| read_prepared_run(&resolve_bundle_path(bundle_dir, path)))
+                .transpose()?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "claim bundle has no prepared_run_path; rebuild the claim with --run"
+                    )
+                })?;
+            verify_prepared_run(&prepared_run)?;
+            Ok(ClaimedInput {
+                trace_path,
+                trace,
+                prepared_run: Some(prepared_run),
+            })
+        }
         ChallengeInput::Trace(path) => {
             let trace = read_checkpoint_trace(path)?;
-            Ok((path.clone(), trace))
+            Ok(ClaimedInput {
+                trace_path: path.clone(),
+                trace,
+                prepared_run: None,
+            })
         }
     }
 }
 
-fn run_raster_replay(base_dir: &Path, replay_run_dir: &Path, stage: &str) -> Result<ReplayPackage> {
+fn read_prepared_run(path: &Path) -> Result<PreparedRun> {
+    inference_artifacts::read_json(path)
+}
+
+fn verify_prepared_run(prepared: &PreparedRun) -> Result<()> {
+    verify_sha256(
+        &prepared.model_manifest_path,
+        &prepared.model_manifest_sha256,
+        "model manifest",
+    )?;
+    let manifest_path = prepared
+        .run_manifest_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("prepared run has no run_manifest_path"))?;
+    let manifest_sha256 = prepared
+        .run_manifest_sha256
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("prepared run has no run_manifest_sha256"))?;
+    verify_sha256(manifest_path, manifest_sha256, "run manifest")
+}
+
+fn verify_sha256(path: &Path, expected: &str, label: &str) -> Result<()> {
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read {label} {}", path.display()))?;
+    let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
+    if actual != expected {
+        bail!(
+            "frozen {label} hash mismatch for {}: expected {}, got {}",
+            path.display(),
+            expected,
+            actual
+        );
+    }
+    Ok(())
+}
+
+fn resolve_bundle_path(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+fn run_raster_replay(
+    base_dir: &Path,
+    manifest_path: &Path,
+    replay_run_dir: &Path,
+    stage: &str,
+) -> Result<ReplayPackage> {
     fs::create_dir_all(replay_run_dir)
         .with_context(|| format!("failed to create {}", replay_run_dir.display()))?;
     let status = Command::new("cargo")
         .current_dir(base_dir)
-        .args(["raster", "chain", "run", "--quiet-timings", "--run"])
+        .args(["raster", "chain", "run"])
+        .arg(manifest_path)
+        .args(["--quiet-timings", "--run"])
         .arg(replay_run_dir)
         .arg("--stage")
         .arg(stage)
@@ -411,6 +508,39 @@ mod tests {
         assert!(replay_run.join("stage_a").join("output.bin").is_file());
         assert!(!replay_run.join("stage_b").exists());
         assert!(source_run.join("stage_b").join("output.bin").is_file());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn prepared_run_hash_mismatch_is_rejected() {
+        let base = temp_dir("prepared-hash");
+        fs::create_dir_all(&base).unwrap();
+        let model_manifest = base.join("model-artifacts").join("manifest.json");
+        fs::create_dir_all(model_manifest.parent().unwrap()).unwrap();
+        fs::write(&model_manifest, b"model").unwrap();
+        let run_manifest = base.join("runs").join("Raster.toml");
+        fs::create_dir_all(run_manifest.parent().unwrap()).unwrap();
+        fs::write(&run_manifest, b"[chain]\nname = \"test\"\n").unwrap();
+
+        let prepared = PreparedRun {
+            version: 1,
+            run_spec_path: base.join("inference.toml"),
+            model_manifest_path: model_manifest.clone(),
+            model_manifest_sha256: format!("{:x}", sha2::Sha256::digest(b"model")),
+            prompt: inference_artifacts::PreparedPrompt {
+                resolved_prompt: String::from("hello"),
+                rendered_prompt: String::from("hello"),
+                initial_pieces: vec![String::from("hello"), String::from("</w>")],
+                eos_token_ids: Vec::new(),
+            },
+            tokens: 1,
+            run_manifest_path: Some(run_manifest),
+            run_manifest_sha256: Some(String::from("wrong")),
+        };
+
+        let error = verify_prepared_run(&prepared).unwrap_err();
+        assert!(error.to_string().contains("run manifest hash mismatch"));
 
         fs::remove_dir_all(base).unwrap();
     }

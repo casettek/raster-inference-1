@@ -2,16 +2,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const DIRECT_INFER_ARTIFACTS_DIR: &str = "direct-infer-artifacts";
-pub const DIRECT_INFER_MANIFEST_JSON: &str = "manifest.json";
+pub const MODEL_ARTIFACTS_DIR: &str = "model-artifacts";
+pub const MODEL_MANIFEST_JSON: &str = "manifest.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DirectInferManifest {
+pub struct ModelManifest {
     pub version: u32,
     pub bundle: DirectInferBundle,
-    pub import: DirectInferImportSettings,
-    pub prompt: DirectInferPrompt,
     pub shape: DirectInferShape,
+    pub eos_token_ids: Vec<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<DirectInferProvenance>,
 }
@@ -24,20 +23,6 @@ pub struct DirectInferBundle {
     pub config_sha256: String,
     pub tokenizer_path: PathBuf,
     pub tokenizer_sha256: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DirectInferImportSettings {
-    pub prompt: String,
-    pub raw_prompt: bool,
-    pub tokens: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DirectInferPrompt {
-    pub rendered_prompt: String,
-    pub initial_pieces: Vec<String>,
-    pub eos_token_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -2,38 +2,37 @@
 
 `raster-chain-inference` runs Gemma inference in three developer-facing modes over the same imported model inputs:
 
-- `infer`: fast deterministic inference from `direct-infer-artifacts/manifest.json`.
+- `infer`: fast deterministic inference from a run spec and `model-artifacts/manifest.json`.
 - `claim build`: a checkpointed deterministic rerun that emits a compact claim.
 - `challenge build`: verifier rerun from a claim trace, divergence detection, and Raster replay of the first divergent stage.
 
-`model import` is the shared setup step. It turns a model bundle into committed Raster externals, the root `Raster.toml` chain manifest, and the direct-infer manifest used by the fast path.
+`model import` is the shared setup step. It turns a model bundle into committed Raster externals and a prompt-free model manifest. `infer`, `claim build`, and `challenge build` prepare prompt-specific run artifacts from `inference.toml`.
 
 ## Quick Start
 
 ```bash
 # Import committed externals and the direct-infer manifest.
 cargo run --release -p raster-inference-cli -- model import \
-  --model ../raster-inference/assets/tiny-gemma-dev \
-  --prompt "hello raster"
+  --model ../raster-inference/assets/tiny-gemma-dev
 
 # Fast deterministic inference, no checkpoint tree.
-cargo run --release -p raster-inference-cli -- infer
+cargo run --release -p raster-inference-cli -- infer --run inference.toml
 
 # Proposer claim with every staged checkpoint.
-cargo run --release -p raster-inference-cli -- claim build
+cargo run --release -p raster-inference-cli -- claim build --run inference.toml
 
-# Verifier challenge from a prior checkpoint trace.
+# Verifier challenge from a prior claim bundle.
 cargo run --release -p raster-inference-cli -- challenge build \
-  --trace target/staged-infer/chains-no-auth/.../checkpoint_trace.json
+  --claim target/staged-infer/chains-no-auth/.../claim_bundle.json
 ```
 
 The same commands are available through `just` recipes:
 
 ```bash
-just import ../raster-inference/assets/tiny-gemma-dev "hello raster"
-just infer
-just claim
-just challenge target/staged-infer/chains-no-auth/.../checkpoint_trace.json
+just import ../raster-inference/assets/tiny-gemma-dev
+just infer inference.toml
+just claim inference.toml
+just challenge target/staged-infer/chains-no-auth/.../claim_bundle.json
 ```
 
 ## Workflows
@@ -56,7 +55,8 @@ just challenge target/staged-infer/chains-no-auth/.../checkpoint_trace.json
 ```text
 Cargo.toml                  # workspace manifest
 justfile                    # workflow and test shortcuts
-Raster.toml                 # canonical generated chain manifest
+Raster.toml                 # prompt-free generated chain manifest template
+inference.toml              # default run spec
 crates/
   raster-inference-cli/     # developer-facing workflow CLI
   model-import/             # model bundle -> committed inputs/manifests

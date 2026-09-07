@@ -40,7 +40,12 @@ impl CheckpointedInferenceExecutor {
             ParityPolicy::Skip => None,
             ParityPolicy::ReferenceStage(stage) => Some(stage.as_str()),
         };
-        let run = chain_runner::run(raster_stage, &config.current_exe, config.staged_backend)?;
+        let run = chain_runner::run(
+            &config.manifest_path,
+            raster_stage,
+            &config.current_exe,
+            config.staged_backend,
+        )?;
         let final_result = match run.final_output {
             Some(CachedStageValue::GeneratedOutput(output)) => {
                 Some(inference_result_from_generated(output))
@@ -56,12 +61,23 @@ impl CheckpointedInferenceExecutor {
 }
 
 fn ensure_supported_manifest_path(base_dir: &Path, manifest_path: &Path) -> Result<()> {
-    let expected = base_dir.join("Raster.toml");
-    if manifest_path != expected {
+    if !manifest_path.is_file() {
         bail!(
-            "checkpointed inference currently requires manifest path {}; got {}",
-            expected.display(),
+            "checkpointed inference manifest does not exist: {}",
             manifest_path.display()
+        );
+    }
+    let canonical_base = base_dir
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", base_dir.display()))?;
+    let canonical_manifest = manifest_path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", manifest_path.display()))?;
+    if !canonical_manifest.starts_with(&canonical_base) {
+        bail!(
+            "checkpointed inference manifest {} is outside {}",
+            manifest_path.display(),
+            base_dir.display()
         );
     }
     Ok(())
@@ -133,11 +149,15 @@ mod tests {
     }
 
     #[test]
-    fn manifest_path_must_match_current_chain_runner_contract() {
-        let error =
-            ensure_supported_manifest_path(Path::new("/repo"), Path::new("/repo/other.toml"))
-                .unwrap_err();
+    fn manifest_path_must_exist_inside_base_dir() {
+        let base =
+            std::env::temp_dir().join(format!("staged-infer-manifest-path-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("target/run")).unwrap();
+        let manifest = base.join("target/run/Raster.toml");
+        std::fs::write(&manifest, "[chain]\nname = \"test\"\n").unwrap();
 
-        assert!(error.to_string().contains("requires manifest path"));
+        ensure_supported_manifest_path(&base, &manifest).unwrap();
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

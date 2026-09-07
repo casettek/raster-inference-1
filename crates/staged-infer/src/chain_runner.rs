@@ -236,12 +236,13 @@ struct AuxWaveExecutionTime {
 }
 
 pub fn run(
+    manifest_path: &Path,
     raster_stage: Option<&str>,
     current_exe: &Path,
     staged_backend: StagedExecutionBackend,
 ) -> Result<HybridRun> {
     let base_dir = std::env::current_dir().context("failed to read current directory")?;
-    let manifest = read_manifest(&base_dir.join("Raster.toml"))?;
+    let manifest = read_manifest(manifest_path)?;
     validate_supported_stages(&manifest.chain.stage)?;
     if let Some(raster_stage) = raster_stage {
         validate_reference_stage(&manifest.chain.stage, raster_stage)?;

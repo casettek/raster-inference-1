@@ -4,8 +4,7 @@
 
 ```bash
 cargo run --release -p raster-inference-cli -- model import \
-  --model ../raster-inference/assets/tiny-gemma-dev \
-  --prompt "hello raster"
+  --model ../raster-inference/assets/tiny-gemma-dev
 ```
 
 Inputs:
@@ -16,14 +15,14 @@ Inputs:
 
 Outputs:
 
-- Root `Raster.toml`, the canonical chain manifest for checkpointed and challenge workflows.
+- Root `Raster.toml`, a prompt-free chain manifest template.
 - Stage externals under `raster-stages/*`, written as `.rastered` and `.rindex` pairs with manifest commitments.
-- `direct-infer-artifacts/manifest.json`, the host-runtime manifest consumed by `infer`.
+- `model-artifacts/manifest.json`, the prompt-free model manifest consumed by run specs.
 
 Useful partial modes:
 
-- `--only-direct`: refresh only `direct-infer-artifacts/manifest.json`.
-- `--only-tokenizer`: refresh prompt/decoder externals.
+- `--only-direct`: refresh only `model-artifacts/manifest.json`.
+- `--only-tokenizer`: refresh tokenizer/decoder externals.
 - `--only-layers`, `--only-embedding`, `--only-ple`: refresh targeted weight externals.
 
-`model import` is setup, not a peer to `infer`, `claim build`, or `challenge build`: the workflows all assume imported artifacts already exist.
+`model import` no longer accepts `--prompt`, `--raw-prompt`, or `--tokens`. Runtime prompt text and token count live in `inference.toml`.

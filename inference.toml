@@ -1,0 +1,4 @@
+model_manifest = "model-artifacts/manifest.json"
+prompt = "say ciao"
+raw_prompt = false
+tokens = 1

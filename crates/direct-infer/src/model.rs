@@ -1,30 +1,21 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use inference_artifacts::{
-    read_json, DirectInferManifest, DirectInferShape, DIRECT_INFER_ARTIFACTS_DIR,
-    DIRECT_INFER_MANIFEST_JSON,
+    read_json, DirectInferShape, InferenceRunSpec, ModelManifest, PreparedPrompt,
 };
-use prompt_prepare::input::{merge_bucket_of, vocab_bucket_of, BpeMerge, BpePieces, MergeBucket};
-use prompt_prepare::input::{PromptTokenizer, TokenEntry, VocabBucket};
+use prompt_prepare::input::BpePieces;
 use raster::{Bytes, List};
 
 use detwgt::{DetwgtMatrixView, DetwgtSlice, MmapDetwgt};
 use host_kernels::tensor::MatrixSource;
 
 const ONE: i32 = 1 << 16;
-const END_OF_WORD: &str = "</w>";
-const BOS_TOKEN: &str = "<bos>";
-const TURN_OPEN: &str = "<|turn>";
-const TURN_CLOSE: &str = "<turn|>";
-const NEWLINE_TOKEN: &str = "\n";
-
 pub const MISSING_DIRECT_MANIFEST: &str =
-    "run raster-inference model import ... to generate direct-infer artifacts";
+    "run raster-inference model import ... to generate a model manifest";
 
 pub struct DirectInferenceModel {
-    pub manifest: DirectInferManifest,
+    pub manifest: ModelManifest,
     pub manifest_path: PathBuf,
     tokenizer: serde_json::Value,
     config_text: serde_json::Value,
@@ -109,9 +100,9 @@ impl DirectInferenceModel {
                 manifest_path.display()
             );
         }
-        let manifest: DirectInferManifest = read_json(manifest_path)?;
-        if manifest.version != 1 {
-            bail!("unsupported direct-infer manifest v{}", manifest.version);
+        let manifest: ModelManifest = read_json(manifest_path)?;
+        if manifest.version != 2 {
+            bail!("unsupported model manifest v{}", manifest.version);
         }
 
         let manifest_dir = manifest_path
@@ -144,20 +135,25 @@ impl DirectInferenceModel {
         })
     }
 
-    pub fn default_manifest_path(base_dir: &Path) -> PathBuf {
-        base_dir
-            .join(DIRECT_INFER_ARTIFACTS_DIR)
-            .join(DIRECT_INFER_MANIFEST_JSON)
+    pub fn prepare_prompt(
+        &self,
+        spec_dir: &Path,
+        spec: &InferenceRunSpec,
+    ) -> Result<PreparedPrompt> {
+        run_prep::prepare_prompt(&self.tokenizer, spec_dir, spec, &self.manifest)
     }
 
     fn matrix_view(&self, name: &str, rows: usize, cols: usize) -> Result<DirectMatrixView<'_>> {
         Ok(DirectMatrixView::new(self.detwgt.matrix(name, rows, cols)?))
     }
 
-    pub fn prompt_inputs(&self) -> Result<prompt_prepare::input::PromptTokenization> {
-        let tokenizer = self.prompt_tokenizer()?;
+    pub fn prompt_inputs(
+        &self,
+        prompt: &PreparedPrompt,
+    ) -> Result<prompt_prepare::input::PromptTokenization> {
+        let tokenizer = run_prep::prompt_tokenizer(&self.tokenizer)?;
         let pieces = BpePieces {
-            pieces: List::from(self.manifest.prompt.initial_pieces.clone()),
+            pieces: List::from(prompt.initial_pieces.clone()),
         };
         host_kernels::kernels::prompt_prepare::run_prompt_prepare_direct(
             host_kernels::kernels::prompt_prepare::PromptPrepareDirectInputs {
@@ -438,76 +434,11 @@ impl DirectInferenceModel {
     }
 
     pub fn decoder_table(&self) -> Result<output_finalize::input::DecoderTable> {
-        let model = self
-            .tokenizer
-            .get("model")
-            .ok_or_else(|| anyhow::anyhow!("tokenizer.json has no model"))?;
-        let vocab_map = vocab_map(model)?;
-        let special_ids: BTreeSet<u32> = self
-            .tokenizer
-            .get("added_tokens")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .get("special")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-            })
-            .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_u64))
-            .map(|id| id as u32)
-            .collect();
-        let eos_ids: BTreeSet<u32> = self.manifest.prompt.eos_token_ids.iter().copied().collect();
-        let max_token_id = vocab_map.values().copied().max().unwrap_or(0);
-        let mut tokens =
-            vec![output_finalize::input::DecoderToken::default(); max_token_id as usize + 1];
-        for (token, id) in vocab_map {
-            tokens[id as usize] = output_finalize::input::DecoderToken {
-                token,
-                special: special_ids.contains(&id),
-                terminal: eos_ids.contains(&id),
-            };
-        }
-        Ok(output_finalize::input::DecoderTable {
-            tokens: List::from(tokens),
-        })
+        run_prep::decoder_table(&self.tokenizer, &self.manifest.eos_token_ids)
     }
 
     pub fn shape(&self) -> &DirectInferShape {
         &self.manifest.shape
-    }
-
-    fn prompt_tokenizer(&self) -> Result<PromptTokenizer> {
-        let model = self
-            .tokenizer
-            .get("model")
-            .ok_or_else(|| anyhow::anyhow!("tokenizer.json has no model"))?;
-        let vocab_map = vocab_map(model)?;
-        let mut vocab: Vec<TokenEntry> = vocab_map
-            .into_iter()
-            .map(|(token, id)| TokenEntry { token, id })
-            .collect();
-        vocab.sort_by_key(|entry| entry.id);
-        let merges = model
-            .get("merges")
-            .and_then(serde_json::Value::as_array)
-            .map(|merges| {
-                merges
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(rank, entry)| parse_merge(rank as u32, entry))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let (vocab_bucket_count, vocab_buckets) = bucket_vocab(vocab);
-        let (merge_bucket_count, merge_buckets) = bucket_merges(merges);
-        Ok(PromptTokenizer {
-            vocab_bucket_count,
-            merge_bucket_count,
-            vocab_buckets: List::from(vocab_buckets),
-            merge_buckets: List::from(merge_buckets),
-        })
     }
 
     fn is_sliding(&self, idx: usize) -> bool {
@@ -731,84 +662,6 @@ fn resolve_manifest_path(manifest_dir: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn vocab_map(model: &serde_json::Value) -> Result<BTreeMap<String, u32>> {
-    model
-        .get("vocab")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("tokenizer.json has no vocab"))?
-        .iter()
-        .map(|(token, id)| {
-            Ok((
-                token.clone(),
-                id.as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("token '{token}' has non-integer id"))?
-                    as u32,
-            ))
-        })
-        .collect()
-}
-
-fn bucket_vocab(vocab: Vec<TokenEntry>) -> (u32, Vec<VocabBucket>) {
-    let count = bucket_count_for(vocab.len());
-    let mut buckets: Vec<Vec<TokenEntry>> = vec![Vec::new(); count as usize];
-    for entry in vocab {
-        buckets[vocab_bucket_of(&entry.token, count) as usize].push(entry);
-    }
-    (
-        count,
-        buckets
-            .into_iter()
-            .map(|entries| VocabBucket {
-                entries: List::from(entries),
-            })
-            .collect(),
-    )
-}
-
-fn bucket_merges(merges: Vec<BpeMerge>) -> (u32, Vec<MergeBucket>) {
-    let count = bucket_count_for(merges.len());
-    let mut buckets: Vec<Vec<BpeMerge>> = vec![Vec::new(); count as usize];
-    for rule in merges {
-        buckets[merge_bucket_of(&rule.left, &rule.right, count) as usize].push(rule);
-    }
-    for bucket in &mut buckets {
-        bucket.sort_by_key(|rule| rule.rank);
-    }
-    (
-        count,
-        buckets
-            .into_iter()
-            .map(|rules| MergeBucket {
-                rules: List::from(rules),
-            })
-            .collect(),
-    )
-}
-
-fn bucket_count_for(len: usize) -> u32 {
-    (len / 4).max(1) as u32
-}
-
-fn parse_merge(rank: u32, entry: &serde_json::Value) -> Option<BpeMerge> {
-    let (left, right) = match entry {
-        serde_json::Value::String(text) => {
-            let mut parts = text.splitn(2, ' ');
-            (parts.next()?.to_string(), parts.next()?.to_string())
-        }
-        serde_json::Value::Array(pair) if pair.len() == 2 => {
-            (pair[0].as_str()?.to_string(), pair[1].as_str()?.to_string())
-        }
-        _ => return None,
-    };
-    let merged = format!("{left}{right}");
-    Some(BpeMerge {
-        rank,
-        left,
-        right,
-        merged,
-    })
-}
-
 fn inv_sqrt_q16(n: usize) -> i32 {
     if n == 0 {
         return 0;
@@ -831,51 +684,4 @@ fn pack_i32_page(values: &[i32]) -> raster::BytesPage {
 
 fn paged_i32s(values: &[i32]) -> Result<Bytes<196_608>> {
     Bytes::<196_608>::paged(pack_i32_bytes(values)).map_err(|error| anyhow::anyhow!("{error}"))
-}
-
-#[allow(dead_code)]
-fn render_gemma_turns(prompt: &str) -> String {
-    format!(
-        "{BOS_TOKEN}{TURN_OPEN}user\n{}{TURN_CLOSE}\n{TURN_OPEN}model\n",
-        prompt.trim()
-    )
-}
-
-#[allow(dead_code)]
-fn supports_gemma_turns(vocab: &BTreeMap<String, u32>) -> bool {
-    [BOS_TOKEN, TURN_OPEN, TURN_CLOSE, NEWLINE_TOKEN]
-        .iter()
-        .all(|token| vocab.contains_key(*token))
-}
-
-#[allow(dead_code)]
-fn split_prompt(prompt: &str, vocab: &BTreeMap<String, u32>, specials: &[String]) -> Vec<String> {
-    let mut pieces = Vec::new();
-    let mut rest = prompt;
-    while !rest.is_empty() {
-        if let Some(special) = specials
-            .iter()
-            .find(|token| rest.starts_with(token.as_str()))
-        {
-            pieces.push(special.clone());
-            rest = &rest[special.len()..];
-            continue;
-        }
-        let ch = rest.chars().next().expect("rest is non-empty");
-        rest = &rest[ch.len_utf8()..];
-        let piece = if ch == ' ' {
-            String::from('\u{2581}')
-        } else {
-            ch.to_string()
-        };
-        if vocab.contains_key(&piece) {
-            pieces.push(piece);
-        } else {
-            for byte in piece.as_bytes() {
-                pieces.push(format!("<0x{byte:02X}>"));
-            }
-        }
-    }
-    pieces.push(END_OF_WORD.to_string());
-    pieces
 }

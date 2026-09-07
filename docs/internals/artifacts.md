@@ -2,15 +2,23 @@
 
 The stable contract types and filenames live in `crates/inference-artifacts`.
 
-## Direct Infer
+## Model And Run Specs
 
-`direct-infer-artifacts/manifest.json` records the host-runtime inputs for `infer`:
+`model-artifacts/manifest.json` records reusable model setup:
 
 - Model, config, and tokenizer paths plus SHA-256 hashes.
-- Import settings such as prompt, raw-prompt mode, and token count.
-- Rendered prompt pieces and EOS token ids.
 - Model shape and fixed-point scaling parameters.
-- Optional provenance pointing back to the Raster manifest used during import.
+- EOS token ids.
+- Optional provenance pointing back to the prompt-free Raster manifest template used during import.
+
+`inference.toml` records run-time inputs:
+
+- `model_manifest`
+- Exactly one of `prompt` or `prompt_file`
+- `raw_prompt`
+- `tokens`
+
+`prepared_run.json` freezes the resolved prompt, rendered prompt, initial pieces, EOS ids, model manifest hash, generated run manifest path/hash, and token count for claim/challenge reproducibility.
 
 ## Checkpoints
 
@@ -37,7 +45,7 @@ Every checkpointed stage directory must include:
 - `checkpoint_hashes.txt`
 - `claim_bundle.json`
 
-The claim bundle is intentionally compact: it records the first checkpoint input commitment and the final checkpoint output commitment.
+The claim bundle records the first checkpoint input commitment, final checkpoint output commitment, checkpoint trace path, and prepared-run metadata path.
 
 ## Challenges
 

@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "bundle": {
     "model_detwgt_path": "/Users/caszete/models/gemma-4-E2B-detwgt/model.detwgt",
     "model_detwgt_sha256": "5db440151c6bbd58c75ec4147c65261b438c5eff625f1cbefc1d0c463bc146c0",
@@ -7,49 +7,6 @@
     "config_sha256": "1b28f3d2c3100f6c594754b81107428bd7b822a7f48272ca681dae9d2ec38330",
     "tokenizer_path": "/Users/caszete/models/gemma-4-E2B-detwgt/tokenizer.json",
     "tokenizer_sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
-  },
-  "import": {
-    "prompt": "hello raster",
-    "raw_prompt": false,
-    "tokens": 1
-  },
-  "prompt": {
-    "rendered_prompt": "<bos><|turn>user\nhello raster<turn|>\n<|turn>model\n",
-    "initial_pieces": [
-      "<bos>",
-      "<|turn>",
-      "u",
-      "s",
-      "e",
-      "r",
-      "\n",
-      "h",
-      "e",
-      "l",
-      "l",
-      "o",
-      "▁",
-      "r",
-      "a",
-      "s",
-      "t",
-      "e",
-      "r",
-      "<turn|>",
-      "\n",
-      "<|turn>",
-      "m",
-      "o",
-      "d",
-      "e",
-      "l",
-      "\n",
-      "</w>"
-    ],
-    "eos_token_ids": [
-      1,
-      106
-    ]
   },
   "shape": {
     "hidden_size": 1536,
@@ -108,5 +65,13 @@
     "ple_projection_scalar": 1672,
     "ple_input_scale": 46341,
     "final_logit_softcap": 1966080
+  },
+  "eos_token_ids": [
+    1,
+    106
+  ],
+  "provenance": {
+    "raster_manifest_path": "../Raster.toml",
+    "raster_manifest_sha256": "fixture"
   }
 }

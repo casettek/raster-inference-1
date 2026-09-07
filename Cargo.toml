@@ -8,6 +8,7 @@ members = [
     "crates/inference-artifacts",
     "crates/model-import",
     "crates/raster-inference-cli",
+    "crates/run-prep",
     "crates/staged-infer",
     "raster-stages/decode-embed",
     "raster-stages/decode-init",
@@ -28,5 +29,6 @@ default-members = [
     "crates/inference-artifacts",
     "crates/model-import",
     "crates/raster-inference-cli",
+    "crates/run-prep",
     "crates/staged-infer",
 ]

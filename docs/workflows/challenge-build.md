@@ -1,18 +1,18 @@
 # Challenge Build Workflow
 
-`challenge build` consumes a claimed checkpoint trace, recomputes the checkpointed run, locates the first divergence, and replays that one divergent stage through Raster.
+`challenge build` consumes a claim bundle, recomputes the checkpointed run from the claim's frozen prepared-run metadata, locates the first divergence, and replays that one divergent stage through Raster.
 
 ```bash
 cargo run --release -p raster-inference-cli -- challenge build \
-  --trace target/staged-infer/chains-no-auth/.../checkpoint_trace.json
+  --claim target/staged-infer/chains-no-auth/.../claim_bundle.json
 # or
-just challenge target/staged-infer/chains-no-auth/.../checkpoint_trace.json
+just challenge target/staged-infer/chains-no-auth/.../claim_bundle.json
 ```
 
 Flow:
 
-1. Load the claimed `checkpoint_trace.json`.
-2. Run the checkpointed staged executor again to produce a recomputed trace.
+1. Load the claimed `claim_bundle.json`, its `checkpoint_trace.json`, and its `prepared_run.json`.
+2. Run the checkpointed staged executor again with the frozen run manifest from `prepared_run.json`.
 3. Compare traces in stage order and stop at the first mismatch.
 4. If no divergence exists, report the claimed and recomputed traces.
 5. If a divergence exists, seed a replay directory with all prior recomputed stages.
@@ -34,4 +34,4 @@ Challenge outputs live under the recomputed run's `challenge/<stage>/` directory
 - `challenge_trace.json`
 - `challenge_bundle.json`
 
-`challenge locate` and `fault prove` are reserved commands; `challenge build` is the implemented verifier workflow today.
+`--trace` remains a lower-level debug input, but it recomputes with the current root manifest because a trace alone has no frozen run metadata. `challenge locate` and `fault prove` are reserved commands; `challenge build` is the implemented verifier workflow today.

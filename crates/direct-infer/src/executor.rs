@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use inference_artifacts::{
-    InferStageTiming, InferenceResult, InferenceRunReport, InferenceTimings,
+    read_run_spec, InferStageTiming, InferenceResult, InferenceRunReport, InferenceTimings,
 };
 
 use crate::model::DirectInferenceModel;
@@ -23,14 +23,34 @@ impl DirectInferenceExecutor {
     pub fn run_with_report(&self, config: DirectInferenceConfig) -> Result<InferenceRunReport> {
         let infer_started = Instant::now();
         let mut timings = Vec::new();
+        let run_spec_path = if config.run_spec_path.is_absolute() {
+            config.run_spec_path.clone()
+        } else {
+            config.base_dir.join(&config.run_spec_path)
+        };
+        let run_spec = read_run_spec(&run_spec_path).with_context(|| {
+            format!(
+                "failed to load run spec {}; create inference.toml with model_manifest, prompt/prompt_file, raw_prompt, and tokens",
+                run_spec_path.display()
+            )
+        })?;
+        let run_spec_dir = run_spec_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("run spec has no parent directory"))?;
+        let model_manifest_path = if run_spec.model_manifest.is_absolute() {
+            run_spec.model_manifest.clone()
+        } else {
+            run_spec_dir.join(&run_spec.model_manifest)
+        };
 
         let load_started = Instant::now();
-        let model = DirectInferenceModel::load(&config.direct_manifest_path)
+        let model = DirectInferenceModel::load(&model_manifest_path)
             .context("failed to load direct-infer model")?;
         timings.push(phase_timing("load_direct_model", load_started.elapsed()));
 
         let prompt_started = Instant::now();
-        let prompt = model.prompt_inputs()?;
+        let prepared_prompt = model.prepare_prompt(run_spec_dir, &run_spec)?;
+        let prompt = model.prompt_inputs(&prepared_prompt)?;
         timings.push(phase_timing("prompt_prepare", prompt_started.elapsed()));
 
         let embedding_started = Instant::now();
@@ -52,9 +72,9 @@ impl DirectInferenceExecutor {
         let mut edge = host_kernels::kernels::decode_init::run_decode_init_direct(
             host_kernels::kernels::decode_init::DecodeInitDirectInputs,
         )?;
-        for token_idx in 0..model.manifest.import.tokens {
+        for token_idx in 0..run_spec.tokens {
             edge = advance_decode_edge(score, &edge);
-            if token_idx + 1 == model.manifest.import.tokens {
+            if token_idx + 1 == run_spec.tokens {
                 break;
             }
             let decode_seed = run_decode_embed_view(&model, &edge)?;
@@ -197,8 +217,10 @@ mod tests {
     fn direct_infer_uses_direct_manifest_by_default() {
         let config = DirectInferenceConfig::from_current_dir().expect("config should build");
         assert_eq!(
-            config.direct_manifest_path,
-            DirectInferenceModel::default_manifest_path(&config.base_dir)
+            config.run_spec_path,
+            config
+                .base_dir
+                .join(inference_artifacts::INFERENCE_RUN_SPEC_TOML)
         );
     }
 }

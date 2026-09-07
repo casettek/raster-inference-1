@@ -4,6 +4,7 @@ pub mod claim;
 pub mod direct;
 pub mod inference;
 pub mod io;
+pub mod run;
 
 pub use challenge::{
     read_challenge_bundle, write_challenge_artifacts, ChallengeBundle, ChallengeTrace, Divergence,
@@ -16,16 +17,22 @@ pub use checkpoint::{
     Checkpoint, CheckpointTrace, CHECKPOINT_HASHES_TXT, CHECKPOINT_TRACE_JSON,
     EXECUTION_TIMES_JSON,
 };
-pub use claim::{write_claim_artifacts, ClaimBundle, ClaimEndpoint, CLAIM_BUNDLE_JSON};
+pub use claim::{
+    read_claim_bundle, write_claim_artifacts, write_claim_artifacts_with_prepared_run, ClaimBundle,
+    ClaimEndpoint, CLAIM_BUNDLE_JSON,
+};
 pub use direct::{
-    DirectInferBundle, DirectInferImportSettings, DirectInferManifest, DirectInferPrompt,
-    DirectInferProvenance, DirectInferShape, DIRECT_INFER_ARTIFACTS_DIR,
-    DIRECT_INFER_MANIFEST_JSON,
+    DirectInferBundle, DirectInferProvenance, DirectInferShape, ModelManifest, MODEL_ARTIFACTS_DIR,
+    MODEL_MANIFEST_JSON,
 };
 pub use inference::{
     InferAuxWaveTiming, InferStageTiming, InferenceResult, InferenceRunReport, InferenceTimings,
 };
 pub use io::{read_json, write_json};
+pub use run::{
+    read_run_spec, InferenceRunSpec, PreparedPrompt, PreparedRun, INFERENCE_RUN_SPEC_TOML,
+    PREPARED_RUN_JSON,
+};
 
 #[cfg(test)]
 mod tests {
@@ -117,6 +124,7 @@ mod tests {
         };
         let bundle = ClaimBundle {
             version: 1,
+            checkpoint_trace_path: PathBuf::from("checkpoint_trace.json"),
             input: ClaimEndpoint {
                 stage: String::from("prompt_prepare"),
                 commitment: String::from("input"),
@@ -125,6 +133,7 @@ mod tests {
                 stage: String::from("output_finalize"),
                 commitment: String::from("abc"),
             },
+            prepared_run_path: None,
         };
 
         assert_eq!(
@@ -139,9 +148,9 @@ mod tests {
     }
 
     #[test]
-    fn direct_infer_manifest_round_trips_as_json() {
-        let manifest = DirectInferManifest {
-            version: 1,
+    fn model_manifest_round_trips_without_run_prompt() {
+        let manifest = ModelManifest {
+            version: 2,
             bundle: DirectInferBundle {
                 model_detwgt_path: PathBuf::from("../model.detwgt"),
                 model_detwgt_sha256: String::from("model-sha"),
@@ -149,16 +158,6 @@ mod tests {
                 config_sha256: String::from("config-sha"),
                 tokenizer_path: PathBuf::from("../tokenizer.json"),
                 tokenizer_sha256: String::from("tokenizer-sha"),
-            },
-            import: DirectInferImportSettings {
-                prompt: String::from("hello"),
-                raw_prompt: true,
-                tokens: 2,
-            },
-            prompt: DirectInferPrompt {
-                rendered_prompt: String::from("hello"),
-                initial_pieces: vec![String::from("hello"), String::from("</w>")],
-                eos_token_ids: vec![1, 2],
             },
             shape: DirectInferShape {
                 hidden_size: 4,
@@ -182,6 +181,7 @@ mod tests {
                 ple_input_scale: 1 << 16,
                 final_logit_softcap: 0,
             },
+            eos_token_ids: vec![1, 2],
             provenance: Some(DirectInferProvenance {
                 raster_manifest_path: PathBuf::from("../Raster.toml"),
                 raster_manifest_sha256: String::from("raster-sha"),
@@ -189,9 +189,62 @@ mod tests {
         };
 
         assert_eq!(
-            serde_json::from_slice::<DirectInferManifest>(&serde_json::to_vec(&manifest).unwrap())
+            serde_json::from_slice::<ModelManifest>(&serde_json::to_vec(&manifest).unwrap())
                 .unwrap(),
             manifest
+        );
+    }
+
+    #[test]
+    fn run_spec_requires_exactly_one_prompt_source() {
+        let both = InferenceRunSpec {
+            model_manifest: PathBuf::from("model-artifacts/manifest.json"),
+            prompt: Some(String::from("hello")),
+            prompt_file: Some(PathBuf::from("prompt.txt")),
+            raw_prompt: false,
+            tokens: 1,
+        };
+        assert!(both
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not both"));
+
+        let neither = InferenceRunSpec {
+            model_manifest: PathBuf::from("model-artifacts/manifest.json"),
+            prompt: None,
+            prompt_file: None,
+            raw_prompt: false,
+            tokens: 1,
+        };
+        assert!(neither
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("prompt"));
+    }
+
+    #[test]
+    fn prepared_run_metadata_round_trips_as_json() {
+        let prepared = PreparedRun {
+            version: 1,
+            run_spec_path: PathBuf::from("inference.toml"),
+            model_manifest_path: PathBuf::from("model-artifacts/manifest.json"),
+            model_manifest_sha256: String::from("model-sha"),
+            prompt: PreparedPrompt {
+                resolved_prompt: String::from("hello"),
+                rendered_prompt: String::from("hello"),
+                initial_pieces: vec![String::from("hello"), String::from("</w>")],
+                eos_token_ids: vec![1, 2],
+            },
+            tokens: 2,
+            run_manifest_path: Some(PathBuf::from("target/runs/run/Raster.toml")),
+            run_manifest_sha256: Some(String::from("run-sha")),
+        };
+
+        assert_eq!(
+            serde_json::from_slice::<PreparedRun>(&serde_json::to_vec(&prepared).unwrap()).unwrap(),
+            prepared
         );
     }
 

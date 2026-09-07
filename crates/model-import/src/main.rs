@@ -2,8 +2,7 @@
 //!
 //! ```sh
 //! cargo run -p model-import -- \
-//!   --model ../raster-inference/assets/tiny-gemma-dev \
-//!   --prompt "hello raster"
+//!   --model ../raster-inference/assets/tiny-gemma-dev
 //! ```
 //!
 //! Reads `model.detwgt` (deterministic Q16.16 weights), `config.json` (shapes,
@@ -27,21 +26,8 @@ use std::path::{Path, PathBuf};
 /// Q16.16 one.
 const ONE: i32 = 1 << 16;
 
-/// The end-of-word marker `prompt-prepare` needs to flush its last piece. It
-/// appears in no merge rule and is dropped with the final cursor.
-const END_OF_WORD: &str = "</w>";
-
-/// Gemma's turn markers, as `chat_template.jinja` emits them.
-///
-/// An instruction-tuned model was trained to answer inside its own turn, so a
-/// bare prompt is not a question to it — it is a fragment, and the continuation
-/// it produces is a turn break, not an answer. There is no Jinja engine here,
-/// so the one shape this chain needs — a single user message with the
-/// generation prompt appended — is written out directly.
-const BOS_TOKEN: &str = "<bos>";
-const TURN_OPEN: &str = "<|turn>";
-const TURN_CLOSE: &str = "<turn|>";
-const NEWLINE_TOKEN: &str = "\n";
+const INITIAL_PIECES_PLACEHOLDER_COMMITMENT: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 
 fn main() {
     if let Err(error) = run_from_env() {
@@ -53,14 +39,6 @@ fn main() {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportConfig {
     pub model_dir: PathBuf,
-    pub prompt: String,
-    /// Commit the prompt exactly as given, with no turn markers and no `<bos>`.
-    /// Needed for a tokenizer that has no such tokens — `tiny-gemma-dev` — and
-    /// for reproducing a pre-template fixture.
-    pub raw_prompt: bool,
-    /// Exact number of generated tokens. The decode loop is statically
-    /// expanded to this many select+transition iterations.
-    pub tokens: u32,
     /// Write the complete chain manifest here instead of printing it.
     pub manifest: Option<PathBuf>,
     /// Rewrite only the tokenizer externals, leaving the weight externals
@@ -101,9 +79,6 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<(), Box<d
 
 fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<ImportConfig, Box<dyn Error>> {
     let mut model_dir = None;
-    let mut prompt = String::from("hello raster");
-    let mut raw_prompt = false;
-    let mut tokens = 1u32;
     let mut manifest = None;
     let mut only_tokenizer = false;
     let mut only_layers = false;
@@ -114,15 +89,6 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<ImportConfi
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--model" => model_dir = args.next().map(PathBuf::from),
-            "--prompt" => prompt = args.next().ok_or("--prompt needs a value")?,
-            "--raw-prompt" => raw_prompt = true,
-            "--tokens" => {
-                tokens = args
-                    .next()
-                    .ok_or("--tokens needs a value")?
-                    .parse()
-                    .map_err(|_| "--tokens must be a non-negative integer")?
-            }
             "--manifest" => manifest = args.next().map(PathBuf::from),
             "--only-tokenizer" => only_tokenizer = true,
             "--only-layers" => only_layers = true,
@@ -137,9 +103,6 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<ImportConfi
     }
     Ok(ImportConfig {
         model_dir: model_dir.ok_or("--model <bundle-dir> is required")?,
-        prompt,
-        raw_prompt,
-        tokens,
         manifest,
         only_tokenizer,
         only_layers,
@@ -170,14 +133,7 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
             .manifest
             .as_deref()
             .zip(raster_manifest_text.as_deref());
-        direct_manifest::write_direct_manifest(
-            &args,
-            &tokenizer,
-            &eos_ids,
-            &shape,
-            text,
-            raster_manifest,
-        )?;
+        direct_manifest::write_model_manifest(&args, &eos_ids, &shape, text, raster_manifest)?;
         return Ok(ImportResult {
             manifest_path: None,
             manifest_text: None,
@@ -187,15 +143,9 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
 
     if args.only_tokenizer {
         let mut stages = Vec::new();
-        let decoder_commitment = write_tokenizer(
-            &tokenizer,
-            &args.prompt,
-            args.raw_prompt,
-            &eos_ids,
-            &mut stages,
-        )?;
+        let decoder_commitment = write_tokenizer(&tokenizer, &eos_ids, &mut stages)?;
         println!();
-        println!("# ---- replaces prompt and decoder externals in the root Raster.toml ----");
+        println!("# ---- replaces tokenizer and decoder externals in the root Raster.toml ----");
         for stage in &stages {
             println!();
             print!("{stage}");
@@ -289,13 +239,7 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
     println!();
 
     let mut stages = Vec::new();
-    let decoder_commitment = write_tokenizer(
-        &tokenizer,
-        &args.prompt,
-        args.raw_prompt,
-        &eos_ids,
-        &mut stages,
-    )?;
+    let decoder_commitment = write_tokenizer(&tokenizer, &eos_ids, &mut stages)?;
     write_embedding(&weights, &shape, &mut stages)?;
     write_ple_layers(&weights, &shape, &mut stages)?;
     write_transformer_layers(&weights, &shape, &mut stages)?;
@@ -308,19 +252,13 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
         manifest.push('\n');
         manifest.push_str(stage);
     }
-    manifest.push_str(&generation_stages(
-        &shape,
-        &decoder_commitment,
-        args.tokens,
-        &stages,
-    )?);
+    manifest.push_str(&generation_stages(&shape, &decoder_commitment, 0, &stages)?);
     let stage_count = stages.len();
     if let Some(path) = args.manifest.as_ref() {
         fs::write(path, &manifest)?;
         println!("wrote {}", path.display());
-        direct_manifest::write_direct_manifest(
+        direct_manifest::write_model_manifest(
             &args,
-            &tokenizer,
             &eos_ids,
             &shape,
             text,
@@ -332,7 +270,7 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
             stage_count,
         })
     } else {
-        direct_manifest::write_direct_manifest(&args, &tokenizer, &eos_ids, &shape, text, None)?;
+        direct_manifest::write_model_manifest(&args, &eos_ids, &shape, text, None)?;
         println!();
         println!("# ---- root Raster.toml ----");
         print!("{manifest}");
@@ -758,8 +696,6 @@ fn load_eos_ids(model_dir: &Path) -> std::collections::BTreeSet<u32> {
 
 fn write_tokenizer(
     tokenizer: &serde_json::Value,
-    prompt: &str,
-    raw_prompt: bool,
     eos_ids: &std::collections::BTreeSet<u32>,
     stages: &mut Vec<String>,
 ) -> Result<String, Box<dyn Error>> {
@@ -801,24 +737,6 @@ fn write_tokenizer(
         .map(|id| id as u32)
         .collect();
 
-    // The same entries by text, longest first, so `split_prompt` can keep each
-    // one whole and prefer the longer of two that share a prefix.
-    let mut special_tokens: Vec<String> = tokenizer
-        .get("added_tokens")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|entry| {
-            entry
-                .get("special")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-        })
-        .filter_map(|entry| entry.get("content").and_then(serde_json::Value::as_str))
-        .map(str::to_string)
-        .collect();
-    special_tokens.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-
     let max_token_id = vocab.iter().map(|entry| entry.id).max().unwrap_or(0);
     let mut decoder_tokens = vec![DecoderToken::default(); max_token_id.saturating_add(1) as usize];
     for entry in &vocab {
@@ -851,44 +769,12 @@ fn write_tokenizer(
         })
         .unwrap_or_default();
 
-    // An instruction-tuned model answers inside a turn it was asked to open.
-    // Templating is therefore the default, and dropping to the bare prompt is
-    // an explicit choice — either the caller's, or forced by a tokenizer that
-    // has no turn markers to template with.
-    let templated = !raw_prompt && supports_gemma_turns(&vocab_map);
-    if !raw_prompt && !templated {
-        println!(
-            "prompt: no {TURN_OPEN}/{TURN_CLOSE}/{BOS_TOKEN} in this vocabulary — \
-             committing the bare prompt"
-        );
-    }
-    let rendered = if templated {
-        render_gemma_turns(prompt)
-    } else {
-        prompt.to_string()
-    };
-    let pieces = if templated {
-        split_prompt(&rendered, &vocab_map, &special_tokens)
-    } else {
-        split_prompt(&rendered, &vocab_map, &[])
-    };
-
     println!(
         "tokenizer: {} entries, {} merges",
         vocab.len(),
         merges.len()
     );
-    println!(
-        "prompt: {} · {} terminal id(s)",
-        if templated {
-            "gemma turn template"
-        } else {
-            "raw"
-        },
-        eos_ids.len()
-    );
-    println!("rendered prompt: {rendered:?}");
-    println!("prompt pieces: {pieces:?}");
+    println!("tokenizer: {} terminal id(s)", eos_ids.len());
 
     let (vocab_bucket_count, vocab_buckets) = bucket_vocab(vocab);
     let (merge_bucket_count, merge_buckets) = bucket_merges(merges);
@@ -903,23 +789,9 @@ fn write_tokenizer(
         "raster-stages/prompt-prepare",
         "tokenizer",
     )?;
-    let pieces_commitment = write_external(
-        &BpePieces {
-            pieces: pieces.into(),
-        },
-        "raster-stages/prompt-prepare",
-        "initial_pieces",
-    )?;
-
-    // The first stage is the only one with its own inputs, so it is also the
-    // only one that can be run standalone; keep its fixtures in step with the
-    // externals just written.
     write_stage_fixtures(
         "raster-stages/prompt-prepare",
-        &[
-            ("tokenizer", "tokenizer", &tokenizer_commitment),
-            ("initial_pieces", "initial_pieces", &pieces_commitment),
-        ],
+        &[("tokenizer", "tokenizer", &tokenizer_commitment)],
     )?;
 
     stages.push(format!(
@@ -938,9 +810,9 @@ fn write_tokenizer(
         ),
         external_line(
             "initial_pieces",
-            "raster-stages/prompt-prepare",
+            "target/raster-inference/run-prompt-placeholder",
             "initial_pieces",
-            &pieces_commitment
+            INITIAL_PIECES_PLACEHOLDER_COMMITMENT
         ),
     ));
     Ok(decoder_commitment)
@@ -1039,69 +911,6 @@ fn parse_merge(rank: u32, entry: &serde_json::Value) -> Option<BpeMerge> {
         right,
         merged,
     })
-}
-
-/// Renders one user message plus the generation prompt, the way the model's
-/// `chat_template.jinja` does for `add_generation_prompt: true`.
-fn render_gemma_turns(prompt: &str) -> String {
-    format!(
-        "{BOS_TOKEN}{TURN_OPEN}user\n{}{TURN_CLOSE}\n{TURN_OPEN}model\n",
-        prompt.trim()
-    )
-}
-
-/// Whether this tokenizer has the tokens the turn format is made of.
-///
-/// `tiny-gemma-dev` does not: templating against it would emit pieces the
-/// vocabulary pass resolves to `<unk>`, which is worse than the bare prompt.
-fn supports_gemma_turns(vocab: &BTreeMap<String, u32>) -> bool {
-    [BOS_TOKEN, TURN_OPEN, TURN_CLOSE, NEWLINE_TOKEN]
-        .iter()
-        .all(|token| vocab.contains_key(*token))
-}
-
-/// Splits a prompt into the initial pieces the tokenizer stage consumes:
-/// whole special tokens, then SentencePiece's space marker, one piece per
-/// character, byte-fallback for anything the vocabulary does not have, and the
-/// end-of-word terminator.
-///
-/// `specials` is matched longest-first and never split. A special token is a
-/// single vocabulary entry whose text is several characters, and no merge rule
-/// mentions one — so the merge pass could never reassemble it from characters,
-/// and every turn marker would tokenize as its own punctuation.
-fn split_prompt(prompt: &str, vocab: &BTreeMap<String, u32>, specials: &[String]) -> Vec<String> {
-    let mut pieces = Vec::new();
-    let mut rest = prompt;
-    while !rest.is_empty() {
-        if let Some(special) = specials
-            .iter()
-            .find(|token| rest.starts_with(token.as_str()))
-        {
-            pieces.push(special.clone());
-            rest = &rest[special.len()..];
-            continue;
-        }
-        let ch = rest.chars().next().expect("rest is non-empty");
-        rest = &rest[ch.len_utf8()..];
-        let piece = if ch == ' ' {
-            String::from('\u{2581}')
-        } else {
-            ch.to_string()
-        };
-        if vocab.contains_key(&piece) {
-            pieces.push(piece);
-        } else {
-            // Byte fallback: `<0xNN>` per UTF-8 byte, as the tokenizer declares.
-            // Over the *piece*, not the source character: a space that reached
-            // here is `▁`, and its three bytes are what the vocabulary would
-            // have to spell.
-            for byte in piece.as_bytes() {
-                pieces.push(format!("<0x{byte:02X}>"));
-            }
-        }
-    }
-    pieces.push(END_OF_WORD.to_string());
-    pieces
 }
 
 // ---------------------------------------------------------------------------
@@ -1550,11 +1359,6 @@ mod tests {
             [
                 "--model",
                 "fixtures/model",
-                "--prompt",
-                "hello",
-                "--raw-prompt",
-                "--tokens",
-                "3",
                 "--manifest",
                 "Raster.toml",
                 "--only-tokenizer",
@@ -1568,9 +1372,6 @@ mod tests {
             config,
             ImportConfig {
                 model_dir: PathBuf::from("fixtures/model"),
-                prompt: String::from("hello"),
-                raw_prompt: true,
-                tokens: 3,
                 manifest: Some(PathBuf::from("Raster.toml")),
                 only_tokenizer: true,
                 only_layers: false,
@@ -1583,19 +1384,9 @@ mod tests {
 
     #[test]
     fn parse_args_accepts_only_direct() {
-        let config = parse_args_from(
-            [
-                "--model",
-                "fixtures/model",
-                "--prompt",
-                "hello",
-                "--tokens",
-                "3",
-                "--only-direct",
-            ]
-            .map(String::from),
-        )
-        .unwrap();
+        let config =
+            parse_args_from(["--model", "fixtures/model", "--only-direct"].map(String::from))
+                .unwrap();
 
         assert!(config.only_direct);
         assert!(!config.only_tokenizer);
@@ -1623,10 +1414,29 @@ mod tests {
 
     #[test]
     fn parse_args_requires_model_dir() {
-        let error = parse_args_from([String::from("--prompt"), String::from("hello")])
+        let error = parse_args_from([String::from("--manifest"), String::from("Raster.toml")])
             .unwrap_err()
             .to_string();
 
         assert!(error.contains("--model <bundle-dir> is required"));
+    }
+
+    #[test]
+    fn parse_args_rejects_import_time_prompt_flags() {
+        let error = parse_args_from(
+            [
+                "--model",
+                "fixtures/model",
+                "--prompt",
+                "hello",
+                "--tokens",
+                "3",
+            ]
+            .map(String::from),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("unknown argument '--prompt'"));
     }
 }

@@ -97,8 +97,15 @@ fn execute(cli: Cli) -> Result<ExitCode> {
             } else {
                 staged_infer::chain_runner::StagedExecutionBackend::InProcess
             };
-            let run =
-                staged_infer::chain_runner::run(raster_stage.as_deref(), &exe, staged_backend)?;
+            let manifest_path = std::env::current_dir()
+                .context("failed to read current directory")?
+                .join("Raster.toml");
+            let run = staged_infer::chain_runner::run(
+                &manifest_path,
+                raster_stage.as_deref(),
+                &exe,
+                staged_backend,
+            )?;
             if let Some(selected_stage_dir) = run.selected_stage_dir.as_ref() {
                 let report = staged_infer::parity::read_parity_report(selected_stage_dir)?;
                 print!(

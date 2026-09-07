@@ -56,7 +56,7 @@ enum Commands {
         command: ClaimCommand,
     },
     /// Fast unconstrained deterministic inference.
-    Infer,
+    Infer(InferArgs),
     /// Challenge workflows reserved for the verifier path.
     Challenge {
         #[command(subcommand)]
@@ -79,12 +79,6 @@ enum ModelCommand {
 struct ModelImportArgs {
     #[arg(long = "model")]
     model_dir: PathBuf,
-    #[arg(long, default_value = "hello raster")]
-    prompt: String,
-    #[arg(long = "raw-prompt")]
-    raw_prompt: bool,
-    #[arg(long, default_value_t = 1)]
-    tokens: u32,
     #[arg(long)]
     manifest: Option<PathBuf>,
     #[arg(long = "only-tokenizer")]
@@ -99,6 +93,13 @@ struct ModelImportArgs {
     only_direct: bool,
 }
 
+#[derive(Debug, Args)]
+struct InferArgs {
+    /// Run spec to execute.
+    #[arg(long, default_value = inference_artifacts::INFERENCE_RUN_SPEC_TOML)]
+    run: PathBuf,
+}
+
 #[derive(Debug, Subcommand)]
 enum ClaimCommand {
     /// Build a staged-infer checkpoint claim.
@@ -107,6 +108,10 @@ enum ClaimCommand {
 
 #[derive(Debug, Args)]
 struct ClaimBuildArgs {
+    /// Run spec to execute.
+    #[arg(long, default_value = inference_artifacts::INFERENCE_RUN_SPEC_TOML)]
+    run: PathBuf,
+
     /// Use the previous per-stage child-process staged-infer runner.
     #[arg(long = "staged-subprocess", alias = "direct-subprocess", hide = true)]
     staged_subprocess: bool,
@@ -180,14 +185,17 @@ fn execute(cli: Cli) -> Result<ExitCode> {
         }) => {
             warn_if_debug_build("claim build");
             let result = build_claim(args.into_options()?)?;
+            if let Some(final_result) = result.final_result.as_ref() {
+                print_infer_result(final_result);
+            }
             println!("checkpoint trace: {}", result.checkpoint_trace_path.display());
             println!("checkpoint hashes: {}", result.checkpoint_hashes_path.display());
             println!("claim bundle: {}", result.claim_bundle_path.display());
             Ok(ExitCode::SUCCESS)
         }
-        Some(Commands::Infer) => {
+        Some(Commands::Infer(args)) => {
             warn_if_debug_build("infer");
-            let report = run_infer()?;
+            let report = run_infer(args.run)?;
             print_infer_result(&report.result);
             print_infer_timing_summary(&report.timings);
             Ok(ExitCode::SUCCESS)
@@ -226,9 +234,13 @@ fn warn_if_debug_build(_workflow: &str) {}
 
 #[derive(Debug, Args)]
 struct ChallengeBuildArgs {
+    /// Claim bundle to challenge. Preferred over --trace because it carries frozen run metadata.
+    #[arg(long)]
+    claim: Option<PathBuf>,
+
     /// Existing checkpoint trace to challenge.
     #[arg(long)]
-    trace: PathBuf,
+    trace: Option<PathBuf>,
 
     /// Use the previous per-stage child-process staged-infer runner.
     #[arg(long = "staged-subprocess", alias = "direct-subprocess", hide = true)]
@@ -502,9 +514,6 @@ impl ModelImportArgs {
     fn into_import_config(self) -> model_import::ImportConfig {
         model_import::ImportConfig {
             model_dir: self.model_dir,
-            prompt: self.prompt,
-            raw_prompt: self.raw_prompt,
-            tokens: self.tokens,
             manifest: self.manifest,
             only_tokenizer: self.only_tokenizer,
             only_layers: self.only_layers,
@@ -523,13 +532,20 @@ impl ClaimBuildArgs {
         } else {
             staged_infer::chain_runner::StagedExecutionBackend::InProcess
         };
-        ClaimBuildOptions::from_current_dir(current_exe, staged_backend)
+        ClaimBuildOptions::from_current_dir(current_exe, staged_backend, self.run)
     }
 }
 
 impl ChallengeBuildArgs {
     fn into_options(self) -> Result<ChallengeBuildOptions> {
-        let input = ChallengeInput::Trace(self.trace);
+        let input = match (self.claim, self.trace) {
+            (Some(claim), None) => ChallengeInput::Claim(claim),
+            (None, Some(trace)) => ChallengeInput::Trace(trace),
+            (Some(_), Some(_)) => {
+                anyhow::bail!("challenge build accepts either --claim or --trace, not both")
+            }
+            (None, None) => anyhow::bail!("challenge build requires --claim <claim_bundle.json>"),
+        };
         let current_exe = std::env::current_exe().context("failed to locate current executable")?;
         let staged_backend = if self.staged_subprocess {
             staged_infer::chain_runner::StagedExecutionBackend::Subprocess
@@ -552,13 +568,16 @@ mod tests {
             "import",
             "--model",
             "fixtures/model",
-            "--prompt",
-            "hello",
-            "--tokens",
-            "2",
         ])
         .unwrap();
-        parse_for_test(["raster-inference", "claim", "build"]).unwrap();
+        parse_for_test([
+            "raster-inference",
+            "claim",
+            "build",
+            "--run",
+            "inference.toml",
+        ])
+        .unwrap();
         parse_for_test([
             "raster-inference",
             "challenge",
@@ -567,7 +586,7 @@ mod tests {
             "checkpoint_trace.json",
         ])
         .unwrap();
-        parse_for_test(["raster-inference", "infer"]).unwrap();
+        parse_for_test(["raster-inference", "infer", "--run", "inference.toml"]).unwrap();
         parse_for_test([
             "raster-inference",
             "model",
@@ -583,7 +602,7 @@ mod tests {
     fn infer_requires_an_imported_workspace() {
         let error = execute_from(["raster-inference", "infer"]).unwrap_err();
 
-        assert!(format!("{error:#}").contains("raster-inference model import"));
+        assert!(format!("{error:#}").contains("failed to load run spec"));
     }
 
     #[test]
@@ -619,9 +638,6 @@ mod tests {
     fn model_import_args_build_typed_config() {
         let config = ModelImportArgs {
             model_dir: PathBuf::from("model"),
-            prompt: String::from("hi"),
-            raw_prompt: true,
-            tokens: 3,
             manifest: Some(PathBuf::from("Raster.toml")),
             only_tokenizer: true,
             only_layers: false,
@@ -635,9 +651,6 @@ mod tests {
             config,
             model_import::ImportConfig {
                 model_dir: PathBuf::from("model"),
-                prompt: String::from("hi"),
-                raw_prompt: true,
-                tokens: 3,
                 manifest: Some(PathBuf::from("Raster.toml")),
                 only_tokenizer: true,
                 only_layers: false,

@@ -874,6 +874,7 @@ dependencies = [
  "prefill-range",
  "prompt-prepare",
  "raster",
+ "run-prep",
  "serde",
  "serde_json",
  "sha2",
@@ -1602,6 +1603,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "toml",
 ]
 
 [[package]]
@@ -2436,6 +2438,7 @@ dependencies = [
  "inference-artifacts",
  "model-import",
  "raster-runtime",
+ "run-prep",
  "serde",
  "serde_json",
  "sha2",
@@ -2951,6 +2954,18 @@ checksum = "b4382d3af3a4ebdae7f64ba6edd9114fff92c89808004c4943b393377a25d001"
 dependencies = [
  "downcast-rs",
  "paste",
+]
+
+[[package]]
+name = "run-prep"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "inference-artifacts",
+ "output-finalize",
+ "prompt-prepare",
+ "raster",
+ "serde_json",
 ]
 
 [[package]]
