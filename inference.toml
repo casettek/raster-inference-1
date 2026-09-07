@@ -1,4 +1,4 @@
-model_manifest = "model-artifacts/manifest.json"
+model_manifest = "runtime/model-artifacts/manifest.json"
 prompt = "what is the essence of life?"
 raw_prompt = false
 tokens = 7
