@@ -1,4 +1,4 @@
 model_manifest = "model-artifacts/manifest.json"
-prompt = "say ciao"
+prompt = "what is the essence of life?"
 raw_prompt = false
-tokens = 1
+tokens = 7

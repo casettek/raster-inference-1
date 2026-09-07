@@ -10,8 +10,8 @@ use staged_infer::{
 };
 
 use inference_artifacts::{
-    read_json, read_run_spec, write_claim_artifacts_with_prepared_run, write_json,
-    InferenceResult, ModelManifest, PreparedRun, PREPARED_RUN_JSON,
+    read_json, read_run_spec, write_claim_artifacts_with_prepared_run, write_json, InferenceResult,
+    ModelManifest, PreparedRun, PREPARED_RUN_JSON,
 };
 use sha2::{Digest, Sha256};
 

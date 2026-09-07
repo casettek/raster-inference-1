@@ -13,13 +13,6 @@ use raster::List;
 
 use crate::model::{DirectFinalHead, DirectInferenceModel, DirectPleLayer, DirectTransformerLayer};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NextTokenScore {
-    pub decode_position: u32,
-    pub token_id: u32,
-    pub value: i32,
-}
-
 pub fn run_input_embedding_view(
     model: &DirectInferenceModel,
     prompt: &prompt_prepare::input::PromptTokenization,
@@ -141,10 +134,10 @@ pub fn run_prefill_range_view(
     })
 }
 
-pub fn score_next_token_view(
+pub fn score_prefill_logits_view(
     activations: &ActivationSequence,
     head: &DirectFinalHead<'_>,
-) -> Result<NextTokenScore> {
+) -> Result<decode_select_token::input::PrefillLogits> {
     let position = activations.rows.iter().last().ok_or_else(|| {
         anyhow::anyhow!("prefill produced no activation rows; there is no final position to score")
     })?;
@@ -159,45 +152,20 @@ pub fn score_next_token_view(
     let norm = unpack(&head.params.norm_weights)?;
     prefill_finalize::input::rms_norm(&mut values, &norm, head.params.norm_eps)
         .map_err(anyhow::Error::msg)?;
-    let mut best_token = 0;
-    let mut best_value = 0;
-    let mut has_value = false;
+    let mut logits = Vec::with_capacity(head.projection.rows());
     for token_id in 0..head.projection.rows() {
         let value = head.projection.row_dot(token_id, &values)?;
         let value = prefill_finalize::input::softcap(value, head.params.softcap);
-        if !has_value || value > best_value {
-            has_value = true;
-            best_token = token_id as u32;
-            best_value = value;
-        }
+        logits.push(decode_select_token::input::LogitEntry {
+            token_id: token_id as u32,
+            value,
+        });
     }
-    if !has_value {
-        bail!("output decode requires at least one logit to select the next token");
-    }
-    Ok(NextTokenScore {
+    Ok(decode_select_token::input::PrefillLogits {
         decode_position: activations.start_position + activations.rows.len() as u32,
-        token_id: best_token,
-        value: best_value,
+        logits: List::from(logits),
+        errors: List::new(),
     })
-}
-
-pub fn advance_decode_edge(
-    score: NextTokenScore,
-    prior: &decode_select_token::input::DecodeEdge,
-) -> decode_select_token::input::DecodeEdge {
-    let mut generated_token_ids = prior
-        .generated_token_ids
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
-    generated_token_ids.push(score.token_id);
-    decode_select_token::input::DecodeEdge {
-        has_selected: true,
-        decode_position: score.decode_position,
-        token_id: score.token_id,
-        value: score.value,
-        generated_token_ids: List::from(generated_token_ids),
-    }
 }
 
 struct InputRows {

@@ -1,14 +1,17 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use inference_artifacts::{
     read_run_spec, InferStageTiming, InferenceResult, InferenceRunReport, InferenceTimings,
 };
+use serde::Serialize;
 
 use crate::model::DirectInferenceModel;
 use crate::view_kernels::{
-    advance_decode_edge, run_decode_embed_view, run_input_embedding_view, run_ple_prepare_view,
-    run_prefill_range_view, score_next_token_view, NextTokenScore,
+    run_decode_embed_view, run_input_embedding_view, run_ple_prepare_view, run_prefill_range_view,
+    score_prefill_logits_view,
 };
 use crate::DirectInferenceConfig;
 
@@ -23,6 +26,7 @@ impl DirectInferenceExecutor {
     pub fn run_with_report(&self, config: DirectInferenceConfig) -> Result<InferenceRunReport> {
         let infer_started = Instant::now();
         let mut timings = Vec::new();
+        let mut trace = DirectTrace::from_env()?;
         let run_spec_path = if config.run_spec_path.is_absolute() {
             config.run_spec_path.clone()
         } else {
@@ -51,20 +55,23 @@ impl DirectInferenceExecutor {
         let prompt_started = Instant::now();
         let prepared_prompt = model.prepare_prompt(run_spec_dir, &run_spec)?;
         let prompt = model.prompt_inputs(&prepared_prompt)?;
+        trace.record("prompt_prepare", &prompt)?;
         timings.push(phase_timing("prompt_prepare", prompt_started.elapsed()));
 
         let embedding_started = Instant::now();
         let empty_or_embedding = run_input_embedding_view(&model, &prompt)?;
+        trace.record("input_embedding", &empty_or_embedding)?;
         timings.push(phase_timing("input_embedding", embedding_started.elapsed()));
 
         let prefill_started = Instant::now();
-        let (mut prior_layers, mut score) = run_layers_and_score(
+        let (mut prior_layers, mut logits) = run_layers_and_logits(
             &model,
             empty_or_embedding.clone(),
             empty_or_embedding.clone(),
             None,
             &mut timings,
             "prefill",
+            &mut trace,
         )?;
         timings.push(phase_timing("prefill", prefill_started.elapsed()));
 
@@ -73,21 +80,29 @@ impl DirectInferenceExecutor {
             host_kernels::kernels::decode_init::DecodeInitDirectInputs,
         )?;
         for token_idx in 0..run_spec.tokens {
-            edge = advance_decode_edge(score, &edge);
+            edge = host_kernels::kernels::decode_select_token::run_decode_select_token_direct(
+                host_kernels::kernels::decode_select_token::DecodeSelectTokenDirectInputs {
+                    logits: &logits,
+                    prior: &edge,
+                },
+            )?;
+            trace.record(&format!("decode_select_t{token_idx}"), &edge)?;
             if token_idx + 1 == run_spec.tokens {
                 break;
             }
             let decode_seed = run_decode_embed_view(&model, &edge)?;
-            let (next_prior_layers, next_score) = run_layers_and_score(
+            trace.record(&format!("decode_embed_t{token_idx}"), &decode_seed)?;
+            let (next_prior_layers, next_logits) = run_layers_and_logits(
                 &model,
                 decode_seed,
                 empty_or_embedding.clone(),
                 Some(&prior_layers),
                 &mut timings,
                 &format!("decode_t{token_idx}"),
+                &mut trace,
             )?;
             prior_layers = next_prior_layers;
-            score = next_score;
+            logits = next_logits;
         }
         timings.push(phase_timing("decode", decode_started.elapsed()));
 
@@ -106,6 +121,7 @@ impl DirectInferenceExecutor {
                 decoder: &decoder,
             },
         )?;
+        trace.record("output_finalize", &output)?;
         let result = InferenceResult {
             generated_token_count: output.generated_token_count,
             generated_token_ids: output.generated_token_ids.iter().copied().collect(),
@@ -126,23 +142,26 @@ impl DirectInferenceExecutor {
     }
 }
 
-fn run_layers_and_score(
+fn run_layers_and_logits(
     model: &DirectInferenceModel,
     seed: prefill_range::input::ActivationSequence,
     empty_or_embedding: prefill_range::input::ActivationSequence,
     prior_layers: Option<&[prefill_range::input::ActivationSequence]>,
     timings: &mut Vec<InferStageTiming>,
     label: &str,
+    trace: &mut DirectTrace,
 ) -> Result<(
     Vec<prefill_range::input::ActivationSequence>,
-    NextTokenScore,
+    decode_select_token::input::PrefillLogits,
 )> {
+    let ple_source = seed.clone();
     let mut current = seed;
     let mut layer_outputs = Vec::with_capacity(model.shape().num_hidden_layers as usize);
     for layer_idx in 0..model.shape().num_hidden_layers as usize {
         let aux_started = Instant::now();
         let ple_layer = model.direct_ple_layer(layer_idx)?;
-        let ple = run_ple_prepare_view(&current, &ple_layer)?;
+        let ple = run_ple_prepare_view(&ple_source, &ple_layer)?;
+        trace.record(&aux_stage_name(label, layer_idx), &ple)?;
         timings.push(phase_timing(
             &format!("{label}_prefill_prepare_aux_l{layer_idx}"),
             aux_started.elapsed(),
@@ -166,6 +185,7 @@ fn run_layers_and_score(
         );
         current =
             run_prefill_range_view(&current, &layer, &prior_kv, &donor_a_kv, &donor_b_kv, &ple)?;
+        trace.record(&range_stage_name(label, layer_idx), &current)?;
         layer_outputs.push(current.clone());
         timings.push(phase_timing(
             &format!("{label}_prefill_range_l{layer_idx}"),
@@ -175,12 +195,13 @@ fn run_layers_and_score(
 
     let finalize_started = Instant::now();
     let head = model.direct_final_head()?;
-    let score = score_next_token_view(&current, &head)?;
+    let logits = score_prefill_logits_view(&current, &head)?;
+    trace.record(&finalize_stage_name(label), &logits)?;
     timings.push(phase_timing(
         &format!("{label}_prefill_finalize"),
         finalize_started.elapsed(),
     ));
-    Ok((layer_outputs, score))
+    Ok((layer_outputs, logits))
 }
 
 fn donor_input(
@@ -195,6 +216,96 @@ fn donor_input(
         .get(donor_layer as usize)
         .cloned()
         .unwrap_or_else(|| fallback.clone())
+}
+
+struct DirectTrace {
+    print: bool,
+    expected: BTreeMap<String, String>,
+    first_mismatch: Option<String>,
+}
+
+impl DirectTrace {
+    fn from_env() -> Result<Self> {
+        let expected = match std::env::var_os("DIRECT_INFER_COMPARE_TRACE") {
+            Some(path) => {
+                let trace_path = PathBuf::from(path);
+                let trace = inference_artifacts::read_checkpoint_trace(&trace_path)
+                    .with_context(|| format!("failed to read {}", trace_path.display()))?;
+                trace
+                    .checkpoints
+                    .into_iter()
+                    .map(|checkpoint| (checkpoint.stage, checkpoint.output_commitment))
+                    .collect()
+            }
+            None => BTreeMap::new(),
+        };
+        let print = std::env::var("DIRECT_INFER_TRACE_COMMITMENTS")
+            .map(|value| !value.eq_ignore_ascii_case("off") && value != "0")
+            .unwrap_or(false)
+            || !expected.is_empty();
+        if print {
+            raster::init();
+        }
+        Ok(Self {
+            print,
+            expected,
+            first_mismatch: None,
+        })
+    }
+
+    fn record<T: Serialize>(&mut self, stage: &str, value: &T) -> Result<()> {
+        if !self.print {
+            return Ok(());
+        }
+        let (_, _, commitment) =
+            raster::encode_raster_value(value).map_err(|error| anyhow::anyhow!("{error}"))?;
+        match self.expected.get(stage) {
+            Some(expected) if expected == &commitment => {
+                eprintln!("direct-infer trace {stage}: structural={commitment} MATCH");
+            }
+            Some(expected) => {
+                eprintln!(
+                    "direct-infer trace {stage}: structural={commitment} MISMATCH expected={expected}"
+                );
+                if self.first_mismatch.is_none() {
+                    self.first_mismatch = Some(stage.to_string());
+                    eprintln!("direct-infer first mismatch: {stage}");
+                }
+            }
+            None => eprintln!("direct-infer trace {stage}: structural={commitment}"),
+        }
+        Ok(())
+    }
+}
+
+fn aux_stage_name(label: &str, layer_idx: usize) -> String {
+    if label == "prefill" {
+        format!("prefill_prepare_aux_l{layer_idx}")
+    } else if let Some(token_idx) = label.strip_prefix("decode_t") {
+        format!("decode_aux_t{token_idx}_l{layer_idx}")
+    } else {
+        format!("{label}_prefill_prepare_aux_l{layer_idx}")
+    }
+}
+
+fn range_stage_name(label: &str, layer_idx: usize) -> String {
+    if label == "prefill" {
+        format!("prefill_range_l{layer_idx}")
+    } else if let Some(token_idx) = label.strip_prefix("decode_t") {
+        format!("decode_range_t{token_idx}_l{layer_idx}")
+    } else {
+        format!("{label}_prefill_range_l{layer_idx}")
+    }
+}
+
+fn finalize_stage_name(label: &str) -> String {
+    if label == "prefill" {
+        String::from("prefill_finalize")
+    } else if let Some(token_idx) = label.strip_prefix("decode_t") {
+        format!("decode_finalize_t{token_idx}")
+    } else {
+        format!("{label}_prefill_finalize")
+    }
 }
 
 fn phase_timing(stage: &str, duration: Duration) -> InferStageTiming {

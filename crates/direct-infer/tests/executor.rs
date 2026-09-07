@@ -4,8 +4,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use direct_infer::detwgt::MmapDetwgt;
 use direct_infer::model::{DirectFinalHead, DirectMatrixView};
-use direct_infer::view_kernels::score_next_token_view;
+use direct_infer::view_kernels::score_prefill_logits_view;
 use direct_infer::{DirectInferenceConfig, DirectInferenceExecutor};
+use host_kernels::kernels::decode_select_token::{
+    run_decode_select_token_direct, DecodeSelectTokenDirectInputs,
+};
 use host_kernels::tensor::{dot_bits, matvec_from_source, Matrix, MatrixSource};
 use inference_artifacts::{
     write_json, DirectInferBundle, DirectInferShape, InferenceRunSpec, ModelManifest,
@@ -136,7 +139,7 @@ fn row_dot_matches_dot_bits_for_i16_and_i32() {
 }
 
 #[test]
-fn final_head_streaming_selection_matches_eager_tie_break() {
+fn final_head_logits_feed_shared_decode_select_tie_break() {
     let dir = temp_dir("stream-final-head");
     fs::create_dir_all(&dir).unwrap();
     let detwgt = dir.join("model.detwgt");
@@ -169,11 +172,44 @@ fn final_head_streaming_selection_matches_eager_tie_break() {
         kv: List::new(),
         start_position: 0,
     };
-    let score = score_next_token_view(&activations, &head).unwrap();
+    let logits = score_prefill_logits_view(&activations, &head).unwrap();
+    let prior = host_kernels::kernels::decode_init::run_decode_init_direct(
+        host_kernels::kernels::decode_init::DecodeInitDirectInputs,
+    )
+    .unwrap();
+    let edge = run_decode_select_token_direct(DecodeSelectTokenDirectInputs {
+        logits: &logits,
+        prior: &prior,
+    })
+    .unwrap();
 
-    assert_eq!(score.token_id, 0, "equal scores keep the earliest token");
+    assert_eq!(logits.decode_position, 1);
+    assert_eq!(logits.logits.len(), 3);
+    assert_eq!(edge.token_id, 0, "equal scores keep the earliest token");
+    assert_eq!(
+        edge.generated_token_ids.iter().copied().collect::<Vec<_>>(),
+        vec![0]
+    );
 
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires local Gemma model artifacts and runs the full direct inference path"]
+fn current_say_ciao_direct_first_token_matches_claim_reference() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repo root should resolve");
+    let result = DirectInferenceExecutor
+        .run(DirectInferenceConfig {
+            base_dir: repo.clone(),
+            run_spec_path: repo.join(INFERENCE_RUN_SPEC_TOML),
+        })
+        .unwrap();
+
+    assert_eq!(result.generated_token_ids.first().copied(), Some(150917));
+    assert_eq!(result.generated_text, "Ciao");
 }
 
 #[test]

@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode, ExitStatus};
@@ -184,9 +185,10 @@ fn execute(cli: Cli) -> Result<ExitCode> {
             command: ClaimCommand::Build(args),
         }) => {
             warn_if_debug_build("claim build");
+            let run_spec_path = args.run.clone();
             let result = build_claim(args.into_options()?)?;
             if let Some(final_result) = result.final_result.as_ref() {
-                print_infer_result(final_result);
+                print_infer_result(final_result, Some(&run_spec_path));
             }
             println!("checkpoint trace: {}", result.checkpoint_trace_path.display());
             println!("checkpoint hashes: {}", result.checkpoint_hashes_path.display());
@@ -195,8 +197,9 @@ fn execute(cli: Cli) -> Result<ExitCode> {
         }
         Some(Commands::Infer(args)) => {
             warn_if_debug_build("infer");
+            let run_spec_path = args.run.clone();
             let report = run_infer(args.run)?;
-            print_infer_result(&report.result);
+            print_infer_result(&report.result, Some(&run_spec_path));
             print_infer_timing_summary(&report.timings);
             Ok(ExitCode::SUCCESS)
         }
@@ -291,16 +294,218 @@ fn print_challenge_result(result: &ChallengeBuildResult) {
     }
 }
 
-fn print_infer_result(result: &staged_infer::InferenceResult) {
+fn print_infer_result(result: &staged_infer::InferenceResult, run_spec_path: Option<&Path>) {
     println!("generated token count: {}", result.generated_token_count);
     println!("generated token ids: {:?}", result.generated_token_ids);
     println!(
         "generated token ids sha256: {}",
         result.generated_token_ids_sha256
     );
+    if let Some(run_spec_path) = run_spec_path {
+        match render_token_trace_for_run(result, run_spec_path) {
+            Ok(trace) => print!("{trace}"),
+            Err(error) => eprintln!("generated token trace unavailable: {error:#}"),
+        }
+    }
     println!("stop reason: {}", result.stop_reason);
     println!("generated text:");
     println!("{}", result.generated_text);
+}
+
+fn render_token_trace_for_run(
+    result: &staged_infer::InferenceResult,
+    run_spec_path: &Path,
+) -> Result<String> {
+    let base_dir = std::env::current_dir().context("failed to read current directory")?;
+    let run_spec_path = absolute(&base_dir, run_spec_path);
+    let run_spec = inference_artifacts::read_run_spec(&run_spec_path)?;
+    let run_spec_dir = run_spec_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("run spec has no parent directory"))?;
+    let model_manifest_path = absolute(run_spec_dir, &run_spec.model_manifest);
+    let model_manifest: inference_artifacts::ModelManifest =
+        inference_artifacts::read_json(&model_manifest_path)?;
+    let model_manifest_dir = model_manifest_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("model manifest has no parent directory"))?;
+    let tokenizer_path = absolute(model_manifest_dir, &model_manifest.bundle.tokenizer_path);
+    let tokenizer: serde_json::Value = inference_artifacts::read_json(&tokenizer_path)?;
+    let decoder = TokenDecoder::from_tokenizer(&tokenizer, &model_manifest.eos_token_ids)?;
+    Ok(render_token_trace(result, &decoder))
+}
+
+fn render_token_trace(result: &staged_infer::InferenceResult, decoder: &TokenDecoder) -> String {
+    let mut out = String::from("generated tokens:\n");
+    let mut stopped = false;
+    for (idx, token_id) in result.generated_token_ids.iter().copied().enumerate() {
+        let display = decoder.display(token_id, stopped);
+        if display.kind == TokenKind::Terminal {
+            stopped = true;
+        }
+        out.push_str(&format!(
+            "  {idx}: id={token_id} token={} kind={} rendered={}\n",
+            display.token,
+            display.kind.as_str(),
+            display.rendered
+        ));
+    }
+    out
+}
+
+#[derive(Debug)]
+struct TokenDecoder {
+    tokens: BTreeMap<u32, String>,
+    special_ids: BTreeSet<u32>,
+    terminal_ids: BTreeSet<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    Text,
+    Special,
+    Terminal,
+    Byte,
+    Unknown,
+    AfterStop,
+}
+
+struct TokenDisplay {
+    token: String,
+    kind: TokenKind,
+    rendered: String,
+}
+
+impl TokenKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Special => "special",
+            Self::Terminal => "terminal",
+            Self::Byte => "byte",
+            Self::Unknown => "unknown",
+            Self::AfterStop => "after_stop",
+        }
+    }
+}
+
+impl TokenDecoder {
+    fn from_tokenizer(tokenizer: &serde_json::Value, eos_ids: &[u32]) -> Result<Self> {
+        let mut tokens = tokenizer
+            .get("model")
+            .and_then(|model| model.get("vocab"))
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("tokenizer.json has no vocab"))?
+            .iter()
+            .map(|(token, id)| {
+                Ok((
+                    id.as_u64()
+                        .ok_or_else(|| anyhow::anyhow!("token '{token}' has non-integer id"))?
+                        as u32,
+                    token.clone(),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let mut special_ids = BTreeSet::new();
+        if let Some(added_tokens) = tokenizer
+            .get("added_tokens")
+            .and_then(serde_json::Value::as_array)
+        {
+            for entry in added_tokens {
+                let Some(id) = entry.get("id").and_then(serde_json::Value::as_u64) else {
+                    continue;
+                };
+                if let Some(content) = entry.get("content").and_then(serde_json::Value::as_str) {
+                    tokens
+                        .entry(id as u32)
+                        .or_insert_with(|| content.to_string());
+                }
+                if entry
+                    .get("special")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    special_ids.insert(id as u32);
+                }
+            }
+        }
+        Ok(Self {
+            tokens,
+            special_ids,
+            terminal_ids: eos_ids.iter().copied().collect(),
+        })
+    }
+
+    fn display(&self, token_id: u32, stopped: bool) -> TokenDisplay {
+        let Some(token) = self.tokens.get(&token_id) else {
+            return TokenDisplay {
+                token: String::from("<unknown>"),
+                kind: TokenKind::Unknown,
+                rendered: String::from("<unknown>"),
+            };
+        };
+        if stopped {
+            return TokenDisplay {
+                token: quote_token(token),
+                kind: TokenKind::AfterStop,
+                rendered: String::from("<skipped>"),
+            };
+        }
+        if self.terminal_ids.contains(&token_id) {
+            return TokenDisplay {
+                token: quote_token(token),
+                kind: TokenKind::Terminal,
+                rendered: String::from("<stops text>"),
+            };
+        }
+        if self.special_ids.contains(&token_id) {
+            return TokenDisplay {
+                token: quote_token(token),
+                kind: TokenKind::Special,
+                rendered: String::from("<skipped>"),
+            };
+        }
+        if let Some(byte) = byte_fallback(token) {
+            return TokenDisplay {
+                token: quote_token(token),
+                kind: TokenKind::Byte,
+                rendered: format!("<byte 0x{byte:02X}>"),
+            };
+        }
+        TokenDisplay {
+            token: quote_token(token),
+            kind: TokenKind::Text,
+            rendered: quote_token(&token.replace('\u{2581}', " ")),
+        }
+    }
+}
+
+fn byte_fallback(token: &str) -> Option<u8> {
+    let bytes = token.as_bytes();
+    if bytes.len() != 6 || &bytes[..3] != b"<0x" || bytes[5] != b'>' {
+        return None;
+    }
+    Some(hex_nibble(bytes[3])? * 16 + hex_nibble(bytes[4])?)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn quote_token(token: &str) -> String {
+    format!("{token:?}")
+}
+
+fn absolute(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
 }
 
 fn print_infer_timing_summary(timings: &staged_infer::InferenceTimings) {
@@ -632,6 +837,37 @@ mod tests {
         assert!(!summary.contains("stages:"));
         assert!(!summary.contains("input synthesis:"));
         assert!(!summary.contains("encode:"));
+    }
+
+    #[test]
+    fn token_trace_labels_special_terminal_byte_unknown_and_text_tokens() {
+        let decoder = TokenDecoder {
+            tokens: std::collections::BTreeMap::from([
+                (1, String::from("<eos>")),
+                (2, String::from("<bos>")),
+                (3, String::from("late")),
+                (10, String::from("<0xC3>")),
+                (150917, String::from("Ciao")),
+            ]),
+            special_ids: std::collections::BTreeSet::from([1, 2]),
+            terminal_ids: std::collections::BTreeSet::from([1]),
+        };
+        let result = staged_infer::InferenceResult {
+            generated_token_count: 6,
+            generated_token_ids: vec![2, 150917, 10, 999, 1, 3],
+            generated_token_ids_sha256: String::from("sha"),
+            generated_text: String::from("Ciao"),
+            stop_reason: String::from("eos"),
+        };
+
+        let trace = render_token_trace(&result, &decoder);
+
+        assert!(trace.contains(r#"0: id=2 token="<bos>" kind=special rendered=<skipped>"#));
+        assert!(trace.contains(r#"1: id=150917 token="Ciao" kind=text rendered="Ciao""#));
+        assert!(trace.contains(r#"2: id=10 token="<0xC3>" kind=byte rendered=<byte 0xC3>"#));
+        assert!(trace.contains("3: id=999 token=<unknown> kind=unknown rendered=<unknown>"));
+        assert!(trace.contains(r#"4: id=1 token="<eos>" kind=terminal rendered=<stops text>"#));
+        assert!(trace.contains(r#"5: id=3 token="late" kind=after_stop rendered=<skipped>"#));
     }
 
     #[test]
