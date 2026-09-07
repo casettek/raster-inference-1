@@ -76,12 +76,12 @@ impl DirectInferenceExecutor {
         timings.push(phase_timing("prefill", prefill_started.elapsed()));
 
         let decode_started = Instant::now();
-        let mut edge = host_kernels::kernels::decode_init::run_decode_init_direct(
-            host_kernels::kernels::decode_init::DecodeInitDirectInputs,
+        let mut edge = inference_kernels::kernels::decode_init::run_decode_init_direct(
+            inference_kernels::kernels::decode_init::DecodeInitDirectInputs,
         )?;
         for token_idx in 0..run_spec.tokens {
-            edge = host_kernels::kernels::decode_select_token::run_decode_select_token_direct(
-                host_kernels::kernels::decode_select_token::DecodeSelectTokenDirectInputs {
+            edge = inference_kernels::kernels::decode_select_token::run_decode_select_token_direct(
+                inference_kernels::kernels::decode_select_token::DecodeSelectTokenDirectInputs {
                     logits: &logits,
                     prior: &edge,
                 },
@@ -115,8 +115,8 @@ impl DirectInferenceExecutor {
             generated_token_ids: edge.generated_token_ids.clone(),
         };
         let decoder = model.decoder_table()?;
-        let output = host_kernels::kernels::output_finalize::run_output_finalize_direct(
-            host_kernels::kernels::output_finalize::OutputFinalizeDirectInputs {
+        let output = inference_kernels::kernels::output_finalize::run_output_finalize_direct(
+            inference_kernels::kernels::output_finalize::OutputFinalizeDirectInputs {
                 edge: &output_edge,
                 decoder: &decoder,
             },

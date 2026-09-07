@@ -1,6 +1,6 @@
 # Artifact Contracts
 
-The stable contract types and filenames live in `crates/inference-artifacts`.
+The stable contract types and filenames live in `crates/inference/artifacts`.
 
 ## Model And Run Specs
 

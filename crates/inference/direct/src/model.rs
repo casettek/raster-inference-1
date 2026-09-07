@@ -8,7 +8,7 @@ use prompt_prepare::input::BpePieces;
 use raster::{Bytes, List};
 
 use detwgt::{DetwgtMatrixView, DetwgtSlice, MmapDetwgt};
-use host_kernels::tensor::MatrixSource;
+use inference_kernels::tensor::MatrixSource;
 
 const ONE: i32 = 1 << 16;
 pub const MISSING_DIRECT_MANIFEST: &str =
@@ -155,8 +155,8 @@ impl DirectInferenceModel {
         let pieces = BpePieces {
             pieces: List::from(prompt.initial_pieces.clone()),
         };
-        host_kernels::kernels::prompt_prepare::run_prompt_prepare_direct(
-            host_kernels::kernels::prompt_prepare::PromptPrepareDirectInputs {
+        inference_kernels::kernels::prompt_prepare::run_prompt_prepare_direct(
+            inference_kernels::kernels::prompt_prepare::PromptPrepareDirectInputs {
                 tokenizer: &tokenizer,
                 initial_pieces: &pieces,
             },

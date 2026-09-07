@@ -58,14 +58,17 @@ justfile                    # workflow and test shortcuts
 Raster.toml                 # prompt-free generated chain manifest template
 inference.toml              # default run spec
 crates/
-  raster-inference-cli/     # developer-facing workflow CLI
-  model-import/             # model bundle -> committed inputs/manifests
-  direct-infer/             # fast deterministic runtime
-  staged-infer/             # checkpointed chain executor and parity tooling
-  inference-artifacts/      # shared JSON contracts and artifact I/O
+  model/
+    import/                 # model bundle -> committed inputs/manifests
+    run-prep/               # prompt/run preparation helpers
+    detwgt/                 # DETWGT eager and mmap readers
+  inference/
+    cli/                    # developer-facing workflow CLI
+    direct/                 # fast deterministic runtime
+    staged/                 # checkpointed chain executor and parity tooling
+    artifacts/              # shared JSON contracts and artifact I/O
+    kernels/                # shared deterministic inference kernels
   det-num/                  # deterministic numeric primitives
-  host-kernels/             # host-side mirrors of Raster stage kernels
-  detwgt/                   # DETWGT eager and mmap readers
 raster-stages/              # verifiable Raster program crates
 manifests/                  # alternate generated manifests and examples
 docs/                       # workflow, internals, issues, proposals

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
-pub use host_kernels::MaterializationCacheKey;
+pub use inference_kernels::MaterializationCacheKey;
 use raster::List;
 use serde::Deserialize;
 

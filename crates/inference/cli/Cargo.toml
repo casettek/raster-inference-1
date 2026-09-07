@@ -11,13 +11,13 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-direct-infer = { path = "../direct-infer" }
-staged-infer = { path = "../staged-infer" }
+direct-infer = { path = "../direct" }
+staged-infer = { path = "../staged" }
 hex = "0.4"
-inference-artifacts = { path = "../inference-artifacts" }
-model-import = { path = "../model-import" }
-raster-runtime = { path = "../../../raster/crates/raster-runtime" }
-run-prep = { path = "../run-prep" }
+inference-artifacts = { path = "../artifacts" }
+model-import = { path = "../../model/import" }
+raster-runtime = { path = "../../../../raster/crates/raster-runtime" }
+run-prep = { path = "../../model/run-prep" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

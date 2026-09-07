@@ -6,10 +6,10 @@ use direct_infer::detwgt::MmapDetwgt;
 use direct_infer::model::{DirectFinalHead, DirectMatrixView};
 use direct_infer::view_kernels::score_prefill_logits_view;
 use direct_infer::{DirectInferenceConfig, DirectInferenceExecutor};
-use host_kernels::kernels::decode_select_token::{
+use inference_kernels::kernels::decode_select_token::{
     run_decode_select_token_direct, DecodeSelectTokenDirectInputs,
 };
-use host_kernels::tensor::{dot_bits, matvec_from_source, Matrix, MatrixSource};
+use inference_kernels::tensor::{dot_bits, matvec_from_source, Matrix, MatrixSource};
 use inference_artifacts::{
     write_json, DirectInferBundle, DirectInferShape, InferenceRunSpec, ModelManifest,
     INFERENCE_RUN_SPEC_TOML, MODEL_ARTIFACTS_DIR, MODEL_MANIFEST_JSON,
@@ -173,8 +173,8 @@ fn final_head_logits_feed_shared_decode_select_tie_break() {
         start_position: 0,
     };
     let logits = score_prefill_logits_view(&activations, &head).unwrap();
-    let prior = host_kernels::kernels::decode_init::run_decode_init_direct(
-        host_kernels::kernels::decode_init::DecodeInitDirectInputs,
+    let prior = inference_kernels::kernels::decode_init::run_decode_init_direct(
+        inference_kernels::kernels::decode_init::DecodeInitDirectInputs,
     )
     .unwrap();
     let edge = run_decode_select_token_direct(DecodeSelectTokenDirectInputs {

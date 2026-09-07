@@ -865,8 +865,8 @@ dependencies = [
  "decode-select-token",
  "det-num",
  "detwgt",
- "host-kernels",
  "inference-artifacts",
+ "inference-kernels",
  "input-embedding",
  "output-finalize",
  "prefill-finalize",
@@ -1355,25 +1355,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e712f64ec3850b98572bffac52e2c6f282b29fe6c5fa6d42334b30be438d95c1"
 
 [[package]]
-name = "host-kernels"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "decode-embed",
- "decode-select-token",
- "det-num",
- "input-embedding",
- "output-finalize",
- "prefill-finalize",
- "prefill-prepare-aux",
- "prefill-range",
- "prompt-prepare",
- "raster",
- "rayon",
- "sha2",
-]
-
-[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1604,6 +1585,25 @@ dependencies = [
  "serde_json",
  "sha2",
  "toml",
+]
+
+[[package]]
+name = "inference-kernels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "decode-embed",
+ "decode-select-token",
+ "det-num",
+ "input-embedding",
+ "output-finalize",
+ "prefill-finalize",
+ "prefill-prepare-aux",
+ "prefill-range",
+ "prompt-prepare",
+ "raster",
+ "rayon",
+ "sha2",
 ]
 
 [[package]]
@@ -3220,8 +3220,8 @@ dependencies = [
  "decode-select-token",
  "det-num",
  "hex",
- "host-kernels",
  "inference-artifacts",
+ "inference-kernels",
  "input-embedding",
  "output-finalize",
  "prefill-finalize",

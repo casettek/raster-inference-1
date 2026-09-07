@@ -10,7 +10,7 @@ pub use executor::{
     CheckpointedInferenceConfig, CheckpointedInferenceExecutor, CheckpointedInferenceResult,
     ParityPolicy,
 };
-pub use host_kernels::{kernels, prefill_range, tensor};
+pub use inference_kernels::{kernels, prefill_range, tensor};
 pub use inference_artifacts::{
     InferAuxWaveTiming, InferStageTiming, InferenceResult, InferenceRunReport, InferenceTimings,
 };

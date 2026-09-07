@@ -9,7 +9,7 @@ use crate::cache::{
     materialization_key_from_stage_files, materialize_with_cache, CachedInputs,
     MaterializationCache, MaterializationCacheKey,
 };
-use host_kernels::kernels::input_embedding::{
+use inference_kernels::kernels::input_embedding::{
     run_input_embedding_direct, InputEmbeddingDirectInputs,
 };
 

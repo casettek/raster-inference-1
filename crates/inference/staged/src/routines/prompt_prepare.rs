@@ -5,7 +5,7 @@ use prompt_prepare::input::{BpePieces, PromptTokenization, PromptTokenizer};
 
 use crate::artifact_io::{with_main_sequence_scope, with_stage_sequence_scope};
 use crate::cache::CachedInputs;
-use host_kernels::kernels::prompt_prepare::{run_prompt_prepare_direct, PromptPrepareDirectInputs};
+use inference_kernels::kernels::prompt_prepare::{run_prompt_prepare_direct, PromptPrepareDirectInputs};
 
 pub struct Inputs {
     pub tokenizer: PromptTokenizer,

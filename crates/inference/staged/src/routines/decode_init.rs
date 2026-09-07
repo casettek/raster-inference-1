@@ -5,7 +5,7 @@ use decode_select_token::input::DecodeEdge;
 
 use crate::artifact_io::{with_main_sequence_scope, with_stage_sequence_scope};
 use crate::cache::CachedInputs;
-use host_kernels::kernels::decode_init::{run_decode_init_direct, DecodeInitDirectInputs};
+use inference_kernels::kernels::decode_init::{run_decode_init_direct, DecodeInitDirectInputs};
 
 pub struct Inputs;
 

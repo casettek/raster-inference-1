@@ -29,7 +29,7 @@ pub struct UncheckpointedInferenceExecutor;
 struct InferRunCache {
     stage_outputs: StageOutputCache,
     materializations: MaterializationCache,
-    prefill_range_weights: host_kernels::prefill_range::PrefillRangeWeightCache,
+    prefill_range_weights: inference_kernels::prefill_range::PrefillRangeWeightCache,
 }
 
 struct InferRunState {
@@ -58,7 +58,7 @@ struct InferAuxStageJob<'a> {
     input_manifest_path: PathBuf,
     cached_inputs: CachedInputs,
     materialization_cache: &'a MaterializationCache,
-    prefill_range_weights: &'a host_kernels::prefill_range::PrefillRangeWeightCache,
+    prefill_range_weights: &'a inference_kernels::prefill_range::PrefillRangeWeightCache,
     input_synthesis_duration: Duration,
 }
 
@@ -207,7 +207,7 @@ fn run_cached_stage(
     stage_index: &BTreeMap<String, usize>,
     cached_inputs: CachedInputs,
     materialization_cache: &MaterializationCache,
-    prefill_range_weights: &host_kernels::prefill_range::PrefillRangeWeightCache,
+    prefill_range_weights: &inference_kernels::prefill_range::PrefillRangeWeightCache,
 ) -> Result<InferStageRun> {
     fs::create_dir_all(stage_dir)
         .with_context(|| format!("failed to create {}", stage_dir.display()))?;

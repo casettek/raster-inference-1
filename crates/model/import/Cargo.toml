@@ -10,10 +10,10 @@ name = "model-import"
 path = "src/main.rs"
 
 [dependencies]
-det-num = { path = "../det-num" }
+det-num = { path = "../../det-num" }
 detwgt = { path = "../detwgt" }
-inference-artifacts = { path = "../inference-artifacts" }
-raster = { path = "../../../raster/crates/raster" }
+inference-artifacts = { path = "../../inference/artifacts" }
+raster = { path = "../../../../raster/crates/raster" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
@@ -21,4 +21,4 @@ sha2 = "0.10"
 # (see its header), but the hash must NOT be: it is the one function the host
 # and the replay guest have to agree on byte-for-byte, and two copies of it is
 # exactly how they would silently drift into different buckets.
-prompt-prepare = { path = "../../raster-stages/prompt-prepare" }
+prompt-prepare = { path = "../../../raster-stages/prompt-prepare" }

@@ -10,7 +10,7 @@ use crate::cache::{
     MaterializationCache, MaterializationCacheKey,
 };
 
-pub use host_kernels::kernels::prefill_range::{
+pub use inference_kernels::kernels::prefill_range::{
     run_prefill_range_direct, run_prefill_range_direct_with_weight_cache, PrefillRangeDirectInputs,
     PrefillRangeWeightCache,
 };
