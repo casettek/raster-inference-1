@@ -21,7 +21,8 @@ Flow:
 4. If no divergence exists, report the claimed and recomputed traces.
 5. If a divergence exists, seed a replay directory with all prior recomputed stages.
 6. Run `cargo raster chain run --stage <stage>` for the divergent stage.
-7. Write the challenge artifacts.
+7. Compare the Raster replay checkpoint with the native recomputed checkpoint. The stage name, input commitment, output structural commitment, and output SHA-256 must all match, yielding the same checkpoint hash.
+8. Write the challenge artifacts only after that parity check passes. A mismatch fails challenge construction with a native/Raster parity error identifying the stage, differing field, and both values. The replay files remain available for debugging.
 
 Challenge hash verification happens during recomputation. Sequential stages stop immediately at the first mismatch. Parallel aux waves still execute with the existing parallelism; if a mismatch is found in the middle of a completed aux batch, later batch outputs may exist on disk but are ignored for the challenge trace and replay seed.
 

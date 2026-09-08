@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::checkpoint::{read_checkpoint_from_stage_dir, Checkpoint};
@@ -103,6 +103,43 @@ pub fn write_challenge_artifacts(
     divergence: &Divergence,
     replay_package: &ReplayPackage,
 ) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+    let recomputed = divergence.recomputed.as_ref().with_context(|| {
+        format!(
+            "cannot verify native/Raster checkpoint parity for stage `{}`: missing recomputed checkpoint",
+            divergence.stage
+        )
+    })?;
+    let replay_output =
+        read_checkpoint_from_stage_dir(&replay_package.stage, &replay_package.stage_dir)?;
+
+    // A successful replay is only usable if its entire checkpoint matches the
+    // native recomputation. Validate before publishing any challenge artifacts.
+    for (field, native, raster) in [
+        ("stage", &recomputed.stage, &replay_output.stage),
+        (
+            "input_commitment",
+            &recomputed.input_commitment,
+            &replay_output.input_commitment,
+        ),
+        (
+            "output_commitment",
+            &recomputed.output_commitment,
+            &replay_output.output_commitment,
+        ),
+        (
+            "output_sha256",
+            &recomputed.output_sha256,
+            &replay_output.output_sha256,
+        ),
+    ] {
+        if native != raster {
+            bail!(
+                "native/Raster checkpoint parity mismatch for stage `{}`: {field} differs (native `{native}`, Raster `{raster}`); refusing to build challenge",
+                divergence.stage
+            );
+        }
+    }
+
     std::fs::create_dir_all(challenge_dir)
         .with_context(|| format!("failed to create {}", challenge_dir.display()))?;
 
@@ -112,8 +149,6 @@ pub fn write_challenge_artifacts(
     let replay_package_path = challenge_dir.join(REPLAY_PACKAGE_JSON);
     write_json(&replay_package_path, replay_package)?;
 
-    let replay_output =
-        read_checkpoint_from_stage_dir(&replay_package.stage, &replay_package.stage_dir)?;
     let challenge_trace = ChallengeTrace {
         version: 1,
         stage: replay_package.stage.clone(),

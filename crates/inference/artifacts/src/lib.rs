@@ -289,54 +289,7 @@ mod tests {
     #[test]
     fn challenge_artifacts_summarize_raster_replay() {
         let base = temp_dir("challenge-artifacts");
-        let replay_run_dir = base.join("replay");
-        fs::create_dir_all(&replay_run_dir).unwrap();
-        write_stage(
-            &replay_run_dir,
-            "stage_a",
-            "raster-commitment",
-            b"raster-output",
-        );
-        let stage_dir = replay_run_dir.join("stage_a");
-        fs::write(stage_dir.join("input.json"), b"{}").unwrap();
-        fs::write(stage_dir.join("input_manifest.json"), b"{}").unwrap();
-        fs::write(stage_dir.join("commit.bin"), b"commit").unwrap();
-
-        let divergence = Divergence {
-            version: 1,
-            checkpoint_index: 0,
-            stage: String::from("stage_a"),
-            reason: DivergenceReason::OutputCommitment,
-            claimed_trace_path: Some(PathBuf::from("claimed.json")),
-            claimed_checkpoint_hashes_path: None,
-            recomputed_trace_path: PathBuf::from("recomputed.json"),
-            claimed_hash: None,
-            recomputed_hash: None,
-            claimed: Some(Checkpoint {
-                stage: String::from("stage_a"),
-                input_commitment: String::from("input"),
-                output_commitment: String::from("claimed"),
-                output_sha256: String::from("111"),
-            }),
-            recomputed: Some(Checkpoint {
-                stage: String::from("stage_a"),
-                input_commitment: String::from("input"),
-                output_commitment: String::from("recomputed"),
-                output_sha256: String::from("222"),
-            }),
-        };
-        let replay_package = ReplayPackage {
-            version: 1,
-            stage: String::from("stage_a"),
-            replay_run_dir: replay_run_dir.clone(),
-            stage_dir: stage_dir.clone(),
-            input_path: stage_dir.join("input.json"),
-            input_manifest_path: stage_dir.join("input_manifest.json"),
-            output_path: stage_dir.join("output.bin"),
-            output_index_path: stage_dir.join("output.rindex"),
-            output_manifest_path: stage_dir.join("output_manifest.json"),
-            commit_path: stage_dir.join("commit.bin"),
-        };
+        let (divergence, replay_package) = matching_challenge_fixture(&base);
 
         let (divergence_path, replay_package_path, challenge_trace_path, bundle_path) =
             write_challenge_artifacts(
@@ -377,6 +330,217 @@ mod tests {
         );
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn challenge_artifacts_accept_matching_replay_with_hash_claim() {
+        let base = temp_dir("challenge-hash-parity");
+        let (mut divergence, replay_package) = matching_challenge_fixture(&base);
+        use_hash_claim(&mut divergence);
+
+        let (_, _, _, bundle_path) = write_challenge_artifacts(
+            &base.join("challenge"),
+            ChallengeSourcePath::CheckpointHashes(Path::new("checkpoints.txt")),
+            &divergence.recomputed_trace_path,
+            &divergence,
+            &replay_package,
+        )
+        .unwrap();
+
+        let replay =
+            read_checkpoint_from_stage_dir(&replay_package.stage, &replay_package.stage_dir)
+                .unwrap();
+        assert_eq!(
+            checkpoint_hash(&replay).unwrap(),
+            divergence.recomputed_hash.unwrap()
+        );
+        let bundle = read_challenge_bundle(&bundle_path).unwrap();
+        assert_eq!(
+            bundle.source_checkpoint_hashes_path,
+            Some(PathBuf::from("checkpoints.txt"))
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn challenge_artifacts_reject_replay_that_agrees_with_claimant() {
+        for hash_claim in [false, true] {
+            let base = temp_dir("challenge-replay-agrees-with-claimant");
+            let (mut divergence, replay_package) = matching_challenge_fixture(&base);
+            write_stage(
+                &replay_package.replay_run_dir,
+                &replay_package.stage,
+                "claimed",
+                b"claimed-output",
+            );
+            let replay =
+                read_checkpoint_from_stage_dir(&replay_package.stage, &replay_package.stage_dir)
+                    .unwrap();
+            assert_eq!(divergence.claimed.as_ref(), Some(&replay));
+            let source = if hash_claim {
+                use_hash_claim(&mut divergence);
+                assert_eq!(
+                    divergence.claimed_hash.as_ref(),
+                    Some(&checkpoint_hash(&replay).unwrap())
+                );
+                ChallengeSourcePath::CheckpointHashes(Path::new("checkpoints.txt"))
+            } else {
+                ChallengeSourcePath::Trace(Path::new("claimed.json"))
+            };
+
+            let error = write_challenge_artifacts(
+                &base.join("challenge"),
+                source,
+                &divergence.recomputed_trace_path,
+                &divergence,
+                &replay_package,
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains("native/Raster checkpoint parity mismatch"));
+            assert!(error.contains("stage `stage_a`"));
+            assert!(error.contains("output_commitment differs"));
+            assert!(error.contains("native `raster-commitment`, Raster `claimed`"));
+            assert_no_challenge_artifacts(&base.join("challenge"));
+            // Keep replay evidence available to diagnose the parity failure.
+            assert_eq!(
+                fs::read(&replay_package.output_path).unwrap(),
+                b"claimed-output"
+            );
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn challenge_artifacts_reject_each_checkpoint_field_mismatch() {
+        for field in [
+            "stage",
+            "input_commitment",
+            "output_commitment",
+            "output_sha256",
+        ] {
+            let base = temp_dir("challenge-checkpoint-mismatch");
+            let (divergence, mut replay_package) = matching_challenge_fixture(&base);
+            match field {
+                "stage" => replay_package.stage = String::from("other_stage"),
+                "input_commitment" => {
+                    fs::write(&replay_package.input_manifest_path, b"different-input").unwrap();
+                }
+                "output_commitment" => {
+                    fs::write(
+                        &replay_package.output_manifest_path,
+                        r#"{"output":{"commitment":"different-commitment"}}"#,
+                    )
+                    .unwrap();
+                }
+                "output_sha256" => {
+                    fs::write(&replay_package.output_path, b"different-output").unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let error = write_challenge_artifacts(
+                &base.join("challenge"),
+                ChallengeSourcePath::Trace(Path::new("claimed.json")),
+                &divergence.recomputed_trace_path,
+                &divergence,
+                &replay_package,
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains("native/Raster checkpoint parity mismatch"));
+            assert!(error.contains(&format!("{field} differs")), "{error}");
+            assert_no_challenge_artifacts(&base.join("challenge"));
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn challenge_artifacts_require_recomputed_checkpoint() {
+        let base = temp_dir("challenge-missing-recomputed-checkpoint");
+        let (mut divergence, replay_package) = matching_challenge_fixture(&base);
+        divergence.recomputed = None;
+
+        let error = write_challenge_artifacts(
+            &base.join("challenge"),
+            ChallengeSourcePath::Trace(Path::new("claimed.json")),
+            &divergence.recomputed_trace_path,
+            &divergence,
+            &replay_package,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("missing recomputed checkpoint"));
+        assert_no_challenge_artifacts(&base.join("challenge"));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    fn matching_challenge_fixture(base: &Path) -> (Divergence, ReplayPackage) {
+        let native_run_dir = base.join("native");
+        let replay_run_dir = base.join("challenge").join("raster-replay");
+        for run_dir in [&native_run_dir, &replay_run_dir] {
+            write_stage(run_dir, "stage_a", "raster-commitment", b"raster-output");
+        }
+        let recomputed =
+            read_checkpoint_from_stage_dir("stage_a", &native_run_dir.join("stage_a")).unwrap();
+        let claimed = Checkpoint {
+            output_commitment: String::from("claimed"),
+            output_sha256: format!("{:x}", Sha256::digest(b"claimed-output")),
+            ..recomputed.clone()
+        };
+        let divergence = Divergence {
+            version: 1,
+            checkpoint_index: 0,
+            stage: String::from("stage_a"),
+            reason: DivergenceReason::OutputCommitment,
+            claimed_trace_path: Some(PathBuf::from("claimed.json")),
+            claimed_checkpoint_hashes_path: None,
+            recomputed_trace_path: PathBuf::from("recomputed.json"),
+            claimed_hash: None,
+            recomputed_hash: None,
+            claimed: Some(claimed),
+            recomputed: Some(recomputed),
+        };
+        let stage_dir = replay_run_dir.join("stage_a");
+        fs::write(stage_dir.join("input.json"), b"{}").unwrap();
+        fs::write(stage_dir.join("commit.bin"), b"commit").unwrap();
+        let replay_package = ReplayPackage {
+            version: 1,
+            stage: String::from("stage_a"),
+            replay_run_dir,
+            stage_dir: stage_dir.clone(),
+            input_path: stage_dir.join("input.json"),
+            input_manifest_path: stage_dir.join("input_manifest.json"),
+            output_path: stage_dir.join("output.bin"),
+            output_index_path: stage_dir.join("output.rindex"),
+            output_manifest_path: stage_dir.join("output_manifest.json"),
+            commit_path: stage_dir.join("commit.bin"),
+        };
+        (divergence, replay_package)
+    }
+
+    fn use_hash_claim(divergence: &mut Divergence) {
+        divergence.reason = DivergenceReason::CheckpointHash;
+        divergence.claimed_trace_path = None;
+        divergence.claimed_checkpoint_hashes_path = Some(PathBuf::from("checkpoints.txt"));
+        divergence.claimed_hash =
+            Some(checkpoint_hash(&divergence.claimed.take().unwrap()).unwrap());
+        divergence.recomputed_hash =
+            Some(checkpoint_hash(divergence.recomputed.as_ref().unwrap()).unwrap());
+    }
+
+    fn assert_no_challenge_artifacts(challenge_dir: &Path) {
+        for filename in [
+            DIVERGENCE_JSON,
+            REPLAY_PACKAGE_JSON,
+            CHALLENGE_TRACE_JSON,
+            CHALLENGE_BUNDLE_JSON,
+        ] {
+            assert!(!challenge_dir.join(filename).exists(), "wrote {filename}");
+        }
     }
 
     fn write_stage(base: &Path, stage: &str, commitment: &str, output: &[u8]) {
