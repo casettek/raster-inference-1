@@ -17,8 +17,15 @@ pub struct Divergence {
     pub checkpoint_index: usize,
     pub stage: String,
     pub reason: DivergenceReason,
-    pub claimed_trace_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed_trace_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed_checkpoint_hashes_path: Option<PathBuf>,
     pub recomputed_trace_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recomputed_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claimed: Option<Checkpoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -32,6 +39,9 @@ pub enum DivergenceReason {
     InputCommitment,
     OutputCommitment,
     OutputSha256,
+    CheckpointHash,
+    MissingClaimedHash,
+    MissingRecomputedHash,
     MissingClaimedCheckpoint,
     MissingRecomputedCheckpoint,
 }
@@ -65,7 +75,10 @@ pub struct ReplayPackage {
 pub struct ChallengeBundle {
     pub version: u32,
     pub stage: String,
-    pub source_trace_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_trace_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_checkpoint_hashes_path: Option<PathBuf>,
     pub recomputed_trace_path: PathBuf,
     pub divergence_path: PathBuf,
     pub challenge_trace_path: PathBuf,
@@ -77,9 +90,15 @@ pub fn read_challenge_bundle(path: &Path) -> Result<ChallengeBundle> {
     read_json(path)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChallengeSourcePath<'a> {
+    Trace(&'a Path),
+    CheckpointHashes(&'a Path),
+}
+
 pub fn write_challenge_artifacts(
     challenge_dir: &Path,
-    source_trace_path: &Path,
+    source_path: ChallengeSourcePath<'_>,
     recomputed_trace_path: &Path,
     divergence: &Divergence,
     replay_package: &ReplayPackage,
@@ -107,10 +126,15 @@ pub fn write_challenge_artifacts(
     let challenge_trace_path = challenge_dir.join(CHALLENGE_TRACE_JSON);
     write_json(&challenge_trace_path, &challenge_trace)?;
 
+    let (source_trace_path, source_checkpoint_hashes_path) = match source_path {
+        ChallengeSourcePath::Trace(path) => (Some(path.to_path_buf()), None),
+        ChallengeSourcePath::CheckpointHashes(path) => (None, Some(path.to_path_buf())),
+    };
     let bundle = ChallengeBundle {
         version: 1,
         stage: replay_package.stage.clone(),
-        source_trace_path: source_trace_path.to_path_buf(),
+        source_trace_path,
+        source_checkpoint_hashes_path,
         recomputed_trace_path: recomputed_trace_path.to_path_buf(),
         divergence_path: divergence_path.clone(),
         challenge_trace_path: challenge_trace_path.clone(),

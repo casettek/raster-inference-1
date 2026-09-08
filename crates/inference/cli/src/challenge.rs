@@ -5,11 +5,15 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use sha2::Digest;
 use staged_infer::chain_runner::StagedExecutionBackend;
-use staged_infer::{CheckpointedInferenceConfig, CheckpointedInferenceExecutor, ParityPolicy};
+use staged_infer::{
+    CheckpointHashChallengeConfig, CheckpointedInferenceConfig, CheckpointedInferenceExecutor,
+    ParityPolicy,
+};
 
 use inference_artifacts::{
-    build_checkpoint_trace, read_challenge_bundle, read_checkpoint_trace, read_claim_bundle,
-    write_challenge_artifacts, write_checkpoint_trace_artifact, ChallengeBundle, Checkpoint,
+    build_checkpoint_trace, checkpoint_hashes, read_challenge_bundle, read_checkpoint_hashes,
+    read_checkpoint_trace, read_claim_bundle, write_challenge_artifacts,
+    write_checkpoint_trace_artifact, ChallengeBundle, ChallengeSourcePath, Checkpoint,
     CheckpointTrace, Divergence, DivergenceReason, PreparedRun, ReplayPackage,
 };
 
@@ -17,6 +21,10 @@ use inference_artifacts::{
 pub enum ChallengeInput {
     Claim(PathBuf),
     Trace(PathBuf),
+    CheckpointHashes {
+        claim_context_path: PathBuf,
+        checkpoint_hashes_path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -36,7 +44,7 @@ pub struct ChallengeBuildResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChallengeBuildOutcome {
     NoDivergence {
-        claimed_trace_path: PathBuf,
+        claimed_reference_path: PathBuf,
         recomputed_trace_path: PathBuf,
         recomputed_chain_dir: PathBuf,
     },
@@ -59,28 +67,48 @@ pub fn build_challenge(options: ChallengeBuildOptions) -> Result<ChallengeBuildR
         .and_then(|prepared| prepared.run_manifest_path.clone())
         .unwrap_or_else(|| options.manifest_path.clone());
     let executor = CheckpointedInferenceExecutor;
-    let recomputed = executor.run(CheckpointedInferenceConfig {
-        base_dir: options.base_dir.clone(),
-        manifest_path: manifest_path.clone(),
-        current_exe: options.current_exe,
-        staged_backend: options.staged_backend,
-        parity_policy: ParityPolicy::Skip,
-    })?;
-    let recomputed_trace = build_checkpoint_trace(&recomputed.chain_dir, &manifest_path)?;
+    let (recomputed_chain_dir, recomputed_trace, divergence) = match &claimed_input.checkpoints {
+        ClaimedCheckpoints::Hashes { path, hashes } => {
+            let recomputed = executor.run_until_hash_divergence(CheckpointHashChallengeConfig {
+                base_dir: options.base_dir.clone(),
+                manifest_path: manifest_path.clone(),
+                current_exe: options.current_exe.clone(),
+                staged_backend: options.staged_backend,
+                claimed_hashes_path: path.clone(),
+                claimed_hashes: hashes.clone(),
+            })?;
+            (
+                recomputed.chain_dir,
+                recomputed.recomputed_trace,
+                recomputed.divergence,
+            )
+        }
+        ClaimedCheckpoints::Trace { .. } => {
+            let recomputed = executor.run(CheckpointedInferenceConfig {
+                base_dir: options.base_dir.clone(),
+                manifest_path: manifest_path.clone(),
+                current_exe: options.current_exe.clone(),
+                staged_backend: options.staged_backend,
+                parity_policy: ParityPolicy::Skip,
+            })?;
+            let recomputed_trace = build_checkpoint_trace(&recomputed.chain_dir, &manifest_path)?;
+            let recomputed_trace_path = recomputed
+                .chain_dir
+                .join(inference_artifacts::CHECKPOINT_TRACE_JSON);
+            let divergence =
+                claimed_input.locate_divergence(&recomputed_trace_path, &recomputed_trace)?;
+            (recomputed.chain_dir, recomputed_trace, divergence)
+        }
+    };
     let recomputed_trace_path =
-        write_checkpoint_trace_artifact(&recomputed.chain_dir, &recomputed_trace)?;
+        write_checkpoint_trace_artifact(&recomputed_chain_dir, &recomputed_trace)?;
 
-    let Some(divergence) = locate_divergence(
-        &claimed_input.trace_path,
-        &claimed_input.trace,
-        &recomputed_trace_path,
-        &recomputed_trace,
-    ) else {
+    let Some(divergence) = divergence else {
         return Ok(ChallengeBuildResult {
             outcome: ChallengeBuildOutcome::NoDivergence {
-                claimed_trace_path: claimed_input.trace_path,
+                claimed_reference_path: claimed_input.reference_path().to_path_buf(),
                 recomputed_trace_path,
-                recomputed_chain_dir: recomputed.chain_dir,
+                recomputed_chain_dir,
             },
         });
     };
@@ -99,13 +127,12 @@ pub fn build_challenge(options: ChallengeBuildOptions) -> Result<ChallengeBuildR
         );
     }
 
-    let challenge_dir = recomputed
-        .chain_dir
+    let challenge_dir = recomputed_chain_dir
         .join("challenge")
         .join(sanitize_stage_name(&divergence.stage));
     let replay_run_dir = challenge_dir.join("raster-replay");
     seed_replay_directory(
-        &recomputed.chain_dir,
+        &recomputed_chain_dir,
         &recomputed_trace,
         divergence.checkpoint_index,
         &replay_run_dir,
@@ -119,7 +146,7 @@ pub fn build_challenge(options: ChallengeBuildOptions) -> Result<ChallengeBuildR
     let (divergence_path, replay_package_path, challenge_trace_path, challenge_bundle_path) =
         write_challenge_artifacts(
             &challenge_dir,
-            &claimed_input.trace_path,
+            claimed_input.source_path(),
             &recomputed_trace_path,
             &divergence,
             &replay_package,
@@ -161,13 +188,51 @@ pub fn locate_divergence(
             checkpoint_index: index,
             stage,
             reason,
-            claimed_trace_path: claimed_trace_path.to_path_buf(),
+            claimed_trace_path: Some(claimed_trace_path.to_path_buf()),
+            claimed_checkpoint_hashes_path: None,
             recomputed_trace_path: recomputed_trace_path.to_path_buf(),
+            claimed_hash: None,
+            recomputed_hash: None,
             claimed: claimed_checkpoint.cloned(),
             recomputed: recomputed_checkpoint.cloned(),
         });
     }
     None
+}
+
+pub fn locate_hash_divergence(
+    claimed_hashes_path: &Path,
+    claimed_hashes: &[String],
+    recomputed_trace_path: &Path,
+    recomputed: &CheckpointTrace,
+) -> Result<Option<Divergence>> {
+    let recomputed_hashes = checkpoint_hashes(recomputed)?;
+    let checkpoint_count = claimed_hashes.len().max(recomputed_hashes.len());
+    for index in 0..checkpoint_count {
+        let claimed_hash = claimed_hashes.get(index);
+        let recomputed_hash = recomputed_hashes.get(index);
+        let Some(reason) = hash_divergence_reason(claimed_hash, recomputed_hash) else {
+            continue;
+        };
+        let recomputed_checkpoint = recomputed.checkpoints.get(index);
+        let stage = recomputed_checkpoint
+            .map(|checkpoint| checkpoint.stage.clone())
+            .unwrap_or_else(|| format!("<checkpoint-{index}>"));
+        return Ok(Some(Divergence {
+            version: 1,
+            checkpoint_index: index,
+            stage,
+            reason,
+            claimed_trace_path: None,
+            claimed_checkpoint_hashes_path: Some(claimed_hashes_path.to_path_buf()),
+            recomputed_trace_path: recomputed_trace_path.to_path_buf(),
+            claimed_hash: claimed_hash.cloned(),
+            recomputed_hash: recomputed_hash.cloned(),
+            claimed: None,
+            recomputed: recomputed_checkpoint.cloned(),
+        }));
+    }
+    Ok(None)
 }
 
 fn divergence_reason(
@@ -198,10 +263,75 @@ fn divergence_reason(
     }
 }
 
+fn hash_divergence_reason(
+    claimed: Option<&String>,
+    recomputed: Option<&String>,
+) -> Option<DivergenceReason> {
+    match (claimed, recomputed) {
+        (None, None) => None,
+        (None, Some(_)) => Some(DivergenceReason::MissingClaimedHash),
+        (Some(_), None) => Some(DivergenceReason::MissingRecomputedHash),
+        (Some(claimed), Some(recomputed)) if claimed != recomputed => {
+            Some(DivergenceReason::CheckpointHash)
+        }
+        _ => None,
+    }
+}
+
 struct ClaimedInput {
-    trace_path: PathBuf,
-    trace: CheckpointTrace,
+    checkpoints: ClaimedCheckpoints,
     prepared_run: Option<PreparedRun>,
+}
+
+enum ClaimedCheckpoints {
+    Trace {
+        path: PathBuf,
+        trace: CheckpointTrace,
+    },
+    Hashes {
+        path: PathBuf,
+        hashes: Vec<String>,
+    },
+}
+
+impl ClaimedInput {
+    fn reference_path(&self) -> &Path {
+        self.checkpoints.path()
+    }
+
+    fn source_path(&self) -> ChallengeSourcePath<'_> {
+        match &self.checkpoints {
+            ClaimedCheckpoints::Trace { path, .. } => ChallengeSourcePath::Trace(path),
+            ClaimedCheckpoints::Hashes { path, .. } => ChallengeSourcePath::CheckpointHashes(path),
+        }
+    }
+
+    fn locate_divergence(
+        &self,
+        recomputed_trace_path: &Path,
+        recomputed_trace: &CheckpointTrace,
+    ) -> Result<Option<Divergence>> {
+        match &self.checkpoints {
+            ClaimedCheckpoints::Trace { path, trace } => Ok(locate_divergence(
+                path,
+                trace,
+                recomputed_trace_path,
+                recomputed_trace,
+            )),
+            ClaimedCheckpoints::Hashes { path, hashes } => {
+                locate_hash_divergence(path, hashes, recomputed_trace_path, recomputed_trace)
+            }
+        }
+    }
+}
+
+impl ClaimedCheckpoints {
+    fn path(&self) -> &Path {
+        match self {
+            ClaimedCheckpoints::Trace { path, .. } => path,
+            ClaimedCheckpoints::Hashes { path, .. } => path,
+        }
+    }
 }
 
 fn load_claimed_input(input: &ChallengeInput) -> Result<ClaimedInput> {
@@ -225,17 +355,49 @@ fn load_claimed_input(input: &ChallengeInput) -> Result<ClaimedInput> {
                 })?;
             verify_prepared_run(&prepared_run)?;
             Ok(ClaimedInput {
-                trace_path,
-                trace,
+                checkpoints: ClaimedCheckpoints::Trace {
+                    path: trace_path,
+                    trace,
+                },
                 prepared_run: Some(prepared_run),
             })
         }
         ChallengeInput::Trace(path) => {
             let trace = read_checkpoint_trace(path)?;
             Ok(ClaimedInput {
-                trace_path: path.clone(),
-                trace,
+                checkpoints: ClaimedCheckpoints::Trace {
+                    path: path.clone(),
+                    trace,
+                },
                 prepared_run: None,
+            })
+        }
+        ChallengeInput::CheckpointHashes {
+            claim_context_path,
+            checkpoint_hashes_path,
+        } => {
+            let bundle = read_claim_bundle(claim_context_path)?;
+            let bundle_dir = claim_context_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("claim context bundle has no parent directory"))?;
+            let prepared_run = bundle
+                .prepared_run_path
+                .as_ref()
+                .map(|path| read_prepared_run(&resolve_bundle_path(bundle_dir, path)))
+                .transpose()?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "claim context bundle has no prepared_run_path; rebuild the claim with --run"
+                    )
+                })?;
+            verify_prepared_run(&prepared_run)?;
+            let hashes = read_checkpoint_hashes(checkpoint_hashes_path)?;
+            Ok(ClaimedInput {
+                checkpoints: ClaimedCheckpoints::Hashes {
+                    path: checkpoint_hashes_path.clone(),
+                    hashes,
+                },
+                prepared_run: Some(prepared_run),
             })
         }
     }
@@ -486,6 +648,68 @@ mod tests {
             divergence.reason,
             DivergenceReason::MissingClaimedCheckpoint
         );
+    }
+
+    #[test]
+    fn hash_mismatch_is_first_divergence() {
+        let recomputed = trace(vec![
+            checkpoint("stage_a", "aaa", "111"),
+            checkpoint("stage_b", "bbb", "222"),
+        ]);
+        let mut claimed_hashes = checkpoint_hashes(&recomputed).unwrap();
+        let replacement = if claimed_hashes[1].starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        claimed_hashes[1].replace_range(0..1, replacement);
+
+        let divergence = locate_hash_divergence(
+            Path::new("checkpoints.txt"),
+            &claimed_hashes,
+            Path::new("recomputed.json"),
+            &recomputed,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(divergence.checkpoint_index, 1);
+        assert_eq!(divergence.stage, "stage_b");
+        assert_eq!(divergence.reason, DivergenceReason::CheckpointHash);
+        assert_eq!(
+            divergence.claimed_checkpoint_hashes_path,
+            Some(PathBuf::from("checkpoints.txt"))
+        );
+        assert!(divergence.claimed_trace_path.is_none());
+        assert_eq!(
+            divergence.recomputed,
+            Some(checkpoint("stage_b", "bbb", "222"))
+        );
+    }
+
+    #[test]
+    fn missing_claimed_hash_is_divergence_at_recomputed_stage() {
+        let recomputed = trace(vec![
+            checkpoint("stage_a", "aaa", "111"),
+            checkpoint("stage_b", "bbb", "222"),
+        ]);
+        let claimed_hashes =
+            checkpoint_hashes(&trace(vec![checkpoint("stage_a", "aaa", "111")])).unwrap();
+
+        let divergence = locate_hash_divergence(
+            Path::new("checkpoints.txt"),
+            &claimed_hashes,
+            Path::new("recomputed.json"),
+            &recomputed,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(divergence.checkpoint_index, 1);
+        assert_eq!(divergence.stage, "stage_b");
+        assert_eq!(divergence.reason, DivergenceReason::MissingClaimedHash);
+        assert_eq!(divergence.claimed_hash, None);
+        assert!(divergence.recomputed_hash.is_some());
     }
 
     #[test]

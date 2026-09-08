@@ -10,9 +10,11 @@ use staged_infer::{
 };
 
 use inference_artifacts::{
-    read_json, read_run_spec, write_claim_artifacts_with_prepared_run, write_json, InferenceResult,
-    ModelManifest, PreparedRun, PREPARED_RUN_JSON,
+    read_checkpoint_hashes, read_checkpoint_trace, read_json, read_run_spec,
+    write_checkpoint_hashes, write_claim_artifacts_with_prepared_run, write_json, InferenceResult,
+    ModelManifest, PreparedRun, CHECKPOINT_TRACE_JSON, PREPARED_RUN_JSON,
 };
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
@@ -37,6 +39,46 @@ pub struct ClaimBuildResult {
     pub final_result: Option<InferenceResult>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CorruptCheckpointSelection {
+    Random { seed: Option<String> },
+    Index(usize),
+    Stage(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct CorruptCheckpointHashesOptions {
+    pub hashes_path: PathBuf,
+    pub trace_path: Option<PathBuf>,
+    pub output_path: Option<PathBuf>,
+    pub selection: CorruptCheckpointSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorruptCheckpointHashesResult {
+    pub source_hashes_path: PathBuf,
+    pub corrupted_hashes_path: PathBuf,
+    pub corruption_manifest_path: PathBuf,
+    pub checkpoint_index: usize,
+    pub checkpoint_number: usize,
+    pub stage: Option<String>,
+    pub original_hash: String,
+    pub corrupted_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CorruptionManifest {
+    version: u32,
+    source_hashes_path: PathBuf,
+    corrupted_hashes_path: PathBuf,
+    checkpoint_index: usize,
+    checkpoint_number: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<String>,
+    original_hash: String,
+    corrupted_hash: String,
+}
+
 pub fn build_claim(options: ClaimBuildOptions) -> Result<ClaimBuildResult> {
     let prepared = prepare_claim_run(&options)?;
     let executor = CheckpointedInferenceExecutor;
@@ -52,6 +94,62 @@ pub fn build_claim(options: ClaimBuildOptions) -> Result<ClaimBuildResult> {
         &prepared.manifest_path,
         &prepared.prepared_run,
     )
+}
+
+pub fn corrupt_checkpoint_hashes(
+    options: CorruptCheckpointHashesOptions,
+) -> Result<CorruptCheckpointHashesResult> {
+    let mut hashes = read_checkpoint_hashes(&options.hashes_path)?;
+    if hashes.is_empty() {
+        anyhow::bail!("cannot corrupt empty checkpoint hash file");
+    }
+
+    let trace_path = resolve_trace_path(&options.hashes_path, options.trace_path.as_deref());
+    let trace = if trace_path.is_file() {
+        Some(read_checkpoint_trace(&trace_path)?)
+    } else {
+        None
+    };
+    let checkpoint_index = select_checkpoint_index(&options.selection, &hashes, trace.as_ref())?;
+    let checkpoint_number = checkpoint_index + 1;
+    let stage = trace
+        .as_ref()
+        .and_then(|trace| trace.checkpoints.get(checkpoint_index))
+        .map(|checkpoint| checkpoint.stage.clone());
+    let original_hash = hashes[checkpoint_index].clone();
+    let corrupted_hash = corrupt_hash(&original_hash);
+    hashes[checkpoint_index] = corrupted_hash.clone();
+
+    let corrupted_hashes_path = options
+        .output_path
+        .unwrap_or_else(|| default_corrupted_hashes_path(&options.hashes_path));
+    write_checkpoint_hashes(&corrupted_hashes_path, &hashes)?;
+
+    let corruption_manifest_path = corrupted_hashes_path.with_extension("corruption.json");
+    write_json(
+        &corruption_manifest_path,
+        &CorruptionManifest {
+            version: 1,
+            source_hashes_path: options.hashes_path.clone(),
+            corrupted_hashes_path: corrupted_hashes_path.clone(),
+            checkpoint_index,
+            checkpoint_number,
+            stage: stage.clone(),
+            original_hash: original_hash.clone(),
+            corrupted_hash: corrupted_hash.clone(),
+        },
+    )?;
+
+    Ok(CorruptCheckpointHashesResult {
+        source_hashes_path: options.hashes_path,
+        corrupted_hashes_path,
+        corruption_manifest_path,
+        checkpoint_index,
+        checkpoint_number,
+        stage,
+        original_hash,
+        corrupted_hash,
+    })
 }
 
 fn write_claim_result(
@@ -135,8 +233,12 @@ fn prepare_claim_run(options: &ClaimBuildOptions) -> Result<PreparedClaimRun> {
             template_path.display()
         )
     })?;
+    let template_dir = template_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("manifest template has no parent directory"))?;
     let run_manifest = render_run_manifest(
         &template,
+        template_dir,
         &pieces_path,
         &pieces_index_path,
         &pieces_commitment,
@@ -168,6 +270,7 @@ fn prepare_claim_run(options: &ClaimBuildOptions) -> Result<PreparedClaimRun> {
 
 fn render_run_manifest(
     template: &str,
+    template_dir: &Path,
     pieces_path: &Path,
     pieces_index_path: &Path,
     pieces_commitment: &str,
@@ -188,6 +291,7 @@ fn render_run_manifest(
         .any(|line| line.trim_start().starts_with("inputs.initial_pieces ="));
 
     for line in template.lines() {
+        let line = rewrite_manifest_line(line, template_dir)?;
         if line.trim() == "[[chain.repeat]]" {
             in_decode_repeat = true;
         }
@@ -232,8 +336,203 @@ fn absolute(base: &Path, path: &Path) -> PathBuf {
     }
 }
 
+fn rewrite_manifest_line(line: &str, template_dir: &Path) -> Result<String> {
+    let line = rewrite_project_line(line, template_dir)?;
+    let line = rewrite_path_assignments(&line, template_dir, "index_path")?;
+    rewrite_path_assignments(&line, template_dir, "path")
+}
+
+fn rewrite_project_line(line: &str, template_dir: &Path) -> Result<String> {
+    let trimmed = line.trim_start();
+    let Some(value) = trimmed.strip_prefix("project =") else {
+        return Ok(line.to_string());
+    };
+    let indent = &line[..line.len() - trimmed.len()];
+    let project: String = serde_json::from_str(value.trim()).with_context(|| {
+        format!(
+            "failed to parse chain stage project path from manifest line `{}`",
+            line
+        )
+    })?;
+    let project_path = Path::new(&project);
+    if project_path.is_absolute() {
+        return Ok(line.to_string());
+    }
+    let absolute_project = template_dir.join(project_path);
+    Ok(format!(
+        "{}project = {:?}",
+        indent,
+        absolute_project.to_string_lossy()
+    ))
+}
+
+fn rewrite_path_assignments(line: &str, template_dir: &Path, key: &str) -> Result<String> {
+    let mut output = String::with_capacity(line.len());
+    let mut cursor = 0;
+    while let Some(relative_pos) = line[cursor..].find(key) {
+        let key_start = cursor + relative_pos;
+        let Some(assignment) = parse_path_assignment(line, key, key_start)? else {
+            output.push_str(&line[cursor..key_start + key.len()]);
+            cursor = key_start + key.len();
+            continue;
+        };
+
+        output.push_str(&line[cursor..assignment.value_start]);
+        if assignment.path.is_absolute() {
+            output.push_str(assignment.literal);
+        } else {
+            let absolute_path = template_dir.join(assignment.path);
+            output.push_str(&format!("{:?}", absolute_path.to_string_lossy()));
+        }
+        cursor = assignment.value_end;
+    }
+    output.push_str(&line[cursor..]);
+    Ok(output)
+}
+
+struct PathAssignment<'a> {
+    value_start: usize,
+    value_end: usize,
+    literal: &'a str,
+    path: PathBuf,
+}
+
+fn parse_path_assignment<'a>(
+    line: &'a str,
+    key: &str,
+    key_start: usize,
+) -> Result<Option<PathAssignment<'a>>> {
+    if key_start > 0 {
+        let previous = line.as_bytes()[key_start - 1];
+        if previous.is_ascii_alphanumeric() || previous == b'_' {
+            return Ok(None);
+        }
+    }
+    let mut cursor = key_start + key.len();
+    cursor = skip_ascii_spaces(line, cursor);
+    if line.as_bytes().get(cursor) != Some(&b'=') {
+        return Ok(None);
+    }
+    cursor += 1;
+    cursor = skip_ascii_spaces(line, cursor);
+    if line.as_bytes().get(cursor) != Some(&b'"') {
+        return Ok(None);
+    }
+    let value_start = cursor;
+    let value_end = closing_quote_end(line, value_start)?;
+    let literal = &line[value_start..value_end];
+    let path: String = serde_json::from_str(literal)
+        .with_context(|| format!("failed to parse `{key}` path from manifest line `{line}`"))?;
+    Ok(Some(PathAssignment {
+        value_start,
+        value_end,
+        literal,
+        path: PathBuf::from(path),
+    }))
+}
+
+fn skip_ascii_spaces(line: &str, mut cursor: usize) -> usize {
+    while matches!(line.as_bytes().get(cursor), Some(b' ' | b'\t')) {
+        cursor += 1;
+    }
+    cursor
+}
+
+fn closing_quote_end(line: &str, value_start: usize) -> Result<usize> {
+    let mut escaped = false;
+    for (offset, byte) in line.as_bytes()[value_start + 1..].iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' => escaped = true,
+            b'"' => return Ok(value_start + 1 + offset + 1),
+            _ => {}
+        }
+    }
+    anyhow::bail!("unterminated string in manifest line `{line}`")
+}
+
 fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
+}
+
+fn select_checkpoint_index(
+    selection: &CorruptCheckpointSelection,
+    hashes: &[String],
+    trace: Option<&inference_artifacts::CheckpointTrace>,
+) -> Result<usize> {
+    match selection {
+        CorruptCheckpointSelection::Index(index) => {
+            if *index >= hashes.len() {
+                anyhow::bail!(
+                    "checkpoint index {index} is out of range for {} hashes",
+                    hashes.len()
+                );
+            }
+            Ok(*index)
+        }
+        CorruptCheckpointSelection::Stage(stage) => {
+            let trace = trace.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "stage selection requires a checkpoint trace; pass --trace or keep checkpoint_trace.json beside checkpoints.txt"
+                )
+            })?;
+            let index = trace
+                .checkpoints
+                .iter()
+                .position(|checkpoint| checkpoint.stage == *stage)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("stage `{stage}` was not found in checkpoint trace")
+                })?;
+            if index >= hashes.len() {
+                anyhow::bail!(
+                    "stage `{stage}` is checkpoint {index}, but the hash file only has {} hashes",
+                    hashes.len()
+                );
+            }
+            Ok(index)
+        }
+        CorruptCheckpointSelection::Random { seed } => Ok(random_checkpoint_index(seed, hashes)),
+    }
+}
+
+fn random_checkpoint_index(seed: &Option<String>, hashes: &[String]) -> usize {
+    let seed_bytes = match seed {
+        Some(seed) => seed.as_bytes().to_vec(),
+        None => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_string()
+            .into_bytes(),
+    };
+    let digest = Sha256::digest(seed_bytes);
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    (u64::from_be_bytes(bytes) as usize) % hashes.len()
+}
+
+fn corrupt_hash(hash: &str) -> String {
+    let mut bytes = hash.as_bytes().to_vec();
+    bytes[0] = if bytes[0] == b'0' { b'1' } else { b'0' };
+    String::from_utf8(bytes).expect("checkpoints are valid hex")
+}
+
+fn resolve_trace_path(hashes_path: &Path, trace_path: Option<&Path>) -> PathBuf {
+    trace_path
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            hashes_path
+                .parent()
+                .map(|parent| parent.join(CHECKPOINT_TRACE_JSON))
+        })
+        .unwrap_or_else(|| PathBuf::from(CHECKPOINT_TRACE_JSON))
+}
+
+fn default_corrupted_hashes_path(source: &Path) -> PathBuf {
+    source.with_file_name("checkpoints.corrupt.txt")
 }
 
 fn run_id(run_spec_path: &Path, rendered_prompt: &str, tokens: u32) -> String {
@@ -334,9 +633,88 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_checkpoint_hashes_changes_selected_index() {
+        let base = temp_dir("corrupt-index");
+        fs::create_dir_all(&base).unwrap();
+        let hashes_path = base.join("checkpoints.txt");
+        let output_path = base.join("corrupted.txt");
+        let hashes = vec![
+            String::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            String::from("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ];
+        inference_artifacts::write_checkpoint_hashes(&hashes_path, &hashes).unwrap();
+
+        let result = corrupt_checkpoint_hashes(CorruptCheckpointHashesOptions {
+            hashes_path: hashes_path.clone(),
+            trace_path: None,
+            output_path: Some(output_path.clone()),
+            selection: CorruptCheckpointSelection::Index(1),
+        })
+        .unwrap();
+
+        let corrupted = inference_artifacts::read_checkpoint_hashes(&output_path).unwrap();
+        assert_eq!(result.checkpoint_index, 1);
+        assert_eq!(result.checkpoint_number, 2);
+        assert_eq!(corrupted[0], hashes[0]);
+        assert_ne!(corrupted[1], hashes[1]);
+        assert_eq!(result.original_hash, hashes[1]);
+        assert_eq!(result.corrupted_hash, corrupted[1]);
+        assert!(result.corruption_manifest_path.is_file());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn corrupt_checkpoint_hashes_can_select_stage_from_trace() {
+        let base = temp_dir("corrupt-stage");
+        fs::create_dir_all(&base).unwrap();
+        let hashes_path = base.join("checkpoints.txt");
+        let trace_path = base.join(CHECKPOINT_TRACE_JSON);
+        let trace = inference_artifacts::CheckpointTrace {
+            checkpoints: vec![
+                inference_artifacts::Checkpoint {
+                    stage: String::from("stage_a"),
+                    input_commitment: String::from("input-a"),
+                    output_commitment: String::from("output-a"),
+                    output_sha256: String::from("sha-a"),
+                },
+                inference_artifacts::Checkpoint {
+                    stage: String::from("stage_b"),
+                    input_commitment: String::from("input-b"),
+                    output_commitment: String::from("output-b"),
+                    output_sha256: String::from("sha-b"),
+                },
+            ],
+        };
+        inference_artifacts::write_json(&trace_path, &trace).unwrap();
+        let hashes = inference_artifacts::checkpoint_hashes(&trace).unwrap();
+        inference_artifacts::write_checkpoint_hashes(&hashes_path, &hashes).unwrap();
+
+        let result = corrupt_checkpoint_hashes(CorruptCheckpointHashesOptions {
+            hashes_path: hashes_path.clone(),
+            trace_path: None,
+            output_path: Some(base.join("corrupted.txt")),
+            selection: CorruptCheckpointSelection::Stage(String::from("stage_b")),
+        })
+        .unwrap();
+
+        assert_eq!(result.checkpoint_index, 1);
+        assert_eq!(result.checkpoint_number, 2);
+        assert_eq!(result.stage, Some(String::from("stage_b")));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn run_manifest_replaces_prompt_artifact_and_decode_count() {
         let template = r#"[chain]
 name = "test"
+
+[chain.input.weights]
+index = "l"
+path = "runtime/weights/layer{l}.rastered"
+index_path = "runtime/weights/layer{l}.rindex"
+commitments = ["abc"]
 
 [[chain.stage]]
 name = "prompt_prepare"
@@ -356,6 +734,7 @@ project = "raster-stages/decode-select-token"
 
         let manifest = render_run_manifest(
             template,
+            Path::new("/repo"),
             Path::new("/tmp/run/prompt/initial_pieces.rastered"),
             Path::new("/tmp/run/prompt/initial_pieces.rindex"),
             "abc",
@@ -366,6 +745,12 @@ project = "raster-stages/decode-select-token"
         assert!(manifest.contains("path = \"/tmp/run/prompt/initial_pieces.rastered\""));
         assert!(manifest.contains("commitment = \"abc\""));
         assert!(manifest.contains("count = 7"));
+        assert!(manifest.contains("project = \"/repo/raster-stages/prompt-prepare\""));
+        assert!(manifest.contains("project = \"/repo/raster-stages/decode-select-token\""));
+        assert!(manifest.contains("path = \"/repo/tokenizer.rastered\""));
+        assert!(manifest.contains("index_path = \"/repo/tokenizer.rindex\""));
+        assert!(manifest.contains("path = \"/repo/runtime/weights/layer{l}.rastered\""));
+        assert!(manifest.contains("index_path = \"/repo/runtime/weights/layer{l}.rindex\""));
         assert!(!manifest.contains("old.rastered"));
         assert_eq!(manifest.matches("inputs.initial_pieces =").count(), 1);
     }

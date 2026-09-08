@@ -222,10 +222,7 @@ fn allowed_no_auth_roots() -> Result<Vec<PathBuf>> {
             .join("target")
             .join("raster")
             .join("chains-no-auth"),
-        current_dir
-            .join("target")
-            .join("staged-infer")
-            .join("chains-no-auth"),
+        current_dir.join("target").join("staged-infer").join("runs"),
     ];
     Ok(roots
         .into_iter()

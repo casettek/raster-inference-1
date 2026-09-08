@@ -7,8 +7,8 @@ pub mod routines;
 pub mod uncheckpointed;
 
 pub use executor::{
-    CheckpointedInferenceConfig, CheckpointedInferenceExecutor, CheckpointedInferenceResult,
-    ParityPolicy,
+    CheckpointHashChallengeConfig, CheckpointHashChallengeResult, CheckpointedInferenceConfig,
+    CheckpointedInferenceExecutor, CheckpointedInferenceResult, ParityPolicy,
 };
 pub use inference_kernels::{kernels, prefill_range, tensor};
 pub use inference_artifacts::{

@@ -14,7 +14,10 @@ pub use challenge::{
     build_challenge, ChallengeBuildOptions, ChallengeBuildOutcome, ChallengeBuildResult,
     ChallengeInput,
 };
-pub use claim::{build_claim, ClaimBuildOptions, ClaimBuildResult};
+pub use claim::{
+    build_claim, corrupt_checkpoint_hashes, ClaimBuildOptions, ClaimBuildResult,
+    CorruptCheckpointHashesOptions, CorruptCheckpointHashesResult, CorruptCheckpointSelection,
+};
 pub use infer::run_infer;
 pub use inference_artifacts::{
     build_checkpoint_trace, write_claim_artifacts, ChallengeBundle, ChallengeTrace, Checkpoint,
@@ -109,6 +112,8 @@ struct InferArgs {
 enum ClaimCommand {
     /// Build a staged-infer checkpoint claim.
     Build(ClaimBuildArgs),
+    /// Copy and corrupt one claimed checkpoint hash for manual challenge tests.
+    Corrupt(ClaimCorruptHashesArgs),
 }
 
 #[derive(Debug, Args)]
@@ -120,6 +125,37 @@ struct ClaimBuildArgs {
     /// Use the previous per-stage child-process staged-infer runner.
     #[arg(long = "staged-subprocess", alias = "direct-subprocess", hide = true)]
     staged_subprocess: bool,
+}
+
+#[derive(Debug, Args)]
+struct ClaimCorruptHashesArgs {
+    /// Checkpoints hash list to copy and corrupt.
+    #[arg(long = "checkpoints")]
+    checkpoints: PathBuf,
+
+    /// Optional output path for the corrupted hash list.
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    /// Optional checkpoint trace used only to resolve --stage to an index.
+    #[arg(long)]
+    trace: Option<PathBuf>,
+
+    /// Corrupt this zero-based checkpoint index.
+    #[arg(long)]
+    index: Option<usize>,
+
+    /// Corrupt the checkpoint with this stage name.
+    #[arg(long)]
+    stage: Option<String>,
+
+    /// Pick a checkpoint to corrupt. This is the default when no selector is supplied.
+    #[arg(long)]
+    random: bool,
+
+    /// Seed for reproducible random selection.
+    #[arg(long)]
+    seed: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -195,8 +231,23 @@ fn execute(cli: Cli) -> Result<ExitCode> {
                 print_infer_result(final_result, Some(&run_spec_path));
             }
             println!("checkpoint trace: {}", result.checkpoint_trace_path.display());
-            println!("checkpoint hashes: {}", result.checkpoint_hashes_path.display());
+            println!("checkpoints: {}", result.checkpoint_hashes_path.display());
             println!("claim bundle: {}", result.claim_bundle_path.display());
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Commands::Claim {
+            command: ClaimCommand::Corrupt(args),
+        }) => {
+            let result = corrupt_checkpoint_hashes(args.into_options()?)?;
+            println!("corrupted checkpoints: {}", result.corrupted_hashes_path.display());
+            println!("corruption manifest: {}", result.corruption_manifest_path.display());
+            println!("corrupted checkpoint index: {}", result.checkpoint_index);
+            println!("corrupted checkpoint number: {}", result.checkpoint_number);
+            if let Some(stage) = result.stage.as_ref() {
+                println!("corrupted stage: {stage}");
+            }
+            println!("original hash: {}", result.original_hash);
+            println!("corrupted hash: {}", result.corrupted_hash);
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Infer(args)) => {
@@ -249,6 +300,14 @@ struct ChallengeBuildArgs {
     #[arg(long)]
     trace: Option<PathBuf>,
 
+    /// Public claimed checkpoints hash list to challenge.
+    #[arg(long = "checkpoints")]
+    checkpoint_hashes: Option<PathBuf>,
+
+    /// Claim bundle used only as frozen run context for --checkpoints.
+    #[arg(long = "claim-context")]
+    claim_context: Option<PathBuf>,
+
     /// Use the previous per-stage child-process staged-infer runner.
     #[arg(long = "staged-subprocess", alias = "direct-subprocess", hide = true)]
     staged_subprocess: bool,
@@ -264,12 +323,12 @@ fn require_input_args(cli: &Cli) -> Result<()> {
 fn print_challenge_result(result: &ChallengeBuildResult) {
     match &result.outcome {
         ChallengeBuildOutcome::NoDivergence {
-            claimed_trace_path,
+            claimed_reference_path,
             recomputed_trace_path,
             recomputed_chain_dir,
         } => {
             println!("no divergence found");
-            println!("claimed trace: {}", claimed_trace_path.display());
+            println!("claimed reference: {}", claimed_reference_path.display());
             println!("recomputed trace: {}", recomputed_trace_path.display());
             println!("recomputed chain: {}", recomputed_chain_dir.display());
         }
@@ -280,7 +339,15 @@ fn print_challenge_result(result: &ChallengeBuildResult) {
             ..
         } => {
             println!("divergence found: {}", divergence.stage);
+            println!("checkpoint index: {}", divergence.checkpoint_index);
+            println!("checkpoint number: {}", divergence.checkpoint_index + 1);
             println!("reason: {:?}", divergence.reason);
+            if let Some(claimed_hash) = divergence.claimed_hash.as_ref() {
+                println!("claimed checkpoint hash: {claimed_hash}");
+            }
+            if let Some(recomputed_hash) = divergence.recomputed_hash.as_ref() {
+                println!("recomputed checkpoint hash: {recomputed_hash}");
+            }
             if let Some(claimed) = divergence.claimed.as_ref() {
                 println!("claimed commitment: {}", claimed.output_commitment);
                 println!("claimed sha256: {}", claimed.output_sha256);
@@ -747,15 +814,58 @@ impl ClaimBuildArgs {
     }
 }
 
+impl ClaimCorruptHashesArgs {
+    fn into_options(self) -> Result<CorruptCheckpointHashesOptions> {
+        let selector_count = usize::from(self.index.is_some())
+            + usize::from(self.stage.is_some())
+            + usize::from(self.random);
+        if selector_count > 1 {
+            anyhow::bail!("claim corrupt accepts only one of --index, --stage, or --random");
+        }
+        let selection = if let Some(index) = self.index {
+            CorruptCheckpointSelection::Index(index)
+        } else if let Some(stage) = self.stage {
+            CorruptCheckpointSelection::Stage(stage)
+        } else {
+            CorruptCheckpointSelection::Random { seed: self.seed }
+        };
+        Ok(CorruptCheckpointHashesOptions {
+            hashes_path: self.checkpoints,
+            trace_path: self.trace,
+            output_path: self.output,
+            selection,
+        })
+    }
+}
+
 impl ChallengeBuildArgs {
     fn into_options(self) -> Result<ChallengeBuildOptions> {
-        let input = match (self.claim, self.trace) {
-            (Some(claim), None) => ChallengeInput::Claim(claim),
-            (None, Some(trace)) => ChallengeInput::Trace(trace),
-            (Some(_), Some(_)) => {
-                anyhow::bail!("challenge build accepts either --claim or --trace, not both")
+        let input = match (
+            self.claim,
+            self.trace,
+            self.checkpoint_hashes,
+            self.claim_context,
+        ) {
+            (Some(claim), None, None, None) => ChallengeInput::Claim(claim),
+            (None, Some(trace), None, None) => ChallengeInput::Trace(trace),
+            (None, None, Some(checkpoint_hashes_path), Some(claim_context_path)) => {
+                ChallengeInput::CheckpointHashes {
+                    claim_context_path,
+                    checkpoint_hashes_path,
+                }
             }
-            (None, None) => anyhow::bail!("challenge build requires --claim <claim_bundle.json>"),
+            (None, None, Some(_), None) => {
+                anyhow::bail!("challenge build --checkpoints requires --claim-context")
+            }
+            (None, None, None, Some(_)) => {
+                anyhow::bail!("challenge build --claim-context requires --checkpoints")
+            }
+            (None, None, None, None) => anyhow::bail!(
+                "challenge build requires --claim <claim_bundle.json> or --checkpoints <checkpoints.txt> --claim-context <claim_bundle.json>"
+            ),
+            _ => anyhow::bail!(
+                "challenge build accepts only one input mode: --claim, --trace, or --checkpoints with --claim-context"
+            ),
         };
         let current_exe = std::env::current_exe().context("failed to locate current executable")?;
         let staged_backend = if self.staged_subprocess {
@@ -791,10 +901,30 @@ mod tests {
         .unwrap();
         parse_for_test([
             "raster-inference",
+            "claim",
+            "corrupt",
+            "--checkpoints",
+            "checkpoints.txt",
+            "--index",
+            "1",
+        ])
+        .unwrap();
+        parse_for_test([
+            "raster-inference",
             "challenge",
             "build",
             "--trace",
             "checkpoint_trace.json",
+        ])
+        .unwrap();
+        parse_for_test([
+            "raster-inference",
+            "challenge",
+            "build",
+            "--checkpoints",
+            "checkpoints.txt",
+            "--claim-context",
+            "claim_bundle.json",
         ])
         .unwrap();
         parse_for_test(["raster-inference", "infer", "--run", "inference.toml"]).unwrap();

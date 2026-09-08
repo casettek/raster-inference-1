@@ -23,7 +23,8 @@ cargo run --release -p raster-inference-cli -- claim build --run inference.toml
 
 # Verifier challenge from a prior claim bundle.
 cargo run --release -p raster-inference-cli -- challenge build \
-  --claim target/staged-infer/chains-no-auth/.../claim_bundle.json
+  --claim-context target/staged-infer/runs/.../claim_bundle.json \
+  --checkpoints target/staged-infer/runs/.../checkpoints.txt
 ```
 
 The same commands are available through `just` recipes:
@@ -32,7 +33,9 @@ The same commands are available through `just` recipes:
 just import ../raster-inference/assets/tiny-gemma-dev
 just infer inference.toml
 just claim inference.toml
-just challenge target/staged-infer/chains-no-auth/.../claim_bundle.json
+just challenge \
+  target/staged-infer/runs/.../claim_bundle.json \
+  target/staged-infer/runs/.../checkpoints.txt
 ```
 
 ## Workflows

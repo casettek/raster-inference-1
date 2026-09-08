@@ -7,15 +7,15 @@ pub mod io;
 pub mod run;
 
 pub use challenge::{
-    read_challenge_bundle, write_challenge_artifacts, ChallengeBundle, ChallengeTrace, Divergence,
-    DivergenceReason, ReplayPackage, CHALLENGE_BUNDLE_JSON, CHALLENGE_TRACE_JSON, DIVERGENCE_JSON,
-    REPLAY_PACKAGE_JSON,
+    read_challenge_bundle, write_challenge_artifacts, ChallengeBundle, ChallengeSourcePath,
+    ChallengeTrace, Divergence, DivergenceReason, ReplayPackage, CHALLENGE_BUNDLE_JSON,
+    CHALLENGE_TRACE_JSON, DIVERGENCE_JSON, REPLAY_PACKAGE_JSON,
 };
 pub use checkpoint::{
-    build_checkpoint_trace, checkpoint_hashes, read_checkpoint_from_stage_dir,
-    read_checkpoint_trace, write_checkpoint_hashes_artifact, write_checkpoint_trace_artifact,
-    Checkpoint, CheckpointTrace, CHECKPOINT_HASHES_TXT, CHECKPOINT_TRACE_JSON,
-    EXECUTION_TIMES_JSON,
+    build_checkpoint_trace, checkpoint_hash, checkpoint_hashes, read_checkpoint_from_stage_dir,
+    read_checkpoint_hashes, read_checkpoint_trace, write_checkpoint_hashes,
+    write_checkpoint_hashes_artifact, write_checkpoint_trace_artifact, Checkpoint, CheckpointTrace,
+    CHECKPOINTS_TXT, CHECKPOINT_HASHES_TXT, CHECKPOINT_TRACE_JSON, EXECUTION_TIMES_JSON,
 };
 pub use claim::{
     read_claim_bundle, write_claim_artifacts, write_claim_artifacts_with_prepared_run, ClaimBundle,
@@ -108,6 +108,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["stage_a", "stage_b"]
         );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_hashes_round_trip_from_text_file() {
+        let base = temp_dir("checkpoint-hashes");
+        fs::create_dir_all(&base).unwrap();
+        let path = base.join(CHECKPOINT_HASHES_TXT);
+        let hashes = vec![
+            String::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            String::from("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ];
+
+        write_checkpoint_hashes(&path, &hashes).unwrap();
+
+        assert_eq!(read_checkpoint_hashes(&path).unwrap(), hashes);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_hashes_reject_blank_lines() {
+        let base = temp_dir("checkpoint-hashes-blank");
+        fs::create_dir_all(&base).unwrap();
+        let path = base.join(CHECKPOINT_HASHES_TXT);
+        fs::write(
+            &path,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\n",
+        )
+        .unwrap();
+
+        assert!(read_checkpoint_hashes(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid checkpoint hash on line 2"));
 
         fs::remove_dir_all(base).unwrap();
     }
@@ -269,8 +305,11 @@ mod tests {
             checkpoint_index: 0,
             stage: String::from("stage_a"),
             reason: DivergenceReason::OutputCommitment,
-            claimed_trace_path: PathBuf::from("claimed.json"),
+            claimed_trace_path: Some(PathBuf::from("claimed.json")),
+            claimed_checkpoint_hashes_path: None,
             recomputed_trace_path: PathBuf::from("recomputed.json"),
+            claimed_hash: None,
+            recomputed_hash: None,
             claimed: Some(Checkpoint {
                 stage: String::from("stage_a"),
                 input_commitment: String::from("input"),
@@ -300,7 +339,7 @@ mod tests {
         let (divergence_path, replay_package_path, challenge_trace_path, bundle_path) =
             write_challenge_artifacts(
                 &base.join("challenge"),
-                Path::new("claimed.json"),
+                ChallengeSourcePath::Trace(Path::new("claimed.json")),
                 Path::new("recomputed.json"),
                 &divergence,
                 &replay_package,
@@ -321,6 +360,11 @@ mod tests {
         let bundle: ChallengeBundle =
             serde_json::from_slice(&fs::read(&bundle_path).unwrap()).unwrap();
         assert_eq!(bundle.stage, "stage_a");
+        assert_eq!(
+            bundle.source_trace_path,
+            Some(PathBuf::from("claimed.json"))
+        );
+        assert_eq!(bundle.source_checkpoint_hashes_path, None);
         assert_eq!(bundle.raster_commit_path, replay_package.commit_path);
 
         let challenge_trace: ChallengeTrace =

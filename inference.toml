@@ -1,4 +1,4 @@
 model_manifest = "runtime/model-artifacts/gemma-4-E2B-detwgt/manifest.json"
-prompt = "what is the essence of life?"
+prompt = "say hello in italian"
 raw_prompt = false
-tokens = 7
+tokens = 3

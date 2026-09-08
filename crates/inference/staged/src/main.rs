@@ -239,7 +239,7 @@ mod tests {
     fn comparison_command_is_unauthenticated_and_isolated() {
         let command = comparison_command(
             Path::new("/tmp/staged-infer"),
-            Path::new("/tmp/chains-no-auth/run/prefill_range_l3"),
+            Path::new("/tmp/staged-runs/run/prefill_range_l3"),
             Path::new("/tmp/input.json"),
             Path::new("/tmp/input_manifest.json"),
         );

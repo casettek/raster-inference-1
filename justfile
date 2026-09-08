@@ -12,7 +12,13 @@ infer run="inference.toml":
 claim run="inference.toml":
     cargo run --release -p raster-inference-cli -- claim build --run "{{run}}"
 
-challenge claim:
+corrupt checkpoints:
+    cargo run --release -p raster-inference-cli -- claim corrupt --checkpoints "{{checkpoints}}"
+
+challenge claim_context checkpoints:
+    cargo run --release -p raster-inference-cli -- challenge build --claim-context "{{claim_context}}" --checkpoints "{{checkpoints}}"
+
+challenge-claim claim:
     cargo run --release -p raster-inference-cli -- challenge build --claim "{{claim}}"
 
 test-workspace:

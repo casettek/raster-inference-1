@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 use crate::io::{read_json, write_json};
 
 pub const CHECKPOINT_TRACE_JSON: &str = "checkpoint_trace.json";
-pub const CHECKPOINT_HASHES_TXT: &str = "checkpoint_hashes.txt";
+pub const CHECKPOINTS_TXT: &str = "checkpoints.txt";
+pub const CHECKPOINT_HASHES_TXT: &str = CHECKPOINTS_TXT;
 pub const EXECUTION_TIMES_JSON: &str = "execution-times.json";
 
 /// Ordered routine-boundary checkpoints from one checkpointed inference run.
@@ -51,6 +52,16 @@ pub fn read_checkpoint_trace(path: &Path) -> Result<CheckpointTrace> {
     read_json(path)
 }
 
+pub fn read_checkpoint_hashes(path: &Path) -> Result<Vec<String>> {
+    let input =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    input
+        .lines()
+        .enumerate()
+        .map(|(index, line)| validate_checkpoint_hash(line.trim(), index + 1))
+        .collect()
+}
+
 pub fn write_checkpoint_trace_artifact(
     chain_dir: &Path,
     trace: &CheckpointTrace,
@@ -64,7 +75,7 @@ pub fn write_checkpoint_hashes_artifact(
     chain_dir: &Path,
     trace: &CheckpointTrace,
 ) -> Result<PathBuf> {
-    let hashes_path = chain_dir.join(CHECKPOINT_HASHES_TXT);
+    let hashes_path = chain_dir.join(CHECKPOINTS_TXT);
     let mut output = checkpoint_hashes(trace)?.join("\n");
     if !output.is_empty() {
         output.push('\n');
@@ -74,16 +85,29 @@ pub fn write_checkpoint_hashes_artifact(
     Ok(hashes_path)
 }
 
+pub fn write_checkpoint_hashes(path: &Path, hashes: &[String]) -> Result<()> {
+    let mut output = hashes.join("\n");
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    fs::write(path, output).with_context(|| format!("failed to write {}", path.display()))
+}
+
 pub fn checkpoint_hashes(trace: &CheckpointTrace) -> Result<Vec<String>> {
-    trace
-        .checkpoints
-        .iter()
-        .map(|checkpoint| {
-            let encoded = serde_json::to_vec(checkpoint)
-                .context("failed to encode checkpoint for hashing")?;
-            Ok(format!("{:x}", Sha256::digest(encoded)))
-        })
-        .collect()
+    trace.checkpoints.iter().map(checkpoint_hash).collect()
+}
+
+pub fn checkpoint_hash(checkpoint: &Checkpoint) -> Result<String> {
+    let encoded =
+        serde_json::to_vec(checkpoint).context("failed to encode checkpoint for hashing")?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn validate_checkpoint_hash(hash: &str, line_number: usize) -> Result<String> {
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid checkpoint hash on line {line_number}: {hash}");
+    }
+    Ok(hash.to_ascii_lowercase())
 }
 
 pub fn build_checkpoint_trace(chain_dir: &Path, _manifest_path: &Path) -> Result<CheckpointTrace> {

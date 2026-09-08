@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use inference_artifacts::InferenceResult;
+use inference_artifacts::{CheckpointTrace, Divergence, InferenceResult};
 
 use crate::cache::CachedStageValue;
-use crate::chain_runner::{self, StagedExecutionBackend};
+use crate::chain_runner::{self, CheckpointHashVerifier, StagedExecutionBackend};
 use crate::uncheckpointed::inference_result_from_generated;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +27,23 @@ pub struct CheckpointedInferenceResult {
     pub chain_dir: PathBuf,
     pub selected_stage_dir: Option<PathBuf>,
     pub final_result: Option<InferenceResult>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointHashChallengeConfig {
+    pub base_dir: PathBuf,
+    pub manifest_path: PathBuf,
+    pub current_exe: PathBuf,
+    pub staged_backend: StagedExecutionBackend,
+    pub claimed_hashes_path: PathBuf,
+    pub claimed_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointHashChallengeResult {
+    pub chain_dir: PathBuf,
+    pub recomputed_trace: CheckpointTrace,
+    pub divergence: Option<Divergence>,
 }
 
 #[derive(Debug, Default)]
@@ -56,6 +73,28 @@ impl CheckpointedInferenceExecutor {
             chain_dir: run.chain_dir,
             selected_stage_dir: run.selected_stage_dir,
             final_result,
+        })
+    }
+
+    pub fn run_until_hash_divergence(
+        &self,
+        config: CheckpointHashChallengeConfig,
+    ) -> Result<CheckpointHashChallengeResult> {
+        ensure_supported_manifest_path(&config.base_dir, &config.manifest_path)?;
+        let _cwd = CurrentDirGuard::enter(&config.base_dir)?;
+        let verified = chain_runner::run_until_hash_divergence(
+            &config.manifest_path,
+            &config.current_exe,
+            config.staged_backend,
+            CheckpointHashVerifier {
+                claimed_hashes_path: config.claimed_hashes_path,
+                claimed_hashes: config.claimed_hashes,
+            },
+        )?;
+        Ok(CheckpointHashChallengeResult {
+            chain_dir: verified.run.chain_dir,
+            recomputed_trace: verified.recomputed_trace,
+            divergence: verified.divergence,
         })
     }
 }

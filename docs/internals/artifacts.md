@@ -53,7 +53,7 @@ Every checkpointed stage directory must include:
 `claim build` writes:
 
 - `checkpoint_trace.json`
-- `checkpoint_hashes.txt`
+- `checkpoints.txt`
 - `claim_bundle.json`
 
 The claim bundle records the first checkpoint input commitment, final checkpoint output commitment, checkpoint trace path, and prepared-run metadata path.
