@@ -19,3 +19,5 @@ Start with the workflow docs when you want to run the repo, and the internals do
 
 - [Issues](issues/README.md)
 - [Proposals](proposals/)
+- [Ranked BPE tokenizer proposal](proposals/ranked-bpe-tokenizer.md): correctness
+  gap, candidate Raster stage decomposition, and chain integration/validation cost.
