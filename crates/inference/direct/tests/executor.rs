@@ -3,20 +3,24 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use direct_infer::detwgt::MmapDetwgt;
-use direct_infer::model::{DirectFinalHead, DirectMatrixView};
-use direct_infer::view_kernels::score_prefill_logits_view;
+use direct_infer::model::{DirectFinalHead, DirectMatrixView, DirectTransformerLayer};
+use direct_infer::view_kernels::{run_prefill_range_view, score_prefill_logits_view};
 use direct_infer::{DirectInferenceConfig, DirectInferenceExecutor};
-use inference_kernels::kernels::decode_select_token::{
-    run_decode_select_token_direct, DecodeSelectTokenDirectInputs,
-};
-use inference_kernels::tensor::{dot_bits, matvec_from_source, Matrix, MatrixSource};
 use inference_artifacts::{
     write_json, DirectInferBundle, DirectInferShape, InferenceRunSpec, ModelManifest,
     INFERENCE_RUN_SPEC_TOML, MODEL_ARTIFACTS_DIR, MODEL_MANIFEST_JSON,
 };
+use inference_kernels::kernels::decode_select_token::{
+    run_decode_select_token_direct, DecodeSelectTokenDirectInputs,
+};
+use inference_kernels::tensor::{dot_bits, matvec_from_source, Matrix, MatrixSource};
 use input_embedding::input::EmbeddingTable;
 use output_finalize::input::{DecoderTable, DecoderToken};
 use prefill_finalize::input::{FinalHead, FinalHeadParams};
+use prefill_range::input::{
+    pack_i32s, unpack_i32s, ActivationRow, ActivationSequence, LayerParams, PleLayerInputs, PleRow,
+    TransformerLayer,
+};
 use prompt_prepare::input::{
     vocab_bucket_of, BpePieces, MergeBucket, PromptTokenizer, TokenEntry, VocabBucket,
 };
@@ -190,6 +194,147 @@ fn final_head_logits_feed_shared_decode_select_tie_break() {
         edge.generated_token_ids.iter().copied().collect::<Vec<_>>(),
         vec![0]
     );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn native_decode_rotary_outputs_match_prefill_across_chunks() {
+    let dir = temp_dir("decode-rope");
+    fs::create_dir_all(&dir).unwrap();
+    let detwgt = dir.join("model.detwgt");
+    let identity = [ONE, 0, 0, ONE];
+    write_detwgt(
+        &detwgt,
+        &[TensorFixture {
+            name: "identity",
+            dims: vec![2, 2],
+            element_width: 32,
+            values: identity.to_vec(),
+        }],
+    );
+    let model = MmapDetwgt::open(&detwgt).unwrap();
+    let matrix = DirectMatrixView::new(model.matrix("identity", 2, 2).unwrap());
+    let norm = pack_i32s(&[ONE, ONE]);
+    let params = LayerParams {
+        layer_idx: 0,
+        hidden_size: 2,
+        ffn_size: 2,
+        num_heads: 1,
+        num_kv_heads: 1,
+        head_dim: 2,
+        sliding_window: 0,
+        attn_scale: ONE,
+        layer_scalar: 0,
+        norm_eps: 0,
+        rope_base: 10_000_i64 << 32,
+        rotary_dim: 2,
+        rope_freq_base_dim: 2,
+        kv_donor_layer: -1,
+        donor_a_layer: -2,
+        donor_b_layer: -3,
+        norm_input: norm.clone(),
+        norm_post_attn: norm.clone(),
+        norm_pre_ffw: norm.clone(),
+        norm_post_ffw: norm.clone(),
+        q_norm: pack_i32s(&[ONE, 0]),
+        k_norm: pack_i32s(&[ONE, 0]),
+        ple_width: 2,
+        ple_post_norm: norm,
+    };
+    let view = DirectTransformerLayer {
+        params: params.clone(),
+        w_q: matrix,
+        w_k: matrix,
+        w_v: matrix,
+        w_o: matrix,
+        w_gate: matrix,
+        w_up: matrix,
+        w_down: matrix,
+        ple_input_gate: matrix,
+        ple_layer_projection: matrix,
+    };
+    let layer = TransformerLayer {
+        params,
+        w_q: paged(&identity),
+        w_k: paged(&identity),
+        w_v: paged(&identity),
+        w_o: paged(&identity),
+        w_gate: paged(&identity),
+        w_up: paged(&identity),
+        w_down: paged(&identity),
+        ple_input_gate: paged(&identity),
+        ple_layer_projection: paged(&identity),
+    };
+    let empty = ActivationSequence {
+        rows: List::new(),
+        errors: List::new(),
+        kv: List::new(),
+        start_position: 0,
+    };
+    let activations = ActivationSequence {
+        rows: List::from(
+            (0..5)
+                .map(|token_id| ActivationRow {
+                    token_id,
+                    // Distinct V rows make attention outputs sensitive to Q.
+                    values: pack_i32s(&[ONE, if token_id % 2 == 0 { ONE } else { -ONE }]),
+                })
+                .collect::<Vec<_>>(),
+        ),
+        ..empty.clone()
+    };
+    let ple = PleLayerInputs {
+        layer_idx: 0,
+        rows: List::from(vec![
+            PleRow {
+                values: pack_i32s(&[ONE, ONE])
+            };
+            5
+        ]),
+        errors: List::new(),
+    };
+    let run_staged = |input: &ActivationSequence, prior: &ActivationSequence| {
+        inference_kernels::run_prefill_range_direct(inference_kernels::PrefillRangeDirectInputs {
+            activations: input,
+            layer: &layer,
+            layer_cache_key: None,
+            prior_kv: prior,
+            donor_a_kv: &empty,
+            donor_b_kv: &empty,
+            ple: &ple,
+        })
+        .unwrap()
+    };
+    let reference = run_staged(&activations, &empty);
+    assert_eq!(unpack_i32s(&reference.kv[1].k).unwrap(), [35408, 55146]);
+
+    let mut prior = empty.clone();
+    // Prefill one token, decode twice, then process a two-token chunk.
+    for (start, end) in [(0, 1), (1, 2), (2, 3), (3, 5)] {
+        let chunk = ActivationSequence {
+            rows: List::from(activations.rows.as_slice()[start..end].to_vec()),
+            start_position: start as u32,
+            ..empty.clone()
+        };
+        let direct = run_prefill_range_view(&chunk, &view, &prior, &empty, &empty, &ple).unwrap();
+        let staged = run_staged(&chunk, &prior);
+        for output in [&direct, &staged] {
+            assert!(output.errors.is_empty());
+            assert_eq!(output.start_position, start as u32);
+            assert_eq!(
+                serde_json::to_value(&output.rows).unwrap(),
+                serde_json::to_value(&reference.rows.as_slice()[start..end]).unwrap(),
+                "activation rows at start_position {start}"
+            );
+            assert_eq!(
+                serde_json::to_value(&output.kv).unwrap(),
+                serde_json::to_value(&reference.kv.as_slice()[..end]).unwrap(),
+                "all cached K/V rows at start_position {start}"
+            );
+        }
+        prior = direct;
+    }
 
     fs::remove_dir_all(dir).unwrap();
 }

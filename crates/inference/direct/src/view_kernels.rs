@@ -263,8 +263,9 @@ fn project_tokens(
 
     let head_dim = params.head_dim as usize;
     for row_idx in 0..rows.rows() {
+        // RoPE follows the absolute Raster cursor, including during decode.
         finish_qkv_row(
-            row_idx as u32,
+            start_position + row_idx as u32,
             q.row_mut(row_idx),
             k.row_mut(row_idx),
             v.row_mut(row_idx),

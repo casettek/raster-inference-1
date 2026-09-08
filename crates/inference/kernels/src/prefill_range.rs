@@ -362,8 +362,9 @@ fn project_tokens(
 
     let head_dim = params.head_dim as usize;
     for row_idx in 0..rows.rows() {
+        // RoPE follows the absolute Raster cursor, including during decode.
         finish_qkv_row(
-            row_idx as u32,
+            start_position + row_idx as u32,
             q.row_mut(row_idx),
             k.row_mut(row_idx),
             v.row_mut(row_idx),
@@ -826,6 +827,52 @@ mod tests {
             w_down: matrix.clone(),
             ple_input_gate: matrix.clone(),
             ple_layer_projection: matrix,
+        }
+    }
+
+    #[test]
+    fn qkv_projection_uses_absolute_rotary_positions() {
+        const ONE: i32 = 1 << 16;
+        let mut layer = tiny_layer();
+        layer.params.rotary_dim = 2;
+        // Identity projections of [ONE, ONE] normalise exactly; these weights
+        // leave the rotary pair [ONE, 0] in both Q and K.
+        layer.params.q_norm = pack_i32s(&[ONE, 0]);
+        layer.params.k_norm = pack_i32s(&[ONE, 0]);
+        let params = &layer.params;
+        let weights = LayerWeights::from_layer(&layer, params).unwrap();
+
+        // Raster starts its cursor at start_position and advances once per row.
+        for positions in [[0, 1], [1, 2], [2, 3], [7, 8]] {
+            for row_count in [1, 2] {
+                let rows = InputRows {
+                    token_ids: vec![7; row_count],
+                    slab: Slab::from_rows(vec![vec![ONE, ONE]; row_count]).unwrap(),
+                };
+                let (queries, keys) =
+                    project_tokens(&rows, &weights, params, positions[0]).unwrap();
+                for (local, (query, key)) in queries.iter().zip(&keys).enumerate() {
+                    let position = positions[local];
+                    let mut expected = [Act::from_bits(ONE), Act::from_bits(0)];
+                    rope_rotate_pairs_in_place(
+                        &mut expected,
+                        2,
+                        2,
+                        Acc::from_bits(params.rope_base),
+                        position as usize,
+                    );
+                    let expected = expected.map(|lane| lane.to_bits());
+                    if position == 1 {
+                        assert_eq!(expected, [35408, 55146]);
+                    }
+                    assert_eq!(query.position, position);
+                    assert_eq!(query.local, local as u32);
+                    assert_eq!(key.position, position);
+                    assert_eq!(query.q, expected, "Q at position {position}");
+                    assert_eq!(unpack_page_i32s(&key.k).unwrap(), expected);
+                    assert_eq!(unpack_page_i32s(&key.v).unwrap(), [ONE, ONE]);
+                }
+            }
         }
     }
 
