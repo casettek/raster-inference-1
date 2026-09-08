@@ -6,7 +6,7 @@
 - `claim build`: a checkpointed deterministic rerun that emits a compact claim.
 - `challenge build`: verifier rerun from a claim trace, divergence detection, and Raster replay of the first divergent stage.
 
-`model import` is the shared setup step. It turns a model bundle into committed Raster externals and a prompt-free model manifest. `infer`, `claim build`, and `challenge build` prepare prompt-specific run artifacts from `inference.toml`.
+`model import` is the shared setup step. It turns a model bundle into committed Raster externals and a prompt-free model manifest. `infer`, `claim build`, and `challenge build` select the model through `--run inference.toml` and verify it once before execution. Challenges retain the claim’s frozen prompt and token count.
 
 ## Quick Start
 
@@ -23,6 +23,7 @@ cargo run --release -p raster-inference-cli -- claim build --run inference.toml
 
 # Verifier challenge from a prior claim bundle.
 cargo run --release -p raster-inference-cli -- challenge build \
+  --run inference.toml \
   --claim-context target/staged-infer/runs/.../claim_bundle.json \
   --checkpoints target/staged-infer/runs/.../checkpoints.txt
 ```
@@ -40,7 +41,7 @@ just challenge \
 
 ## Workflows
 
-- [Model import](docs/workflows/model-import.md): bundle inputs, generated externals, root manifest, and direct-infer manifest.
+- [Model import](docs/workflows/model-import.md): bundle inputs, generated externals, model-specific templates, and model manifests.
 - [Infer](docs/workflows/infer.md): fast deterministic inference through `direct-infer`.
 - [Claim build](docs/workflows/claim-build.md): checkpointed staged inference and claim artifacts.
 - [Challenge build](docs/workflows/challenge-build.md): trace comparison, divergence packaging, and Raster replay.
@@ -58,7 +59,7 @@ just challenge \
 ```text
 Cargo.toml                  # workspace manifest
 justfile                    # workflow and test shortcuts
-Raster.toml                 # prompt-free generated chain manifest template
+Raster.toml                 # optional template copy for manual Raster commands
 inference.toml              # default run spec
 crates/
   model/
@@ -78,4 +79,4 @@ manifests/                  # alternate generated manifests and examples
 docs/                       # workflow, internals, issues, proposals
 ```
 
-`raster-stages/*` are intentionally left outside `crates/`: each directory is a Raster program boundary with its own `Cargo.toml`, `Raster.lock`, no-std tile library, and sequence entry point. Reusable imported model externals live under `runtime/model-artifacts/<model-id>/raster/`, prompt fixtures live under `runtime/prompt-fixtures/`, and generated chain manifests point each stage at the files it needs there. The root `Raster.toml` is a chain manifest with a `[chain]` table and no `[program]` table.
+`raster-stages/*` are intentionally left outside `crates/`: each directory is a Raster program boundary with its own `Cargo.toml`, `Raster.lock`, no-std tile library, and sequence entry point. Reusable imported model externals live under `runtime/model-artifacts/<model-id>/raster/`, prompt fixtures live under `runtime/prompt-fixtures/`, and generated chain manifests point each stage at the files it needs there. Each full import saves its chain template under `runtime/model-artifacts/<model-id>/Raster.toml`. The root `Raster.toml` can be refreshed with `--manifest Raster.toml` for manual Raster commands; run-spec workflows use the model-specific template.

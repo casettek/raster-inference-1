@@ -7,8 +7,8 @@
 //!
 //! Reads `model.detwgt` (deterministic Q16.16 weights), `config.json` (shapes,
 //! attention types, softcap) and `tokenizer.json` (vocabulary and merges), and
-//! writes one `.rastered`/`.rindex` pair per stage external — then prints the
-//! whole `[chain]` manifest, stages expanded per layer.
+//! writes one `.rastered`/`.rindex` pair per stage external and saves a
+//! model-specific `[chain]` template, stages expanded per layer.
 //!
 //! Every value crosses over unchanged: detwgt stores canonical Q16.16 bit
 //! patterns, which is the representation the stages compute in. Nothing here
@@ -39,7 +39,7 @@ fn main() {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportConfig {
     pub model_dir: PathBuf,
-    /// Write the complete chain manifest here instead of printing it.
+    /// Also write a copy of the complete chain template here.
     pub manifest: Option<PathBuf>,
     /// Root directory for reusable imported model artifacts.
     pub artifact_root: PathBuf,
@@ -224,15 +224,9 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
             .get("text_config")
             .ok_or("config.json has no text_config")?;
         let shape = Shape::from_config(text)?;
-        let raster_manifest_text = match args.manifest.as_ref() {
-            Some(path) if path.is_file() => Some(fs::read_to_string(path)?),
-            _ => None,
-        };
-        let raster_manifest = args
-            .manifest
-            .as_deref()
-            .zip(raster_manifest_text.as_deref());
-        direct_manifest::write_model_manifest(&args, &eos_ids, &shape, text, raster_manifest)?;
+        // A direct-only refresh cannot attest that existing Raster externals
+        // were generated from this bundle. Only a full import binds a template.
+        direct_manifest::write_model_manifest(&args, &eos_ids, &shape, text, None)?;
         return Ok(ImportResult {
             manifest_path: None,
             manifest_text: None,
@@ -360,32 +354,45 @@ pub fn import_model(args: ImportConfig) -> Result<ImportResult, Box<dyn Error>> 
         &stages,
     )?);
     let stage_count = stages.len();
-    if let Some(path) = args.manifest.as_ref() {
-        fs::write(path, &manifest)?;
-        println!("wrote {}", path.display());
-        direct_manifest::write_model_manifest(
-            &args,
-            &eos_ids,
-            &shape,
-            text,
-            Some((path, &manifest)),
-        )?;
-        Ok(ImportResult {
-            manifest_path: Some(path.clone()),
-            manifest_text: None,
-            stage_count,
-        })
-    } else {
-        direct_manifest::write_model_manifest(&args, &eos_ids, &shape, text, None)?;
-        println!();
-        println!("# ---- root Raster.toml ----");
-        print!("{manifest}");
-        Ok(ImportResult {
-            manifest_path: None,
-            manifest_text: Some(manifest),
-            stage_count,
-        })
+    let (template_path, template) = save_model_template(&args, &manifest)?;
+    direct_manifest::write_model_manifest(
+        &args,
+        &eos_ids,
+        &shape,
+        text,
+        Some((&template_path, &template)),
+    )?;
+    Ok(ImportResult {
+        manifest_path: Some(template_path),
+        manifest_text: None,
+        stage_count,
+    })
+}
+
+fn save_model_template(
+    args: &ImportConfig,
+    manifest: &str,
+) -> Result<(PathBuf, String), Box<dyn Error>> {
+    // Generated paths start at the importing workspace. Resolve them before
+    // saving under the model directory (or an optional custom --manifest path).
+    let template =
+        inference_artifacts::resolve_raster_manifest_paths(manifest, &std::env::current_dir()?)
+            .map_err(|error| -> Box<dyn Error> { error.to_string().into() })?;
+    let path = args.artifact_dir().join("Raster.toml");
+    fs::create_dir_all(args.artifact_dir())?;
+    fs::write(&path, &template)?;
+    println!("wrote {}", path.display());
+    if let Some(copy) = &args.manifest {
+        if let Some(parent) = copy
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(copy, &template)?;
+        println!("wrote {}", copy.display());
     }
+    Ok((path, template))
 }
 
 fn stage_external_commitment(
@@ -1541,6 +1548,86 @@ fn path_from_dir(base_dir: &Path, path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_saves_independent_templates_with_verified_provenance() {
+        let base = std::env::temp_dir().join(format!(
+            "model-import-templates-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut args = parse_args_from(["--model", "unused"].map(String::from)).unwrap();
+        args.artifact_root = base.join("artifacts");
+        let text = serde_json::json!({
+            "hidden_size": 2, "num_hidden_layers": 1, "num_attention_heads": 1,
+            "num_key_value_heads": 1, "head_dim": 2, "vocab_size": 2, "hidden_size_per_layer_input": 1
+        });
+        let shape = Shape::from_config(&text).unwrap();
+        let mut models = Vec::new();
+        for name in ["model-a", "model-b"] {
+            args.model_dir = base.join(name);
+            fs::create_dir_all(&args.model_dir).unwrap();
+            fs::write(args.model_dir.join("model.detwgt"), name).unwrap();
+            fs::write(
+                args.model_dir.join("config.json"),
+                serde_json::to_vec(&serde_json::json!({"text_config": text})).unwrap(),
+            )
+            .unwrap();
+            fs::write(args.model_dir.join("tokenizer.json"), "{}").unwrap();
+            let manifest = format!("[chain]\nname = \"{name}\"\n[[chain.stage]]\nname = \"prompt_prepare\"\nproject = \"raster-stages/prompt-prepare\"\ninputs.tokenizer = {{ external = {{ path = \"data/{name}.rastered\", index_path = \"data/{name}.rindex\", commitment = \"abc\" }} }}\n");
+            let (path, template) = save_model_template(&args, &manifest).unwrap();
+            assert!(path.is_file()); // No --manifest is necessary.
+            assert!(template.contains(&format!(
+                "project = {:?}",
+                std::env::current_dir()
+                    .unwrap()
+                    .join("raster-stages/prompt-prepare")
+                    .to_string_lossy()
+            )));
+            assert!(template.contains(&format!(
+                "index_path = {:?}",
+                std::env::current_dir()
+                    .unwrap()
+                    .join(format!("data/{name}.rindex"))
+                    .to_string_lossy()
+            )));
+            let model_path = direct_manifest::write_model_manifest(
+                &args,
+                &Default::default(),
+                &shape,
+                &text,
+                Some((&path, &template)),
+            )
+            .unwrap();
+            let model = inference_artifacts::ModelManifest::load_verified(&model_path).unwrap();
+            assert_eq!(
+                model.verified_raster_template(&model_path).unwrap().1,
+                template
+            );
+            assert_eq!(
+                model.provenance.as_ref().unwrap().raster_manifest_path,
+                PathBuf::from("Raster.toml")
+            );
+            models.push((model_path, template));
+            // The next model may overwrite this shared copy, but provenance
+            // must continue pointing at each model's own template.
+            args.manifest = Some(base.join("shared/Raster.toml"));
+        }
+        fs::write(base.join("shared/Raster.toml"), "overwritten").unwrap();
+        for (path, template) in &models {
+            let model = inference_artifacts::ModelManifest::load_verified(path).unwrap();
+            assert_eq!(model.verified_raster_template(path).unwrap().1, *template);
+        }
+        args.only_direct = true;
+        import_model(args).unwrap();
+        let direct_only = inference_artifacts::ModelManifest::load_verified(&models[1].0).unwrap();
+        assert!(direct_only.provenance.is_none());
+        assert!(direct_only.verified_raster_template(&models[1].0).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn parse_args_builds_import_config() {

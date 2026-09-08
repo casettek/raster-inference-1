@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
-use sha2::Digest;
 use staged_infer::chain_runner::StagedExecutionBackend;
 use staged_infer::{
     CheckpointHashChallengeConfig, CheckpointedInferenceConfig, CheckpointedInferenceExecutor,
@@ -12,7 +11,7 @@ use staged_infer::{
 
 use inference_artifacts::{
     build_checkpoint_trace, checkpoint_hashes, read_challenge_bundle, read_checkpoint_hashes,
-    read_checkpoint_trace, read_claim_bundle, write_challenge_artifacts,
+    read_checkpoint_trace, read_claim_bundle, verify_file_sha256, write_challenge_artifacts,
     write_checkpoint_trace_artifact, ChallengeBundle, ChallengeSourcePath, Checkpoint,
     CheckpointTrace, Divergence, DivergenceReason, PreparedRun, ReplayPackage,
 };
@@ -30,7 +29,7 @@ pub enum ChallengeInput {
 #[derive(Debug, Clone)]
 pub struct ChallengeBuildOptions {
     pub base_dir: PathBuf,
-    pub manifest_path: PathBuf,
+    pub run_spec_path: PathBuf,
     pub current_exe: PathBuf,
     pub staged_backend: StagedExecutionBackend,
     pub input: ChallengeInput,
@@ -61,11 +60,7 @@ pub enum ChallengeBuildOutcome {
 
 pub fn build_challenge(options: ChallengeBuildOptions) -> Result<ChallengeBuildResult> {
     let claimed_input = load_claimed_input(&options.input)?;
-    let manifest_path = claimed_input
-        .prepared_run
-        .as_ref()
-        .and_then(|prepared| prepared.run_manifest_path.clone())
-        .unwrap_or_else(|| options.manifest_path.clone());
+    let manifest_path = challenge_manifest_path(&options, &claimed_input)?;
     let executor = CheckpointedInferenceExecutor;
     let (recomputed_chain_dir, recomputed_trace, divergence) = match &claimed_input.checkpoints {
         ClaimedCheckpoints::Hashes { path, hashes } => {
@@ -164,6 +159,45 @@ pub fn build_challenge(options: ChallengeBuildOptions) -> Result<ChallengeBuildR
             challenge_bundle,
         },
     })
+}
+
+fn challenge_manifest_path(
+    options: &ChallengeBuildOptions,
+    claimed: &ClaimedInput,
+) -> Result<PathBuf> {
+    let run_spec_path = resolve_bundle_path(&options.base_dir, &options.run_spec_path);
+    if let Some(prepared) = &claimed.prepared_run {
+        let run_spec = inference_artifacts::read_run_spec(&run_spec_path)?;
+        let run_spec_dir = run_spec_path
+            .parent()
+            .context("run spec has no parent directory")?;
+        let selected_model_path = resolve_bundle_path(run_spec_dir, &run_spec.model_manifest);
+        // The run spec chooses the model; the claim retains its frozen prompt
+        // and token count. Compare identities before touching the large bundle.
+        inference_artifacts::verify_file_sha256(
+            &selected_model_path,
+            &prepared.model_manifest_sha256,
+            "model selected by --run does not match the claim: model manifest",
+        )?;
+        let model =
+            inference_artifacts::ModelManifest::load_verified(&prepared.model_manifest_path)?;
+        model.verified_raster_template(&prepared.model_manifest_path)?;
+        // load_claimed_input already checked the frozen run manifest's hash.
+        return prepared
+            .run_manifest_path
+            .clone()
+            .context("prepared run has no run_manifest_path");
+    }
+
+    // A bare trace has no frozen metadata. Prepare it from the selected run
+    // spec, just as claim build does, rather than selecting a root template.
+    let prepared = crate::claim::prepare_claim_run(&crate::claim::ClaimBuildOptions {
+        base_dir: options.base_dir.clone(),
+        run_spec_path,
+        current_exe: options.current_exe.clone(),
+        staged_backend: options.staged_backend,
+    })?;
+    Ok(prepared.manifest_path)
 }
 
 pub fn locate_divergence(
@@ -408,10 +442,10 @@ fn read_prepared_run(path: &Path) -> Result<PreparedRun> {
 }
 
 fn verify_prepared_run(prepared: &PreparedRun) -> Result<()> {
-    verify_sha256(
+    verify_file_sha256(
         &prepared.model_manifest_path,
         &prepared.model_manifest_sha256,
-        "model manifest",
+        "frozen model manifest",
     )?;
     let manifest_path = prepared
         .run_manifest_path
@@ -421,22 +455,7 @@ fn verify_prepared_run(prepared: &PreparedRun) -> Result<()> {
         .run_manifest_sha256
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("prepared run has no run_manifest_sha256"))?;
-    verify_sha256(manifest_path, manifest_sha256, "run manifest")
-}
-
-fn verify_sha256(path: &Path, expected: &str, label: &str) -> Result<()> {
-    let bytes =
-        fs::read(path).with_context(|| format!("failed to read {label} {}", path.display()))?;
-    let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
-    if actual != expected {
-        bail!(
-            "frozen {label} hash mismatch for {}: expected {}, got {}",
-            path.display(),
-            expected,
-            actual
-        );
-    }
-    Ok(())
+    verify_file_sha256(manifest_path, manifest_sha256, "frozen run manifest")
 }
 
 fn resolve_bundle_path(base: &Path, path: &Path) -> PathBuf {
@@ -571,10 +590,11 @@ impl ChallengeBuildOptions {
         current_exe: PathBuf,
         staged_backend: StagedExecutionBackend,
         input: ChallengeInput,
+        run_spec_path: PathBuf,
     ) -> Result<Self> {
         let base_dir = std::env::current_dir().context("failed to read current directory")?;
         Ok(Self {
-            manifest_path: base_dir.join("Raster.toml"),
+            run_spec_path,
             base_dir,
             current_exe,
             staged_backend,
@@ -586,7 +606,114 @@ impl ChallengeBuildOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn challenge_checks_selected_and_frozen_model_before_execution() {
+        use crate::test_support::{model_fixture, run_spec};
+        use inference_artifacts::{file_sha256, read_json};
+        let base = temp_dir("model-selection");
+        let model_path = model_fixture(&base, "model-a");
+        model_fixture(&base, "model-b");
+        let run_spec_path = run_spec(&base, "model-a");
+        let prepared = crate::claim::prepare_claim_run(&crate::claim::ClaimBuildOptions {
+            base_dir: base.clone(),
+            run_spec_path: run_spec_path.clone(),
+            current_exe: PathBuf::from("unused"),
+            staged_backend: StagedExecutionBackend::InProcess,
+        })
+        .unwrap();
+        let context_path = prepared
+            .manifest_path
+            .parent()
+            .unwrap()
+            .join(inference_artifacts::PREPARED_RUN_JSON);
+        let frozen: PreparedRun = read_json(&context_path).unwrap();
+        let claimed = ClaimedInput {
+            checkpoints: ClaimedCheckpoints::Trace {
+                path: base.join("trace.json"),
+                trace: trace(Vec::new()),
+            },
+            prepared_run: Some(frozen.clone()),
+        };
+        let options = ChallengeBuildOptions {
+            base_dir: base.clone(),
+            run_spec_path: run_spec_path.clone(),
+            current_exe: PathBuf::from("unused"),
+            staged_backend: StagedExecutionBackend::InProcess,
+            input: ChallengeInput::Trace(base.join("trace.json")),
+        };
+        verify_prepared_run(&frozen).unwrap();
+        assert_eq!(
+            challenge_manifest_path(&options, &claimed).unwrap(),
+            prepared.manifest_path
+        );
+
+        // Current prompt/token edits must not change the claim's frozen run.
+        let spec = fs::read_to_string(&run_spec_path)
+            .unwrap()
+            .replace("tokens = 3", "tokens = 8")
+            .replace("prompt = \"h\"", "prompt = \"changed\"");
+        fs::write(&run_spec_path, spec).unwrap();
+        assert_eq!(
+            challenge_manifest_path(&options, &claimed).unwrap(),
+            prepared.manifest_path
+        );
+        assert_eq!(
+            file_sha256(&prepared.manifest_path).unwrap(),
+            frozen.run_manifest_sha256.unwrap()
+        );
+
+        run_spec(&base, "model-b");
+        assert!(challenge_manifest_path(&options, &claimed)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match the claim"));
+        run_spec(&base, "model-a");
+        for (file, label) in [
+            ("model.detwgt", "model weights"),
+            ("config.json", "model config"),
+            ("tokenizer.json", "model tokenizer"),
+            ("Raster.toml", "Raster template"),
+        ] {
+            let path = model_path.parent().unwrap().join(file);
+            let original = fs::read(&path).unwrap();
+            fs::write(&path, "replaced").unwrap();
+            assert!(challenge_manifest_path(&options, &claimed)
+                .unwrap_err()
+                .to_string()
+                .contains(&format!("{label} hash mismatch")));
+            fs::write(path, original).unwrap();
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn bare_trace_prepares_the_run_spec_model() {
+        let base = temp_dir("trace-model");
+        crate::test_support::model_fixture(&base, "selected");
+        fs::write(base.join("Raster.toml"), "stale root template").unwrap();
+        let options = ChallengeBuildOptions {
+            base_dir: base.clone(),
+            run_spec_path: crate::test_support::run_spec(&base, "selected"),
+            current_exe: PathBuf::from("unused"),
+            staged_backend: StagedExecutionBackend::InProcess,
+            input: ChallengeInput::Trace(base.join("trace.json")),
+        };
+        let claimed = ClaimedInput {
+            checkpoints: ClaimedCheckpoints::Trace {
+                path: base.join("trace.json"),
+                trace: trace(Vec::new()),
+            },
+            prepared_run: None,
+        };
+        let manifest = challenge_manifest_path(&options, &claimed).unwrap();
+        assert!(fs::read_to_string(manifest)
+            .unwrap()
+            .contains("name = \"selected\""));
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn identical_traces_have_no_divergence() {

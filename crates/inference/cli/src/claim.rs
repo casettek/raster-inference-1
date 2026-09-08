@@ -10,9 +10,9 @@ use staged_infer::{
 };
 
 use inference_artifacts::{
-    read_checkpoint_hashes, read_checkpoint_trace, read_json, read_run_spec,
-    write_checkpoint_hashes, write_claim_artifacts_with_prepared_run, write_json, InferenceResult,
-    ModelManifest, PreparedRun, CHECKPOINT_TRACE_JSON, PREPARED_RUN_JSON,
+    file_sha256 as sha256_file, read_checkpoint_hashes, read_checkpoint_trace, read_json,
+    read_run_spec, write_checkpoint_hashes, write_claim_artifacts_with_prepared_run, write_json,
+    InferenceResult, ModelManifest, PreparedRun, CHECKPOINT_TRACE_JSON, PREPARED_RUN_JSON,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -25,9 +25,9 @@ pub struct ClaimBuildOptions {
     pub staged_backend: StagedExecutionBackend,
 }
 
-struct PreparedClaimRun {
+pub(crate) struct PreparedClaimRun {
     prepared_run: PreparedRun,
-    manifest_path: PathBuf,
+    pub(crate) manifest_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,14 +193,16 @@ impl ClaimBuildOptions {
     }
 }
 
-fn prepare_claim_run(options: &ClaimBuildOptions) -> Result<PreparedClaimRun> {
+pub(crate) fn prepare_claim_run(options: &ClaimBuildOptions) -> Result<PreparedClaimRun> {
     let run_spec_path = absolute(&options.base_dir, &options.run_spec_path);
     let run_spec = read_run_spec(&run_spec_path)?;
     let run_spec_dir = run_spec_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("run spec has no parent directory"))?;
     let model_manifest_path = absolute(run_spec_dir, &run_spec.model_manifest);
-    let model_manifest: ModelManifest = read_json(&model_manifest_path)?;
+    let model_manifest = ModelManifest::load_verified(&model_manifest_path)?;
+    let (template_path, template) =
+        model_manifest.verified_raster_template(&model_manifest_path)?;
     let model_manifest_dir = model_manifest_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("model manifest has no parent directory"))?;
@@ -222,17 +224,6 @@ fn prepare_claim_run(options: &ClaimBuildOptions) -> Result<PreparedClaimRun> {
     let (pieces_path, pieces_index_path, pieces_commitment) =
         run_prep::write_initial_pieces(&prompt, &prompt_dir)?;
 
-    let template_path = model_manifest
-        .provenance
-        .as_ref()
-        .map(|provenance| absolute(model_manifest_dir, &provenance.raster_manifest_path))
-        .unwrap_or_else(|| options.base_dir.join("Raster.toml"));
-    let template = fs::read_to_string(&template_path).with_context(|| {
-        format!(
-            "failed to read manifest template {}",
-            template_path.display()
-        )
-    })?;
     let template_dir = template_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("manifest template has no parent directory"))?;
@@ -290,8 +281,8 @@ fn render_run_manifest(
         .lines()
         .any(|line| line.trim_start().starts_with("inputs.initial_pieces ="));
 
+    let template = inference_artifacts::resolve_raster_manifest_paths(template, template_dir)?;
     for line in template.lines() {
-        let line = rewrite_manifest_line(line, template_dir)?;
         if line.trim() == "[[chain.repeat]]" {
             in_decode_repeat = true;
         }
@@ -334,128 +325,6 @@ fn absolute(base: &Path, path: &Path) -> PathBuf {
     } else {
         base.join(path)
     }
-}
-
-fn rewrite_manifest_line(line: &str, template_dir: &Path) -> Result<String> {
-    let line = rewrite_project_line(line, template_dir)?;
-    let line = rewrite_path_assignments(&line, template_dir, "index_path")?;
-    rewrite_path_assignments(&line, template_dir, "path")
-}
-
-fn rewrite_project_line(line: &str, template_dir: &Path) -> Result<String> {
-    let trimmed = line.trim_start();
-    let Some(value) = trimmed.strip_prefix("project =") else {
-        return Ok(line.to_string());
-    };
-    let indent = &line[..line.len() - trimmed.len()];
-    let project: String = serde_json::from_str(value.trim()).with_context(|| {
-        format!(
-            "failed to parse chain stage project path from manifest line `{}`",
-            line
-        )
-    })?;
-    let project_path = Path::new(&project);
-    if project_path.is_absolute() {
-        return Ok(line.to_string());
-    }
-    let absolute_project = template_dir.join(project_path);
-    Ok(format!(
-        "{}project = {:?}",
-        indent,
-        absolute_project.to_string_lossy()
-    ))
-}
-
-fn rewrite_path_assignments(line: &str, template_dir: &Path, key: &str) -> Result<String> {
-    let mut output = String::with_capacity(line.len());
-    let mut cursor = 0;
-    while let Some(relative_pos) = line[cursor..].find(key) {
-        let key_start = cursor + relative_pos;
-        let Some(assignment) = parse_path_assignment(line, key, key_start)? else {
-            output.push_str(&line[cursor..key_start + key.len()]);
-            cursor = key_start + key.len();
-            continue;
-        };
-
-        output.push_str(&line[cursor..assignment.value_start]);
-        if assignment.path.is_absolute() {
-            output.push_str(assignment.literal);
-        } else {
-            let absolute_path = template_dir.join(assignment.path);
-            output.push_str(&format!("{:?}", absolute_path.to_string_lossy()));
-        }
-        cursor = assignment.value_end;
-    }
-    output.push_str(&line[cursor..]);
-    Ok(output)
-}
-
-struct PathAssignment<'a> {
-    value_start: usize,
-    value_end: usize,
-    literal: &'a str,
-    path: PathBuf,
-}
-
-fn parse_path_assignment<'a>(
-    line: &'a str,
-    key: &str,
-    key_start: usize,
-) -> Result<Option<PathAssignment<'a>>> {
-    if key_start > 0 {
-        let previous = line.as_bytes()[key_start - 1];
-        if previous.is_ascii_alphanumeric() || previous == b'_' {
-            return Ok(None);
-        }
-    }
-    let mut cursor = key_start + key.len();
-    cursor = skip_ascii_spaces(line, cursor);
-    if line.as_bytes().get(cursor) != Some(&b'=') {
-        return Ok(None);
-    }
-    cursor += 1;
-    cursor = skip_ascii_spaces(line, cursor);
-    if line.as_bytes().get(cursor) != Some(&b'"') {
-        return Ok(None);
-    }
-    let value_start = cursor;
-    let value_end = closing_quote_end(line, value_start)?;
-    let literal = &line[value_start..value_end];
-    let path: String = serde_json::from_str(literal)
-        .with_context(|| format!("failed to parse `{key}` path from manifest line `{line}`"))?;
-    Ok(Some(PathAssignment {
-        value_start,
-        value_end,
-        literal,
-        path: PathBuf::from(path),
-    }))
-}
-
-fn skip_ascii_spaces(line: &str, mut cursor: usize) -> usize {
-    while matches!(line.as_bytes().get(cursor), Some(b' ' | b'\t')) {
-        cursor += 1;
-    }
-    cursor
-}
-
-fn closing_quote_end(line: &str, value_start: usize) -> Result<usize> {
-    let mut escaped = false;
-    for (offset, byte) in line.as_bytes()[value_start + 1..].iter().enumerate() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match byte {
-            b'\\' => escaped = true,
-            b'"' => return Ok(value_start + 1 + offset + 1),
-            _ => {}
-        }
-    }
-    anyhow::bail!("unterminated string in manifest line `{line}`")
-}
-
-fn sha256_file(path: &Path) -> Result<String> {
-    Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
 }
 
 fn select_checkpoint_index(
@@ -558,7 +427,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn options_from_current_dir_use_root_manifest() {
+    fn options_from_current_dir_use_run_spec() {
         let saved = std::env::current_dir().unwrap();
         let base = temp_dir("claim-options");
         fs::create_dir_all(&base).unwrap();
@@ -579,6 +448,63 @@ mod tests {
         assert_eq!(options.run_spec_path, PathBuf::from("inference.toml"));
         assert_eq!(options.current_exe, PathBuf::from("raster-inference"));
         assert_eq!(options.staged_backend, StagedExecutionBackend::InProcess);
+    }
+
+    #[test]
+    fn preparation_uses_selected_model_and_rejects_stale_identity() {
+        use crate::test_support::{model_fixture, run_spec};
+        let base = temp_dir("model-selection");
+        model_fixture(&base, "model-a");
+        let model_path = model_fixture(&base, "model-b");
+        fs::write(base.join("Raster.toml"), "stale model-a template").unwrap();
+        let options = ClaimBuildOptions {
+            base_dir: base.clone(),
+            run_spec_path: run_spec(&base, "model-b"),
+            current_exe: PathBuf::from("unused"),
+            staged_backend: StagedExecutionBackend::InProcess,
+        };
+        let prepared = prepare_claim_run(&options).unwrap();
+        let rendered = fs::read_to_string(&prepared.manifest_path).unwrap();
+        assert!(rendered.contains("name = \"model-b\""));
+        assert!(rendered.contains("count = 3"));
+        assert!(!rendered.contains("model-a"));
+        assert_eq!(
+            fs::canonicalize(&prepared.prepared_run.model_manifest_path).unwrap(),
+            fs::canonicalize(&model_path).unwrap()
+        );
+
+        for (file, label) in [
+            ("model.detwgt", "model weights"),
+            ("config.json", "model config"),
+            ("tokenizer.json", "model tokenizer"),
+            ("Raster.toml", "Raster template"),
+        ] {
+            let path = model_path.parent().unwrap().join(file);
+            let original = fs::read(&path).unwrap();
+            fs::write(&path, "replaced").unwrap();
+            let error = prepare_claim_run(&options).err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{label} hash mismatch")),
+                "{error:#}"
+            );
+            fs::write(path, original).unwrap();
+        }
+
+        let mut model: ModelManifest = read_json(&model_path).unwrap();
+        model.provenance = None;
+        write_json(&model_path, &model).unwrap();
+        let error = prepare_claim_run(&options).err().unwrap();
+        assert!(error.to_string().contains("no Raster template provenance"));
+        model.version = 99;
+        write_json(&model_path, &model).unwrap();
+        assert!(prepare_claim_run(&options)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("unsupported model manifest"));
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

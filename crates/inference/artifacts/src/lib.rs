@@ -4,6 +4,7 @@ pub mod claim;
 pub mod direct;
 pub mod inference;
 pub mod io;
+pub mod manifest;
 pub mod run;
 
 pub use challenge::{
@@ -22,13 +23,14 @@ pub use claim::{
     ClaimEndpoint, CLAIM_BUNDLE_JSON,
 };
 pub use direct::{
-    DirectInferBundle, DirectInferProvenance, DirectInferShape, ModelManifest, MODEL_ARTIFACTS_DIR,
-    MODEL_MANIFEST_JSON,
+    file_sha256, verify_file_sha256, DirectInferBundle, DirectInferProvenance, DirectInferShape,
+    ModelManifest, MODEL_ARTIFACTS_DIR, MODEL_MANIFEST_JSON,
 };
 pub use inference::{
     InferAuxWaveTiming, InferStageTiming, InferenceResult, InferenceRunReport, InferenceTimings,
 };
 pub use io::{read_json, write_json};
+pub use manifest::resolve_raster_manifest_paths;
 pub use run::{
     read_run_spec, InferenceRunSpec, PreparedPrompt, PreparedRun, INFERENCE_RUN_SPEC_TOML,
     PREPARED_RUN_JSON,

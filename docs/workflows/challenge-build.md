@@ -4,6 +4,7 @@
 
 ```bash
 cargo run --release -p raster-inference-cli -- challenge build \
+  --run inference.toml \
   --claim-context target/staged-infer/runs/.../claim_bundle.json \
   --checkpoints target/staged-infer/runs/.../checkpoints.txt
 # or
@@ -15,7 +16,7 @@ just challenge \
 Flow:
 
 1. Load the claimed `checkpoints.txt` and use `claim_bundle.json` only as today's local carrier for `prepared_run.json`.
-2. Run the checkpointed staged executor again with the frozen run manifest from `prepared_run.json`.
+2. Check that the model selected by `--run` (default: `inference.toml`) matches the frozen model manifest, verify the bundle and model template once, and verify the frozen run manifest. Run the checkpointed staged executor with that frozen run manifest; its prompt and token count are preserved even if the current run spec has changed.
 3. After each recomputed checkpoint, hash the verifier's local checkpoint record and compare it to the claimed hash at the same index.
 4. If no divergence exists, report the claimed and recomputed traces.
 5. If a divergence exists, seed a replay directory with all prior recomputed stages.
@@ -45,4 +46,4 @@ just challenge \
   target/staged-infer/runs/.../checkpoints.corrupt.txt
 ```
 
-`--claim` and `--trace` remain lower-level debug inputs that compare full checkpoint records. `--trace` recomputes with the current root manifest because a trace alone has no frozen run metadata. `challenge locate` and `fault prove` are reserved commands; `challenge build` is the implemented verifier workflow today.
+`--claim` and `--trace` remain lower-level debug inputs that compare full checkpoint records. `--trace` prepares a run from `--run` because a trace alone has no frozen run metadata. It uses that run spec’s model, prompt, and token count. `challenge locate` and `fault prove` are reserved commands; `challenge build` is the implemented verifier workflow today.

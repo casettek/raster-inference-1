@@ -15,11 +15,11 @@ claim run="inference.toml":
 corrupt checkpoints:
     cargo run --release -p raster-inference-cli -- claim corrupt --checkpoints "{{checkpoints}}"
 
-challenge claim_context checkpoints:
-    cargo run --release -p raster-inference-cli -- challenge build --claim-context "{{claim_context}}" --checkpoints "{{checkpoints}}"
+challenge claim_context checkpoints run="inference.toml":
+    cargo run --release -p raster-inference-cli -- challenge build --claim-context "{{claim_context}}" --checkpoints "{{checkpoints}}" --run "{{run}}"
 
-challenge-claim claim:
-    cargo run --release -p raster-inference-cli -- challenge build --claim "{{claim}}"
+challenge-claim claim run="inference.toml":
+    cargo run --release -p raster-inference-cli -- challenge build --claim "{{claim}}" --run "{{run}}"
 
 test-workspace:
     cargo test --workspace

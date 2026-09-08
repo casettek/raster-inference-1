@@ -1,9 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use inference_artifacts::{
-    read_json, DirectInferShape, InferenceRunSpec, ModelManifest, PreparedPrompt,
-};
+use inference_artifacts::{DirectInferShape, InferenceRunSpec, ModelManifest, PreparedPrompt};
 use prompt_prepare::input::BpePieces;
 use raster::{Bytes, List};
 
@@ -100,10 +98,7 @@ impl DirectInferenceModel {
                 manifest_path.display()
             );
         }
-        let manifest: ModelManifest = read_json(manifest_path)?;
-        if manifest.version != 2 {
-            bail!("unsupported model manifest v{}", manifest.version);
-        }
+        let manifest = ModelManifest::load_verified(manifest_path)?;
 
         let manifest_dir = manifest_path
             .parent()

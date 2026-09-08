@@ -28,11 +28,11 @@ pub fn write_model_manifest(
     let direct = ModelManifest {
         version: 2,
         bundle: DirectInferBundle {
-            model_detwgt_path: manifest_relative_path(&artifact_dir, &model_detwgt),
+            model_detwgt_path: manifest_relative_path(&artifact_dir, &model_detwgt)?,
             model_detwgt_sha256: sha256_file(&model_detwgt)?,
-            config_path: manifest_relative_path(&artifact_dir, &config),
+            config_path: manifest_relative_path(&artifact_dir, &config)?,
             config_sha256: sha256_file(&config)?,
-            tokenizer_path: manifest_relative_path(&artifact_dir, &tokenizer_path),
+            tokenizer_path: manifest_relative_path(&artifact_dir, &tokenizer_path)?,
             tokenizer_sha256: sha256_file(&tokenizer_path)?,
         },
         shape: DirectInferShape {
@@ -62,10 +62,14 @@ pub fn write_model_manifest(
                 .unwrap_or(0),
         },
         eos_token_ids: eos_ids.iter().copied().collect(),
-        provenance: raster_manifest.map(|(path, text)| DirectInferProvenance {
-            raster_manifest_path: manifest_relative_path(&artifact_dir, path),
-            raster_manifest_sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
-        }),
+        provenance: raster_manifest
+            .map(|(path, text)| -> Result<_, Box<dyn Error>> {
+                Ok(DirectInferProvenance {
+                    raster_manifest_path: manifest_relative_path(&artifact_dir, path)?,
+                    raster_manifest_sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+                })
+            })
+            .transpose()?,
     };
 
     write_json(&manifest_path, &direct)
@@ -82,17 +86,12 @@ pub fn warn_partial_direct_manifest_not_refreshed(args: &ImportConfig) {
     );
 }
 
-fn manifest_relative_path(artifact_dir: &Path, source: &Path) -> PathBuf {
-    if source.is_absolute() {
-        return source.to_path_buf();
-    }
-    let mut path = PathBuf::new();
-    for _ in artifact_dir.components() {
-        path.push("..");
-    }
-    path.join(source)
+fn manifest_relative_path(artifact_dir: &Path, source: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let dir = fs::canonicalize(artifact_dir)?;
+    let source = fs::canonicalize(source)?;
+    Ok(source.strip_prefix(dir).unwrap_or(&source).to_path_buf())
 }
 
 fn sha256_file(path: &Path) -> Result<String, Box<dyn Error>> {
-    Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
+    inference_artifacts::file_sha256(path).map_err(|error| error.to_string().into())
 }

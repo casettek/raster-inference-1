@@ -10,7 +10,7 @@ just claim inference.toml
 
 Flow:
 
-1. The CLI loads the run spec and prompt-free model manifest.
+1. The CLI loads the run spec and its model manifest, then verifies the weight, config, tokenizer, and model-specific template hashes once before preparing the run. Missing template provenance is an error; claims never fall back to the root `Raster.toml`.
 2. Prompt pieces and `prepared_run.json` are written under `target/raster-inference/runs/<run>/`.
 3. A run-specific `Raster.toml` is generated in the same run directory with the requested prompt artifact and token count.
 4. `staged-infer` reads the run manifest and expands the chain stages.

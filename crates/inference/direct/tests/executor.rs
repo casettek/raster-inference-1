@@ -402,11 +402,11 @@ fn direct_executor_runs_from_direct_manifest_without_raster_toml() {
         &ModelManifest {
             version: 2,
             bundle: DirectInferBundle {
-                model_detwgt_path: PathBuf::from("../model.detwgt"),
+                model_detwgt_path: PathBuf::from("../../model.detwgt"),
                 model_detwgt_sha256: sha256_file(&detwgt),
-                config_path: PathBuf::from("../config.json"),
+                config_path: PathBuf::from("../../config.json"),
                 config_sha256: sha256_file(&config),
-                tokenizer_path: PathBuf::from("../tokenizer.json"),
+                tokenizer_path: PathBuf::from("../../tokenizer.json"),
                 tokenizer_sha256: sha256_file(&tokenizer),
             },
             shape: DirectInferShape {
@@ -480,6 +480,34 @@ fn direct_executor_matches_uncheckpointed_staged_result() {
     assert_eq!(direct, staged);
     assert_eq!(direct.generated_token_ids, vec![2]);
 
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn direct_executor_rejects_changed_bundle_before_inference() {
+    let dir = temp_dir("changed-bundle");
+    fs::create_dir_all(&dir).unwrap();
+    let run_spec_path = write_direct_fixture(&dir);
+    for (name, label) in [
+        ("model.detwgt", "model weights"),
+        ("config.json", "model config"),
+        ("tokenizer.json", "model tokenizer"),
+    ] {
+        let path = dir.join(name);
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, b"replaced").unwrap();
+        let error = DirectInferenceExecutor
+            .run(DirectInferenceConfig {
+                base_dir: dir.clone(),
+                run_spec_path: run_spec_path.clone(),
+            })
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(&format!("{label} hash mismatch")),
+            "{error:#}"
+        );
+        fs::write(path, original).unwrap();
+    }
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -576,11 +604,11 @@ fn tiny_direct_manifest(detwgt: &Path, config: &Path, tokenizer: &Path) -> Model
     ModelManifest {
         version: 2,
         bundle: DirectInferBundle {
-            model_detwgt_path: PathBuf::from("../model.detwgt"),
+            model_detwgt_path: PathBuf::from("../../model.detwgt"),
             model_detwgt_sha256: sha256_file(detwgt),
-            config_path: PathBuf::from("../config.json"),
+            config_path: PathBuf::from("../../config.json"),
             config_sha256: sha256_file(config),
-            tokenizer_path: PathBuf::from("../tokenizer.json"),
+            tokenizer_path: PathBuf::from("../../tokenizer.json"),
             tokenizer_sha256: sha256_file(tokenizer),
         },
         shape: DirectInferShape {

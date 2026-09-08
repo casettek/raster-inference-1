@@ -9,6 +9,8 @@ use clap::{Args, Parser, Subcommand};
 mod challenge;
 mod claim;
 mod infer;
+#[cfg(test)]
+mod test_support;
 
 pub use challenge::{
     build_challenge, ChallengeBuildOptions, ChallengeBuildOutcome, ChallengeBuildResult,
@@ -83,6 +85,7 @@ enum ModelCommand {
 struct ModelImportArgs {
     #[arg(long = "model")]
     model_dir: PathBuf,
+    /// Also save a copy of the model-specific Raster template at this path.
     #[arg(long)]
     manifest: Option<PathBuf>,
     #[arg(long = "artifact-root", default_value = inference_artifacts::MODEL_ARTIFACTS_DIR)]
@@ -292,6 +295,10 @@ fn warn_if_debug_build(_workflow: &str) {}
 
 #[derive(Debug, Args)]
 struct ChallengeBuildArgs {
+    /// Run spec selecting the model to verify against the claim.
+    #[arg(long, default_value = inference_artifacts::INFERENCE_RUN_SPEC_TOML)]
+    run: PathBuf,
+
     /// Claim bundle to challenge. Preferred over --trace because it carries frozen run metadata.
     #[arg(long)]
     claim: Option<PathBuf>,
@@ -873,7 +880,7 @@ impl ChallengeBuildArgs {
         } else {
             staged_infer::chain_runner::StagedExecutionBackend::InProcess
         };
-        ChallengeBuildOptions::from_current_dir(current_exe, staged_backend, input)
+        ChallengeBuildOptions::from_current_dir(current_exe, staged_backend, input, self.run)
     }
 }
 
@@ -937,6 +944,34 @@ mod tests {
             "--only-direct",
         ])
         .unwrap();
+    }
+
+    #[test]
+    fn challenge_run_spec_defaults_and_overrides_reach_options() {
+        for run in [None, Some("specs/model-b.toml")] {
+            let mut argv = vec![
+                "raster-inference",
+                "challenge",
+                "build",
+                "--claim",
+                "claim_bundle.json",
+            ];
+            if let Some(path) = run {
+                argv.extend(["--run", path]);
+            }
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Some(Commands::Challenge {
+                command: ChallengeCommand::Build(args),
+            }) = cli.command
+            else {
+                panic!("expected challenge build");
+            };
+            let options = args.into_options().unwrap();
+            assert_eq!(
+                options.run_spec_path,
+                PathBuf::from(run.unwrap_or("inference.toml"))
+            );
+        }
     }
 
     #[test]
