@@ -1,13 +1,11 @@
-use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use inference_artifacts::{
     read_run_spec, InferStageTiming, InferenceResult, InferenceRunReport, InferenceTimings,
 };
-use serde::Serialize;
 
+use crate::diagnostics::{DirectDiagnosticRunReport, DirectTrace};
 use crate::model::DirectInferenceModel;
 use crate::view_kernels::{
     run_decode_embed_view, run_input_embedding_view, run_ple_prepare_view, run_prefill_range_view,
@@ -24,9 +22,29 @@ impl DirectInferenceExecutor {
     }
 
     pub fn run_with_report(&self, config: DirectInferenceConfig) -> Result<InferenceRunReport> {
+        let mut trace = DirectTrace::new(false)?;
+        self.run_traced(config, &mut trace)
+    }
+
+    pub fn run_with_diagnostics(
+        &self,
+        config: DirectInferenceConfig,
+    ) -> Result<DirectDiagnosticRunReport> {
+        let mut trace = DirectTrace::new(true)?;
+        let report = self.run_traced(config, &mut trace)?;
+        Ok(DirectDiagnosticRunReport {
+            report,
+            boundaries: trace.records,
+        })
+    }
+
+    fn run_traced(
+        &self,
+        config: DirectInferenceConfig,
+        trace: &mut DirectTrace,
+    ) -> Result<InferenceRunReport> {
         let infer_started = Instant::now();
         let mut timings = Vec::new();
-        let mut trace = DirectTrace::from_env()?;
         let run_spec_path = if config.run_spec_path.is_absolute() {
             config.run_spec_path.clone()
         } else {
@@ -51,6 +69,7 @@ impl DirectInferenceExecutor {
         let model = DirectInferenceModel::load(&model_manifest_path)
             .context("failed to load direct-infer model")?;
         timings.push(phase_timing("load_direct_model", load_started.elapsed()));
+        trace.configure(model.shape().num_hidden_layers, run_spec.tokens)?;
 
         let prompt_started = Instant::now();
         let prepared_prompt = model.prepare_prompt(run_spec_dir, &run_spec)?;
@@ -71,7 +90,7 @@ impl DirectInferenceExecutor {
             None,
             &mut timings,
             "prefill",
-            &mut trace,
+            trace,
         )?;
         timings.push(phase_timing("prefill", prefill_started.elapsed()));
 
@@ -79,6 +98,7 @@ impl DirectInferenceExecutor {
         let mut edge = inference_kernels::kernels::decode_init::run_decode_init_direct(
             inference_kernels::kernels::decode_init::DecodeInitDirectInputs,
         )?;
+        trace.record("decode_init", &edge)?;
         for token_idx in 0..run_spec.tokens {
             edge = inference_kernels::kernels::decode_select_token::run_decode_select_token_direct(
                 inference_kernels::kernels::decode_select_token::DecodeSelectTokenDirectInputs {
@@ -99,7 +119,7 @@ impl DirectInferenceExecutor {
                 Some(&prior_layers),
                 &mut timings,
                 &format!("decode_t{token_idx}"),
-                &mut trace,
+                trace,
             )?;
             prior_layers = next_prior_layers;
             logits = next_logits;
@@ -131,6 +151,7 @@ impl DirectInferenceExecutor {
         };
         timings.push(phase_timing("output_finalize", finalize_started.elapsed()));
 
+        trace.finish()?;
         Ok(InferenceRunReport {
             result,
             timings: InferenceTimings {
@@ -216,66 +237,6 @@ fn donor_input(
         .get(donor_layer as usize)
         .cloned()
         .unwrap_or_else(|| fallback.clone())
-}
-
-struct DirectTrace {
-    print: bool,
-    expected: BTreeMap<String, String>,
-    first_mismatch: Option<String>,
-}
-
-impl DirectTrace {
-    fn from_env() -> Result<Self> {
-        let expected = match std::env::var_os("DIRECT_INFER_COMPARE_TRACE") {
-            Some(path) => {
-                let trace_path = PathBuf::from(path);
-                let trace = inference_artifacts::read_checkpoint_trace(&trace_path)
-                    .with_context(|| format!("failed to read {}", trace_path.display()))?;
-                trace
-                    .checkpoints
-                    .into_iter()
-                    .map(|checkpoint| (checkpoint.stage, checkpoint.output_commitment))
-                    .collect()
-            }
-            None => BTreeMap::new(),
-        };
-        let print = std::env::var("DIRECT_INFER_TRACE_COMMITMENTS")
-            .map(|value| !value.eq_ignore_ascii_case("off") && value != "0")
-            .unwrap_or(false)
-            || !expected.is_empty();
-        if print {
-            raster::init();
-        }
-        Ok(Self {
-            print,
-            expected,
-            first_mismatch: None,
-        })
-    }
-
-    fn record<T: Serialize>(&mut self, stage: &str, value: &T) -> Result<()> {
-        if !self.print {
-            return Ok(());
-        }
-        let (_, _, commitment) =
-            raster::encode_raster_value(value).map_err(|error| anyhow::anyhow!("{error}"))?;
-        match self.expected.get(stage) {
-            Some(expected) if expected == &commitment => {
-                eprintln!("direct-infer trace {stage}: structural={commitment} MATCH");
-            }
-            Some(expected) => {
-                eprintln!(
-                    "direct-infer trace {stage}: structural={commitment} MISMATCH expected={expected}"
-                );
-                if self.first_mismatch.is_none() {
-                    self.first_mismatch = Some(stage.to_string());
-                    eprintln!("direct-infer first mismatch: {stage}");
-                }
-            }
-            None => eprintln!("direct-infer trace {stage}: structural={commitment}"),
-        }
-        Ok(())
-    }
 }
 
 fn aux_stage_name(label: &str, layer_idx: usize) -> String {

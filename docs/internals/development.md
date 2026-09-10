@@ -21,7 +21,12 @@ just test-direct
 just test-staged
 just test-artifacts
 just test-cli
+just test-parity
 ```
+
+`just test-parity` is the complete release-mode three-path regression gate. It
+retains logs and reports under `target/parity/`; see the
+[parity workflow](../workflows/test-parity.md) for prerequisites and exact checks.
 
 ## Raster Stage Checks
 

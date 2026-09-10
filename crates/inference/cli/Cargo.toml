@@ -21,3 +21,6 @@ run-prep = { path = "../../model/run-prep" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+
+[dev-dependencies]
+raster = { path = "../../../../raster/crates/raster" }

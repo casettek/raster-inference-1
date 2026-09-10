@@ -64,6 +64,8 @@ pub struct ImportConfig {
     /// Write only the host-side direct-infer manifest, without regenerating
     /// committed Raster stage externals.
     pub only_direct: bool,
+    /// Leave stage-local input.json and input_manifest.json fixtures untouched.
+    pub no_stage_fixtures: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +94,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<ImportConfi
     let mut only_embedding = false;
     let mut only_ple = false;
     let mut only_direct = false;
+    let mut no_stage_fixtures = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -112,6 +115,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<ImportConfi
             "--only-embedding" => only_embedding = true,
             "--only-ple" => only_ple = true,
             "--only-direct" => only_direct = true,
+            "--no-stage-fixtures" => no_stage_fixtures = true,
             other => return Err(format!("unknown argument '{other}'").into()),
         }
     }
@@ -128,6 +132,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<ImportConfi
         only_embedding,
         only_ple,
         only_direct,
+        no_stage_fixtures,
     })
 }
 
@@ -146,12 +151,14 @@ impl ImportConfig {
 #[derive(Debug, Clone)]
 struct ArtifactLayout {
     model_dir: PathBuf,
+    no_stage_fixtures: bool,
 }
 
 impl ArtifactLayout {
     fn from_config(args: &ImportConfig) -> Self {
         Self {
             model_dir: args.artifact_dir(),
+            no_stage_fixtures: args.no_stage_fixtures,
         }
     }
 
@@ -1472,6 +1479,9 @@ fn write_stage_fixtures(
     layout: &ArtifactLayout,
     params: &[(&str, &str, &String)],
 ) -> Result<(), Box<dyn Error>> {
+    if layout.no_stage_fixtures {
+        return Ok(());
+    }
     let entries = |render: &dyn Fn(&str, &str, &str) -> String| -> String {
         params
             .iter()
@@ -1634,7 +1644,7 @@ mod tests {
         let config = parse_args_from(
             [
                 "--model",
-                "fixtures/model",
+                "model-bundles/model",
                 "--manifest",
                 "Raster.toml",
                 "--only-tokenizer",
@@ -1647,7 +1657,7 @@ mod tests {
         assert_eq!(
             config,
             ImportConfig {
-                model_dir: PathBuf::from("fixtures/model"),
+                model_dir: PathBuf::from("model-bundles/model"),
                 manifest: Some(PathBuf::from("Raster.toml")),
                 artifact_root: PathBuf::from(inference_artifacts::MODEL_ARTIFACTS_DIR),
                 model_id: None,
@@ -1656,6 +1666,7 @@ mod tests {
                 only_embedding: true,
                 only_ple: false,
                 only_direct: false,
+                no_stage_fixtures: false,
             }
         );
     }
@@ -1663,7 +1674,7 @@ mod tests {
     #[test]
     fn parse_args_accepts_only_direct() {
         let config =
-            parse_args_from(["--model", "fixtures/model", "--only-direct"].map(String::from))
+            parse_args_from(["--model", "model-bundles/model", "--only-direct"].map(String::from))
                 .unwrap();
 
         assert!(config.only_direct);
@@ -1674,11 +1685,50 @@ mod tests {
     }
 
     #[test]
+    fn no_stage_fixtures_preserves_existing_files() {
+        let mut config = parse_args_from(
+            ["--model", "model-bundles/model", "--no-stage-fixtures"].map(String::from),
+        )
+        .unwrap();
+        assert!(config.no_stage_fixtures);
+        let dir = std::env::temp_dir().join(format!("import-no-fixtures-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("input.json"), "existing input").unwrap();
+        fs::write(dir.join("input_manifest.json"), "existing manifest").unwrap();
+        write_stage_fixtures(
+            dir.to_str().unwrap(),
+            &ArtifactLayout::from_config(&config),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("input.json")).unwrap(),
+            "existing input"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("input_manifest.json")).unwrap(),
+            "existing manifest"
+        );
+        config.no_stage_fixtures = false;
+        write_stage_fixtures(
+            dir.to_str().unwrap(),
+            &ArtifactLayout::from_config(&config),
+            &[],
+        )
+        .unwrap();
+        assert_ne!(
+            fs::read_to_string(dir.join("input.json")).unwrap(),
+            "existing input"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn parse_args_accepts_artifact_layout_options() {
         let config = parse_args_from(
             [
                 "--model",
-                "fixtures/google/gemma-4",
+                "model-bundles/google/gemma-4",
                 "--artifact-root",
                 "runtime/models",
                 "--model-id",
@@ -1699,7 +1749,7 @@ mod tests {
     #[test]
     fn external_lines_use_model_scoped_raster_paths() {
         let config = ImportConfig {
-            model_dir: PathBuf::from("fixtures/model"),
+            model_dir: PathBuf::from("model-bundles/model"),
             manifest: None,
             artifact_root: PathBuf::from("runtime/model-artifacts"),
             model_id: Some(String::from("gemma")),
@@ -1708,6 +1758,7 @@ mod tests {
             only_embedding: false,
             only_ple: false,
             only_direct: false,
+            no_stage_fixtures: false,
         };
         let layout = ArtifactLayout::from_config(&config);
 
@@ -1730,7 +1781,7 @@ mod tests {
     #[test]
     fn run_specific_prompt_placeholder_stays_outside_model_artifacts() {
         let config = ImportConfig {
-            model_dir: PathBuf::from("fixtures/model"),
+            model_dir: PathBuf::from("model-bundles/model"),
             manifest: None,
             artifact_root: PathBuf::from("runtime/model-artifacts"),
             model_id: Some(String::from("gemma")),
@@ -1739,6 +1790,7 @@ mod tests {
             only_embedding: false,
             only_ple: false,
             only_direct: false,
+            no_stage_fixtures: false,
         };
         let layout = ArtifactLayout::from_config(&config);
 
@@ -1759,7 +1811,7 @@ mod tests {
     #[test]
     fn stage_fixture_paths_are_relative_to_stage_dir() {
         let config = ImportConfig {
-            model_dir: PathBuf::from("fixtures/model"),
+            model_dir: PathBuf::from("model-bundles/model"),
             manifest: None,
             artifact_root: PathBuf::from("runtime/model-artifacts"),
             model_id: Some(String::from("gemma")),
@@ -1768,6 +1820,7 @@ mod tests {
             only_embedding: false,
             only_ple: false,
             only_direct: false,
+            no_stage_fixtures: false,
         };
         let layout = ArtifactLayout::from_config(&config);
         let path = path_from_dir(
@@ -1788,7 +1841,7 @@ mod tests {
         let error = parse_args_from(
             [
                 "--model",
-                "fixtures/model",
+                "model-bundles/model",
                 "--only-direct",
                 "--only-tokenizer",
             ]
@@ -1814,7 +1867,7 @@ mod tests {
         let error = parse_args_from(
             [
                 "--model",
-                "fixtures/model",
+                "model-bundles/model",
                 "--prompt",
                 "hello",
                 "--tokens",

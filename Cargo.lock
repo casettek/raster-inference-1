@@ -2437,6 +2437,7 @@ dependencies = [
  "hex",
  "inference-artifacts",
  "model-import",
+ "raster",
  "raster-runtime",
  "run-prep",
  "serde",

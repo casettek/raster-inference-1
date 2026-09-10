@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 mod challenge;
 mod claim;
 mod infer;
+mod parity;
 #[cfg(test)]
 mod test_support;
 
@@ -63,6 +64,17 @@ enum Commands {
     },
     /// Fast unconstrained deterministic inference.
     Infer(InferArgs),
+    /// Run the pinned three-path end-to-end parity suite.
+    TestParity,
+    #[command(hide = true)]
+    ParityWorker {
+        #[arg(long)]
+        run: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        direct: bool,
+    },
     /// Challenge workflows reserved for the verifier path.
     Challenge {
         #[command(subcommand)]
@@ -102,6 +114,9 @@ struct ModelImportArgs {
     only_ple: bool,
     #[arg(long = "only-direct")]
     only_direct: bool,
+    /// Do not overwrite the stage-local manual input fixtures.
+    #[arg(long)]
+    no_stage_fixtures: bool,
 }
 
 #[derive(Debug, Args)]
@@ -217,6 +232,14 @@ fn execute(cli: Cli) -> Result<ExitCode> {
     }
 
     match cli.command {
+        Some(Commands::TestParity) => {
+            parity::run()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Commands::ParityWorker { run, output, direct }) => {
+            parity::worker(&run, &output, direct)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Commands::Model {
             command: ModelCommand::Import(args),
         }) => {
@@ -805,6 +828,7 @@ impl ModelImportArgs {
             only_embedding: self.only_embedding,
             only_ple: self.only_ple,
             only_direct: self.only_direct,
+            no_stage_fixtures: self.no_stage_fixtures,
         }
     }
 }
@@ -895,7 +919,7 @@ mod tests {
             "model",
             "import",
             "--model",
-            "fixtures/model",
+            "model-bundles/model",
         ])
         .unwrap();
         parse_for_test([
@@ -940,7 +964,7 @@ mod tests {
             "model",
             "import",
             "--model",
-            "fixtures/model",
+            "model-bundles/model",
             "--only-direct",
         ])
         .unwrap();
@@ -1053,6 +1077,7 @@ mod tests {
             only_embedding: true,
             only_ple: false,
             only_direct: false,
+            no_stage_fixtures: false,
         }
         .into_import_config();
 
@@ -1068,6 +1093,7 @@ mod tests {
                 only_embedding: true,
                 only_ple: false,
                 only_direct: false,
+                no_stage_fixtures: false,
             }
         );
     }

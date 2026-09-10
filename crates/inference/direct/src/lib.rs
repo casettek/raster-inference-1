@@ -1,5 +1,7 @@
 pub mod config;
+pub mod diagnostics;
 pub use detwgt;
+pub use diagnostics::{DirectBoundaryRecord, DirectDiagnosticRunReport};
 pub mod executor;
 pub mod model;
 pub mod state;

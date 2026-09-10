@@ -38,3 +38,7 @@ test-artifacts:
 
 stage-check stage:
     cargo check --manifest-path "raster-stages/{{stage}}/Cargo.toml" --no-default-features
+
+# Full local host parity gate; all logs and outputs are kept under target/parity.
+test-parity:
+    cargo run --release --locked -p raster-inference-cli -- test-parity

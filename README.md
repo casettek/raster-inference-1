@@ -41,6 +41,7 @@ just challenge \
 
 ## Workflows
 
+- [Three-path parity](docs/workflows/test-parity.md): run `just test-parity` to compare Raster-staged, native-staged, and native-direct inference on a pinned model and corpus.
 - [Model import](docs/workflows/model-import.md): bundle inputs, generated externals, model-specific templates, and model manifests.
 - [Infer](docs/workflows/infer.md): fast deterministic inference through `direct-infer`.
 - [Claim build](docs/workflows/claim-build.md): checkpointed staged inference and claim artifacts.
@@ -74,6 +75,7 @@ crates/
     kernels/                # shared deterministic inference kernels
   det-num/                  # deterministic numeric primitives
 raster-stages/              # verifiable Raster program crates
+model-bundles/              # checked-in source model bundles for local gates
 runtime/                    # imported model artifacts, prompt fixtures, generated manifest examples
 manifests/                  # alternate generated manifests and examples
 docs/                       # workflow, internals, issues, proposals
