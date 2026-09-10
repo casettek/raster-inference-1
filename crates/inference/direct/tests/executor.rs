@@ -392,7 +392,7 @@ fn direct_executor_runs_from_direct_manifest_without_raster_toml() {
     let tokenizer = dir.join("tokenizer.json");
     fs::write(
         &tokenizer,
-        r#"{"model":{"vocab":{"<pad>":0,"h":1,"Hi":2},"merges":[]},"added_tokens":[]}"#,
+        r#"{"model":{"type":"BPE","vocab":{"<pad>":0,"h":1,"Hi":2},"merges":[]},"added_tokens":[]}"#,
     )
     .unwrap();
 
@@ -663,7 +663,10 @@ fn write_run_spec(dir: &Path, manifest_path: &Path, prompt: &str, tokens: u32) -
 fn write_staged_fixture(dir: &Path) {
     let tokenizer = tiny_prompt_tokenizer();
     let pieces = BpePieces {
-        pieces: List::from(vec![String::from("h"), String::from("</w>")]),
+        pieces: List::from(vec![prompt_prepare::input::BpePiece {
+            text: "h".into(),
+            segment: 0,
+        }]),
     };
     let embedding = EmbeddingTable {
         hidden_size: 2,
@@ -729,7 +732,7 @@ version = "0.1.0"
 name = "prompt_prepare"
 project = "raster-stages/prompt-prepare"
 inputs.tokenizer = {{ external = {{ path = "raster-stages/prompt-prepare/tokenizer.rastered", index_path = "raster-stages/prompt-prepare/tokenizer.rindex", commitment = "{tokenizer_commitment}" }} }}
-inputs.initial_pieces = {{ external = {{ path = "raster-stages/prompt-prepare/initial_pieces.rastered", index_path = "raster-stages/prompt-prepare/initial_pieces.rindex", commitment = "{pieces_commitment}" }} }}
+inputs.merged_pieces = {{ external = {{ path = "raster-stages/prompt-prepare/initial_pieces.rastered", index_path = "raster-stages/prompt-prepare/initial_pieces.rindex", commitment = "{pieces_commitment}" }} }}
 
 [[chain.stage]]
 name = "input_embedding"
@@ -801,7 +804,7 @@ fn tiny_prompt_tokenizer() -> PromptTokenizer {
 }
 
 fn tiny_tokenizer_json() -> &'static str {
-    r#"{"model":{"vocab":{"<pad>":0,"h":1,"Hi":2},"merges":[]},"added_tokens":[]}"#
+    r#"{"model":{"type":"BPE","vocab":{"<pad>":0,"h":1,"Hi":2},"merges":[]},"added_tokens":[]}"#
 }
 
 fn paged(values: &[i32]) -> Bytes<196_608> {

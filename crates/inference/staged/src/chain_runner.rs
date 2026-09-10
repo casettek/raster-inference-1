@@ -1803,10 +1803,25 @@ mod tests {
             .to_path_buf()
     }
 
+    fn real_manifest_with_repeats(decode: u32, tokenize: u32) -> Manifest {
+        let text = fs::read_to_string(repo_root().join("Raster.toml")).unwrap();
+        let mut doc: RasterTomlDoc = toml::from_str(&text).unwrap();
+        for repeat in &mut doc.chain.repeats {
+            let repeat = repeat.get_mut();
+            repeat.count = match repeat.name.as_str() {
+                "decode" => decode,
+                "tokenize" => tokenize,
+                _ => panic!("unexpected top-level repeat"),
+            };
+        }
+        Manifest {
+            chain: expand_chain_table(doc.chain).unwrap(),
+        }
+    }
+
     #[test]
     fn real_manifest_dispatches_one_reference_and_remaining_stages_native() {
-        let manifest_path = repo_root().join("Raster.toml");
-        let manifest = read_manifest(&manifest_path).unwrap();
+        let manifest = real_manifest_with_repeats(2, 2);
         let mut direct = 0usize;
         let mut reference = 0usize;
 
@@ -1817,15 +1832,14 @@ mod tests {
             }
         }
 
-        assert_eq!(manifest.chain.stage.len(), 221);
-        assert_eq!(direct, 220);
+        assert_eq!(manifest.chain.stage.len(), 224);
+        assert_eq!(direct, 223);
         assert_eq!(reference, 1);
     }
 
     #[test]
     fn real_manifest_dispatches_every_stage_native_without_reference() {
-        let manifest_path = repo_root().join("Raster.toml");
-        let manifest = read_manifest(&manifest_path).unwrap();
+        let manifest = real_manifest_with_repeats(2, 2);
         let mut direct = 0usize;
         let mut reference = 0usize;
 
@@ -1836,16 +1850,23 @@ mod tests {
             }
         }
 
-        assert_eq!(manifest.chain.stage.len(), 221);
-        assert_eq!(direct, 221);
+        assert_eq!(manifest.chain.stage.len(), 224);
+        assert_eq!(direct, 224);
         assert_eq!(reference, 0);
     }
 
     #[test]
     fn real_manifest_expands_decode_repeat_and_export() {
-        let manifest_path = repo_root().join("Raster.toml");
-        let manifest = read_manifest(&manifest_path).unwrap();
+        let manifest = real_manifest_with_repeats(2, 3);
         let index = build_stage_index(&manifest.chain.stage).unwrap();
+
+        assert!(index.contains_key("prompt_merge_b2"));
+        assert!(!index.contains_key("prompt_merge_b3"));
+        let prepare = &manifest.chain.stage[index["prompt_prepare"]];
+        assert_eq!(
+            prepare.inputs["merged_pieces"],
+            InputBinding::From("prompt_merge_b2".into())
+        );
 
         assert!(index.contains_key("decode_select_t0"));
         assert!(index.contains_key("decode_embed_t1"));
@@ -1866,6 +1887,12 @@ mod tests {
         let index = build_stage_index(&manifest.chain.stage).unwrap();
 
         assert!(!index.contains_key("decode_select_t0"));
+        assert!(!index.contains_key("prompt_merge_b0"));
+        let prepare = &manifest.chain.stage[index["prompt_prepare"]];
+        assert_eq!(
+            prepare.inputs["merged_pieces"],
+            InputBinding::From("prompt_merge_seed".into())
+        );
         let output = manifest.chain.stage.last().unwrap();
         assert_eq!(output.name, "output_finalize");
         assert_eq!(
@@ -1972,11 +1999,11 @@ mod tests {
         let manifest_path = repo_root().join("Raster.toml");
         let manifest = read_manifest(&manifest_path).unwrap();
 
-        let range = aux_wave_range(&manifest.chain.stage, 2).unwrap();
+        let range = aux_wave_range(&manifest.chain.stage, 3).unwrap();
 
-        assert_eq!(range, 2..37);
+        assert_eq!(range, 3..38);
         assert!(aux_wave_range(&manifest.chain.stage, 0).is_none());
-        assert!(aux_wave_range(&manifest.chain.stage, 37).is_none());
+        assert!(aux_wave_range(&manifest.chain.stage, 38).is_none());
         for stage in &manifest.chain.stage[range] {
             assert!(is_prefill_prepare_aux_stage(stage));
             assert_eq!(
@@ -1990,7 +2017,7 @@ mod tests {
     fn raster_reference_inside_aux_wave_dispatches_once() {
         let manifest_path = repo_root().join("Raster.toml");
         let manifest = read_manifest(&manifest_path).unwrap();
-        let range = aux_wave_range(&manifest.chain.stage, 2).unwrap();
+        let range = aux_wave_range(&manifest.chain.stage, 3).unwrap();
         let mut direct = 0usize;
         let mut reference = Vec::new();
 

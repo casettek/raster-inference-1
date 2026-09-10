@@ -13,6 +13,12 @@ chain (`--no-auth`), checkpointed native-staged inference, and native-direct
 inference. Each execution owns its intermediate outputs and runtime state.
 All three fixed cases run every time. There are no numerical tolerances.
 
+The staged inventories include `prompt_merge_seed` and every scheduled
+`prompt_merge_b{b}` checkpoint. Direct execution compares final `prompt_prepare`
+and downstream boundaries without inventing intermediate tokenizer checkpoints.
+Independent exact-ID tokenizer fixtures and authenticated tokenizer-chain checks
+are described in [ranked BPE](../proposals/ranked-bpe-tokenizer.md).
+
 The sibling `../raster` checkout and its normal Rust/RISC Zero build prerequisites
 must be available, as required by this workspace's path dependencies. The gate
 builds that checkout's Raster CLI into `target/parity-tools`; it does not use the
@@ -86,7 +92,7 @@ attention alternates, layers 2/3 borrow from layers 0/1, and the sliding window 
 The short raw prompt has 5 input tokens and generates 1 token. The second raw
 prompt has 15 input tokens and generates 8. The wrapped prompt has 33 input
 tokens, including punctuation, repeated spaces, Unicode and byte fallback, and
-generates 8. The corpus exercises BPE merges and both prompt modes. Nonconstant
+generates 8. The corpus exercises competing ranked BPE merges and both prompt modes. Nonconstant
 logits and multiple selected token IDs prevent a degenerate bundle from passing.
 
 This gate checks host computational parity. Proof generation and native/zkVM

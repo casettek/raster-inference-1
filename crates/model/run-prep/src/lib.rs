@@ -2,14 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
-use inference_artifacts::{InferenceRunSpec, ModelManifest, PreparedPrompt};
+use anyhow::{ensure, Context, Result};
+use inference_artifacts::{InferenceRunSpec, ModelManifest, PreparedPiece, PreparedPrompt};
 use output_finalize::input::{DecoderTable, DecoderToken};
 use prompt_prepare::input::{merge_bucket_of, vocab_bucket_of, BpeMerge, MergeBucket};
-use prompt_prepare::input::{BpePieces, PromptTokenizer, TokenEntry, VocabBucket};
+use prompt_prepare::input::{BpePiece, BpePieces, PromptTokenizer, TokenEntry, VocabBucket};
 use raster::List;
 
-const END_OF_WORD: &str = "</w>";
 const BOS_TOKEN: &str = "<bos>";
 const TURN_OPEN: &str = "<|turn>";
 const TURN_CLOSE: &str = "<turn|>";
@@ -30,12 +29,7 @@ pub fn prepare_prompt(
     } else {
         prompt.clone()
     };
-    let initial_pieces = if templated {
-        let special_tokens = special_tokens(tokenizer);
-        split_prompt(&rendered_prompt, &vocab, &special_tokens)
-    } else {
-        split_prompt(&rendered_prompt, &vocab, &[])
-    };
+    let initial_pieces = split_prompt(&rendered_prompt, tokenizer)?;
 
     Ok(PreparedPrompt {
         resolved_prompt: prompt,
@@ -46,23 +40,33 @@ pub fn prepare_prompt(
 }
 
 pub fn prompt_tokenizer(tokenizer: &serde_json::Value) -> Result<PromptTokenizer> {
+    validate_tokenizer_profile(tokenizer)?;
     let model = tokenizer_model(tokenizer)?;
     let mut vocab: Vec<TokenEntry> = vocab_map(model)?
         .into_iter()
         .map(|(token, id)| TokenEntry { token, id })
         .collect();
     vocab.sort_by_key(|entry| entry.id);
-    let merges = model
-        .get("merges")
-        .and_then(serde_json::Value::as_array)
-        .map(|merges| {
-            merges
-                .iter()
-                .enumerate()
-                .filter_map(|(rank, entry)| parse_merge(rank as u32, entry))
-                .collect()
-        })
-        .unwrap_or_default();
+    let vocab_ids = vocab_map(model)?;
+    let mut merges = Vec::new();
+    let mut pairs = BTreeSet::new();
+    if let Some(entries) = model.get("merges").and_then(|v| v.as_array()) {
+        for (rank, entry) in entries.iter().enumerate() {
+            let rule = parse_merge(u32::try_from(rank).context("merge rank overflow")?, entry)
+                .context("malformed BPE merge")?;
+            ensure!(
+                vocab_ids.contains_key(&rule.left)
+                    && vocab_ids.contains_key(&rule.right)
+                    && vocab_ids.contains_key(&rule.merged),
+                "merge token absent from vocabulary"
+            );
+            ensure!(
+                pairs.insert((rule.left.clone(), rule.right.clone())),
+                "duplicate BPE pair"
+            );
+            merges.push(rule);
+        }
+    }
     let (vocab_bucket_count, vocab_buckets) = bucket_vocab(vocab);
     let (merge_bucket_count, merge_buckets) = bucket_merges(merges);
     Ok(PromptTokenizer {
@@ -110,7 +114,16 @@ pub fn write_initial_pieces(
 ) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
     fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let pieces = BpePieces {
-        pieces: List::from(prompt.initial_pieces.clone()),
+        pieces: List::from(
+            prompt
+                .initial_pieces
+                .iter()
+                .map(|p| BpePiece {
+                    text: p.text.clone(),
+                    segment: p.segment,
+                })
+                .collect::<Vec<_>>(),
+        ),
     };
     let data_path = dir.join("initial_pieces.rastered");
     let index_path = dir.join("initial_pieces.rindex");
@@ -132,39 +145,203 @@ pub fn supports_gemma_turns(vocab: &BTreeMap<String, u32>) -> bool {
         .all(|token| vocab.contains_key(*token))
 }
 
-pub fn split_prompt(
-    prompt: &str,
-    vocab: &BTreeMap<String, u32>,
-    specials: &[String],
-) -> Vec<String> {
-    let mut pieces = Vec::new();
+/// The number of ordinary repeats after the mandatory eight-operation seed.
+pub fn tokenizer_repeat_count(piece_count: usize) -> Result<u32> {
+    let merges = piece_count.saturating_sub(1);
+    let batches = (merges / 8 + usize::from(merges % 8 != 0)).max(1);
+    u32::try_from(batches - 1).context("tokenizer repeat count exceeds u32")
+}
+
+/// Supported tokenizer profile: Gemma's literal space normalization/splitting,
+/// atomic added tokens, character pieces, byte fallback and fused unknowns.
+/// Unsupported transformations fail explicitly instead of silently approximating.
+pub fn split_prompt(prompt: &str, tokenizer: &serde_json::Value) -> Result<Vec<PreparedPiece>> {
+    let model = tokenizer_model(tokenizer)?;
+    validate_tokenizer_profile(tokenizer)?;
+    let vocab = vocab_map(model)?;
+    let specials = special_tokens(tokenizer);
+    let normalize_spaces = !tokenizer
+        .get("normalizer")
+        .unwrap_or(&serde_json::Value::Null)
+        .is_null();
+    let split_spaces = !tokenizer
+        .get("pre_tokenizer")
+        .unwrap_or(&serde_json::Value::Null)
+        .is_null();
+    let byte_fallback = model
+        .get("byte_fallback")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let fuse_unk = model
+        .get("fuse_unk")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let unk = model.get("unk_token").and_then(|v| v.as_str());
+    let mut pieces = Vec::<PreparedPiece>::new();
     let mut rest = prompt;
+    let mut segment = 0_u32;
+    let mut previous_unknown = false;
     while !rest.is_empty() {
         if let Some(special) = specials
             .iter()
             .find(|token| rest.starts_with(token.as_str()))
         {
-            pieces.push(special.clone());
+            segment = segment.checked_add(1).context("piece segment overflow")?;
+            pieces.push(PreparedPiece {
+                text: special.clone(),
+                segment,
+            });
+            segment = segment.checked_add(1).context("piece segment overflow")?;
             rest = &rest[special.len()..];
+            previous_unknown = false;
             continue;
         }
-        let ch = rest.chars().next().expect("rest is non-empty");
+        let ch = rest.chars().next().expect("nonempty prompt");
         rest = &rest[ch.len_utf8()..];
-        let piece = if ch == ' ' {
-            String::from('\u{2581}')
+        let text = if normalize_spaces && ch == ' ' {
+            "▁".to_string()
         } else {
             ch.to_string()
         };
-        if vocab.contains_key(&piece) {
-            pieces.push(piece);
+        if vocab.contains_key(&text) {
+            pieces.push(PreparedPiece {
+                text: text.clone(),
+                segment,
+            });
+            previous_unknown = false;
         } else {
-            for byte in piece.as_bytes() {
-                pieces.push(format!("<0x{byte:02X}>"));
+            let bytes = text
+                .as_bytes()
+                .iter()
+                .map(|b| format!("<0x{b:02X}>"))
+                .collect::<Vec<_>>();
+            if byte_fallback && bytes.iter().all(|s| vocab.contains_key(s)) {
+                pieces.extend(
+                    bytes
+                        .into_iter()
+                        .map(|text| PreparedPiece { text, segment }),
+                );
+                previous_unknown = false;
+            } else if let Some(unknown) = unk {
+                if !fuse_unk || !previous_unknown {
+                    pieces.push(PreparedPiece {
+                        text: unknown.to_string(),
+                        segment,
+                    });
+                }
+                previous_unknown = true;
+            } else {
+                // BPE without an unknown token drops characters outside its
+                // vocabulary when byte fallback cannot represent them.
+                previous_unknown = false;
             }
         }
+        // Split(MergedWithPrevious) runs after normalization. In production
+        // spaces have become ▁, so it introduces no new boundaries.
+        if split_spaces && text == " " {
+            segment = segment.checked_add(1).context("piece segment overflow")?;
+            previous_unknown = false;
+        }
     }
-    pieces.push(END_OF_WORD.to_string());
-    pieces
+    Ok(pieces)
+}
+
+pub fn validate_tokenizer_profile(tokenizer: &serde_json::Value) -> Result<()> {
+    let model = tokenizer_model(tokenizer)?;
+    ensure!(
+        model.get("type").and_then(|v| v.as_str()) == Some("BPE"),
+        "only BPE tokenizer models are supported"
+    );
+    for key in ["truncation", "padding"] {
+        ensure!(
+            tokenizer.get(key).is_none_or(|v| v.is_null()),
+            "unsupported tokenizer {key}"
+        );
+    }
+    ensure!(
+        model.get("merges").is_some_and(|v| v.is_array()),
+        "BPE merges must be an array"
+    );
+    ensure!(
+        tokenizer
+            .get("added_tokens")
+            .is_none_or(|v| v.is_null() || v.is_array()),
+        "added_tokens must be an array"
+    );
+    for key in ["continuing_subword_prefix", "end_of_word_suffix"] {
+        ensure!(
+            model
+                .get(key)
+                .is_none_or(|v| v.is_null() || v.as_str() == Some("")),
+            "unsupported BPE {key}"
+        );
+    }
+    ensure!(
+        model
+            .get("dropout")
+            .is_none_or(|v| v.is_null() || v.as_f64() == Some(0.0)),
+        "BPE dropout is unsupported"
+    );
+    ensure!(
+        !model
+            .get("ignore_merges")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        "ignore_merges is unsupported"
+    );
+    for (key, expected) in [
+        (
+            "normalizer",
+            serde_json::json!({"type":"Replace","pattern":{"String":" "},"content":"▁"}),
+        ),
+        (
+            "pre_tokenizer",
+            serde_json::json!({"type":"Split","pattern":{"String":" "},"behavior":"MergedWithPrevious","invert":false}),
+        ),
+        (
+            "post_processor",
+            serde_json::json!({"type":"TemplateProcessing","single":[{"Sequence":{"id":"A","type_id":0}}],"pair":[{"Sequence":{"id":"A","type_id":0}},{"Sequence":{"id":"B","type_id":1}}],"special_tokens":{}}),
+        ),
+    ] {
+        ensure!(
+            tokenizer
+                .get(key)
+                .is_none_or(|v| v.is_null() || *v == expected),
+            "unsupported tokenizer {key}"
+        );
+    }
+    let vocab = vocab_map(model)?;
+    if let Some(unknown) = model.get("unk_token").filter(|v| !v.is_null()) {
+        ensure!(
+            unknown.as_str().is_some_and(|s| vocab.contains_key(s)),
+            "unknown token absent from vocabulary"
+        );
+    }
+    if let Some(tokens) = tokenizer.get("added_tokens").and_then(|v| v.as_array()) {
+        for token in tokens {
+            for key in ["single_word", "lstrip", "rstrip", "normalized"] {
+                ensure!(
+                    !token.get(key).and_then(|v| v.as_bool()).unwrap_or(false),
+                    "unsupported added-token {key}"
+                );
+            }
+            ensure!(
+                token.get("special").and_then(|v| v.as_bool()) == Some(true),
+                "non-special added tokens are unsupported"
+            );
+            let text = token
+                .get("content")
+                .and_then(|v| v.as_str())
+                .context("invalid added token")?;
+            ensure!(
+                !text.is_empty()
+                    && vocab.get(text).map(|id| *id as u64)
+                        == token.get("id").and_then(|v| v.as_u64()),
+                "added token disagrees with vocabulary: {text}"
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn vocab_map(model: &serde_json::Value) -> Result<BTreeMap<String, u32>> {
@@ -178,7 +355,8 @@ pub fn vocab_map(model: &serde_json::Value) -> Result<BTreeMap<String, u32>> {
                 token.clone(),
                 id.as_u64()
                     .ok_or_else(|| anyhow::anyhow!("token '{token}' has non-integer id"))?
-                    as u32,
+                    .try_into()
+                    .context("token id exceeds u32")?,
             ))
         })
         .collect()
@@ -311,7 +489,14 @@ mod tests {
             prepare_prompt(&tokenizer, Path::new("."), &spec, &model_manifest()).unwrap();
 
         assert_eq!(prepared.rendered_prompt, "h");
-        assert_eq!(prepared.initial_pieces, vec!["h", "</w>"]);
+        assert_eq!(
+            prepared
+                .initial_pieces
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["h"]
+        );
     }
 
     #[test]
@@ -321,21 +506,23 @@ mod tests {
         let prepared =
             prepare_prompt(&tokenizer, Path::new("."), &spec, &model_manifest()).unwrap();
 
-        assert!(prepared.initial_pieces.contains(&String::from("<bos>")));
-        assert!(prepared.initial_pieces.contains(&String::from("<|turn>")));
+        assert!(prepared.initial_pieces.iter().any(|p| p.text == "<bos>"));
+        assert!(prepared.initial_pieces.iter().any(|p| p.text == "<|turn>"));
     }
 
     #[test]
     fn byte_fallback_emits_hex_pieces_for_unknown_utf8_bytes() {
         let tokenizer = serde_json::json!({
-            "model": { "vocab": {}, "merges": [] },
+            "model": { "type": "BPE", "vocab": {"<0xC3>": 1, "<0xA9>": 2}, "merges": [], "byte_fallback": true },
             "added_tokens": []
         });
-        let model = tokenizer.get("model").unwrap();
-
         assert_eq!(
-            split_prompt("é", &vocab_map(model).unwrap(), &[]),
-            vec!["<0xC3>", "<0xA9>", "</w>"]
+            split_prompt("é", &tokenizer)
+                .unwrap()
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["<0xC3>", "<0xA9>"]
         );
     }
 
@@ -390,6 +577,7 @@ mod tests {
     fn gemma_tokenizer() -> serde_json::Value {
         serde_json::json!({
             "model": {
+                "type": "BPE",
                 "vocab": {
                     "<bos>": 0,
                     "<|turn>": 1,
@@ -398,7 +586,7 @@ mod tests {
                     "hello": 4,
                     "user": 5,
                     "model": 6,
-                    "h": 7
+                    "h": 7, "e": 8, "l": 9, "o": 10, "u": 11, "s": 12, "r": 13, "m": 14, "d": 15
                 },
                 "merges": []
             },

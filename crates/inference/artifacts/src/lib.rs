@@ -32,8 +32,8 @@ pub use inference::{
 pub use io::{read_json, write_json};
 pub use manifest::resolve_raster_manifest_paths;
 pub use run::{
-    read_run_spec, InferenceRunSpec, PreparedPrompt, PreparedRun, INFERENCE_RUN_SPEC_TOML,
-    PREPARED_RUN_JSON,
+    read_run_spec, InferenceRunSpec, PreparedPiece, PreparedPrompt, PreparedRun,
+    INFERENCE_RUN_SPEC_TOML, PREPARED_RUN_JSON, PREPARED_RUN_VERSION,
 };
 
 #[cfg(test)]
@@ -265,14 +265,17 @@ mod tests {
     #[test]
     fn prepared_run_metadata_round_trips_as_json() {
         let prepared = PreparedRun {
-            version: 1,
+            version: PREPARED_RUN_VERSION,
             run_spec_path: PathBuf::from("inference.toml"),
             model_manifest_path: PathBuf::from("model-artifacts/manifest.json"),
             model_manifest_sha256: String::from("model-sha"),
             prompt: PreparedPrompt {
                 resolved_prompt: String::from("hello"),
                 rendered_prompt: String::from("hello"),
-                initial_pieces: vec![String::from("hello"), String::from("</w>")],
+                initial_pieces: vec![PreparedPiece {
+                    text: String::from("hello"),
+                    segment: 0,
+                }],
                 eos_token_ids: vec![1, 2],
             },
             tokens: 2,

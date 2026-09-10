@@ -148,7 +148,16 @@ impl DirectInferenceModel {
     ) -> Result<prompt_prepare::input::PromptTokenization> {
         let tokenizer = run_prep::prompt_tokenizer(&self.tokenizer)?;
         let pieces = BpePieces {
-            pieces: List::from(prompt.initial_pieces.clone()),
+            pieces: List::from(
+                prompt
+                    .initial_pieces
+                    .iter()
+                    .map(|p| prompt_prepare::input::BpePiece {
+                        text: p.text.clone(),
+                        segment: p.segment,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
         };
         inference_kernels::kernels::prompt_prepare::run_prompt_prepare_direct(
             inference_kernels::kernels::prompt_prepare::PromptPrepareDirectInputs {

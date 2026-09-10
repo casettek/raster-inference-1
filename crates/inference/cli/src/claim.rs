@@ -26,7 +26,7 @@ pub struct ClaimBuildOptions {
 }
 
 pub(crate) struct PreparedClaimRun {
-    prepared_run: PreparedRun,
+    pub(crate) prepared_run: PreparedRun,
     pub(crate) manifest_path: PathBuf,
 }
 
@@ -234,6 +234,7 @@ pub(crate) fn prepare_claim_run(options: &ClaimBuildOptions) -> Result<PreparedC
         &pieces_index_path,
         &pieces_commitment,
         run_spec.tokens,
+        run_prep::tokenizer_repeat_count(prompt.initial_pieces.len())?,
     )?;
     let manifest_path = run_dir.join("Raster.toml");
     fs::create_dir_all(&run_dir)
@@ -242,7 +243,7 @@ pub(crate) fn prepare_claim_run(options: &ClaimBuildOptions) -> Result<PreparedC
         .with_context(|| format!("failed to write {}", manifest_path.display()))?;
     let run_manifest_sha256 = format!("{:x}", Sha256::digest(run_manifest.as_bytes()));
     let prepared_run = PreparedRun {
-        version: 1,
+        version: inference_artifacts::PREPARED_RUN_VERSION,
         run_spec_path,
         model_manifest_path: model_manifest_path.clone(),
         model_manifest_sha256: sha256_file(&model_manifest_path)?,
@@ -266,54 +267,57 @@ fn render_run_manifest(
     pieces_index_path: &Path,
     pieces_commitment: &str,
     tokens: u32,
+    tokenizer_repeats: u32,
 ) -> Result<String> {
     let pieces_line = format!(
         "inputs.initial_pieces = {{ external = {{ path = {:?}, index_path = {:?}, commitment = {:?} }} }}",
-        pieces_path.to_string_lossy(),
-        pieces_index_path.to_string_lossy(),
-        pieces_commitment
+        pieces_path, pieces_index_path, pieces_commitment,
     );
-    let mut replaced_pieces = false;
-    let mut replaced_decode_count = false;
-    let mut in_decode_repeat = false;
-    let mut out = Vec::new();
-    let has_initial_pieces_placeholder = template
-        .lines()
-        .any(|line| line.trim_start().starts_with("inputs.initial_pieces ="));
-
     let template = inference_artifacts::resolve_raster_manifest_paths(template, template_dir)?;
+    let mut table = "";
+    let mut name = String::new();
+    let mut replaced = [0_usize; 3];
+    let mut out = Vec::new();
     for line in template.lines() {
-        if line.trim() == "[[chain.repeat]]" {
-            in_decode_repeat = true;
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            table = match trimmed {
+                "[[chain.repeat]]" => "repeat",
+                "[[chain.stage]]" => "stage",
+                _ => "",
+            };
+            name.clear();
         }
-        if line.trim_start().starts_with("inputs.initial_pieces =") {
-            if replaced_pieces {
-                anyhow::bail!("manifest template has multiple initial_pieces bindings");
-            }
-            out.push(pieces_line.clone());
-            replaced_pieces = true;
-            continue;
+        if trimmed.starts_with("name =") {
+            let value: toml::Value = toml::from_str(trimmed)?;
+            name = value["name"]
+                .as_str()
+                .context("invalid stage/repeat name")?
+                .to_string();
         }
-        out.push(line.to_string());
-        if !has_initial_pieces_placeholder
-            && !replaced_pieces
-            && line.trim_start().starts_with("inputs.tokenizer =")
+        if table == "stage"
+            && name == "prompt_merge_seed"
+            && trimmed.starts_with("inputs.initial_pieces =")
         {
+            replaced[0] += 1;
             out.push(pieces_line.clone());
-            replaced_pieces = true;
-        }
-        if in_decode_repeat && line.trim_start().starts_with("count =") {
-            *out.last_mut().expect("line was just pushed") = format!("count = {tokens}");
-            replaced_decode_count = true;
-            in_decode_repeat = false;
+        } else if table == "repeat"
+            && trimmed.starts_with("count =")
+            && (name == "decode" || name == "tokenize")
+        {
+            let (slot, count) = if name == "decode" {
+                (1, tokens)
+            } else {
+                (2, tokenizer_repeats)
+            };
+            replaced[slot] += 1;
+            out.push(format!("count = {count}"));
+        } else {
+            out.push(line.to_string());
         }
     }
-
-    if !replaced_pieces {
-        anyhow::bail!("manifest template has no prompt_prepare tokenizer binding");
-    }
-    if !replaced_decode_count {
-        anyhow::bail!("manifest template has no decode repeat count to replace");
+    if replaced != [1, 1, 1] {
+        anyhow::bail!("incompatible manifest template: expected one seed prompt binding and named decode/tokenize counts; found {replaced:?}");
     }
     out.push(String::new());
     Ok(out.join("\n"))
@@ -523,14 +527,17 @@ mod tests {
             },
             &manifest_path,
             &PreparedRun {
-                version: 1,
+                version: inference_artifacts::PREPARED_RUN_VERSION,
                 run_spec_path: base.join("inference.toml"),
                 model_manifest_path: base.join("model-artifacts/manifest.json"),
                 model_manifest_sha256: String::from("model-sha"),
                 prompt: inference_artifacts::PreparedPrompt {
                     resolved_prompt: String::from("hello"),
                     rendered_prompt: String::from("hello"),
-                    initial_pieces: vec![String::from("hello"), String::from("</w>")],
+                    initial_pieces: vec![inference_artifacts::PreparedPiece {
+                        text: String::from("hello"),
+                        segment: 0,
+                    }],
                     eos_token_ids: Vec::new(),
                 },
                 tokens: 1,
@@ -643,10 +650,19 @@ index_path = "runtime/weights/layer{l}.rindex"
 commitments = ["abc"]
 
 [[chain.stage]]
-name = "prompt_prepare"
+name = "prompt_merge_seed"
 project = "raster-stages/prompt-prepare"
 inputs.tokenizer = { external = { path = "tokenizer.rastered", index_path = "tokenizer.rindex", commitment = "tok" } }
 inputs.initial_pieces = { external = { path = "old.rastered", index_path = "old.rindex", commitment = "old" } }
+
+[[chain.repeat]]
+name = "tokenize"
+index = "b"
+count = 99
+[[chain.repeat.stage]]
+name = "prompt_merge_b{b}"
+project = "raster-stages/prompt-merge"
+inputs.initial_pieces = { from = "prompt_merge_b{b-1}", first = "prompt_merge_seed" }
 
 [[chain.repeat]]
 name = "decode"
@@ -665,12 +681,15 @@ project = "raster-stages/decode-select-token"
             Path::new("/tmp/run/prompt/initial_pieces.rindex"),
             "abc",
             7,
+            0,
         )
         .unwrap();
 
         assert!(manifest.contains("path = \"/tmp/run/prompt/initial_pieces.rastered\""));
         assert!(manifest.contains("commitment = \"abc\""));
         assert!(manifest.contains("count = 7"));
+        assert!(manifest.contains("count = 0"));
+        assert!(!manifest.contains("count = 99"));
         assert!(manifest.contains("project = \"/repo/raster-stages/prompt-prepare\""));
         assert!(manifest.contains("project = \"/repo/raster-stages/decode-select-token\""));
         assert!(manifest.contains("path = \"/repo/tokenizer.rastered\""));
@@ -678,7 +697,7 @@ project = "raster-stages/decode-select-token"
         assert!(manifest.contains("path = \"/repo/runtime/weights/layer{l}.rastered\""));
         assert!(manifest.contains("index_path = \"/repo/runtime/weights/layer{l}.rindex\""));
         assert!(!manifest.contains("old.rastered"));
-        assert_eq!(manifest.matches("inputs.initial_pieces =").count(), 1);
+        assert_eq!(manifest.matches("inputs.initial_pieces =").count(), 2);
     }
 
     fn write_stage(base: &PathBuf, stage: &str, commitment: &str, output: &[u8]) {

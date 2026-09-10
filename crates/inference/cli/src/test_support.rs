@@ -12,15 +12,23 @@ pub(crate) fn model_fixture(base: &Path, name: &str) -> PathBuf {
     fs::write(dir.join("config.json"), "{}").unwrap();
     fs::write(
         dir.join("tokenizer.json"),
-        r#"{"model":{"vocab":{"h":0},"merges":[]}}"#,
+        r#"{"model":{"type":"BPE","vocab":{"h":0},"merges":[]}}"#,
     )
     .unwrap();
     fs::write(dir.join("Raster.toml"), format!(r#"[chain]
 name = "{name}"
 [[chain.stage]]
+name = "prompt_merge_seed"
+project = "raster-stages/prompt-merge"
+inputs.tokenizer = {{ external = {{ path = "tokenizer.rastered", index_path = "tokenizer.rindex", commitment = "tok" }} }}
+inputs.initial_pieces = {{ external = {{ path = "pieces.rastered", index_path = "pieces.rindex", commitment = "pieces" }} }}
+[[chain.repeat]]
+name = "tokenize"
+index = "b"
+count = 0
+[[chain.stage]]
 name = "prompt_prepare"
 project = "raster-stages/prompt-prepare"
-inputs.tokenizer = {{ external = {{ path = "tokenizer.rastered", index_path = "tokenizer.rindex", commitment = "tok" }} }}
 [[chain.repeat]]
 name = "decode"
 index = "t"

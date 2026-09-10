@@ -13,8 +13,10 @@ pub(super) struct Boundary {
     pub value: Value,
 }
 
-pub(super) fn staged_names(layers: u32, tokens: u32) -> Vec<String> {
-    let mut names = vec!["prompt_prepare".into(), "input_embedding".into()];
+pub(super) fn staged_names(layers: u32, tokens: u32, tokenizer_repeats: u32) -> Vec<String> {
+    let mut names = vec!["prompt_merge_seed".into()];
+    names.extend((0..tokenizer_repeats).map(|b| format!("prompt_merge_b{b}")));
+    names.extend(["prompt_prepare".into(), "input_embedding".into()]);
     names.extend((0..layers).map(|l| format!("prefill_prepare_aux_l{l}")));
     names.extend((0..layers).map(|l| format!("prefill_range_l{l}")));
     names.extend(["prefill_finalize".into(), "decode_init".into()]);
@@ -202,6 +204,7 @@ pub(super) fn value_json(value: &RasterValue) -> Result<Value> {
 
 pub(super) fn validate_errors(stage: &str, value: &Value) -> Result<()> {
     if stage != "prompt_prepare"
+        && !stage.starts_with("prompt_merge_")
         && stage != "decode_init"
         && stage != "output_finalize"
         && !stage.starts_with("decode_select_")
@@ -342,8 +345,8 @@ mod tests {
 
     #[test]
     fn missing_duplicate_and_unexpected_boundaries_fail() {
-        let names = staged_names(4, 8);
-        assert_eq!(names.len(), 101);
+        let names = staged_names(4, 8, 0);
+        assert_eq!(names.len(), 102);
         check_inventory(&names, &names).unwrap();
         assert!(check_inventory(&names, &names[..100]).is_err());
         let mut duplicate = names.clone();
@@ -358,7 +361,7 @@ mod tests {
         let direct = direct_infer::diagnostics::boundary_names(4, 8);
         assert_eq!(
             names.iter().filter(|name| !direct.contains(name)).count(),
-            10
+            11
         );
         assert!(!direct.contains(&"decode_finalize_t7".into()));
         assert!(check_inventory(&direct, &direct[..direct.len() - 1]).is_err());

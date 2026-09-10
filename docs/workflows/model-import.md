@@ -29,6 +29,12 @@ Pass `--manifest <path>` to also save a template copy (for example, the root `Ra
 from each prompt during run preparation and written under that run's `prompt/`
 directory.
 
+Tokenization now uses `prompt_merge_seed`, the fixed repeat named `tokenize`,
+and final `prompt_prepare`. Run preparation derives the tokenizer repeat count
+from its frozen `{text, segment}` pieces independently of the requested decode
+count. Re-import older model templates before creating ranked-BPE claims;
+single-stage tokenizer templates and legacy frozen prepared runs are rejected.
+
 Useful partial modes:
 
 - `--only-direct`: refresh only `runtime/model-artifacts/<model-id>/manifest.json` for direct inference. This clears template provenance, even if `--manifest` is supplied: existing staged artifacts cannot be bound to a refreshed bundle without a full import. Run a full import before building claims or challenges.

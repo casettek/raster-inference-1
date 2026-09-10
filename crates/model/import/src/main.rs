@@ -832,19 +832,13 @@ fn write_tokenizer(
     layout: &ArtifactLayout,
     stages: &mut Vec<String>,
 ) -> Result<String, Box<dyn Error>> {
+    // Reject unsupported profiles, invalid IDs and malformed merge tables
+    // before replacing any existing tokenizer/decoder artifact.
+    let prepared_tokenizer = run_prep::prompt_tokenizer(tokenizer)?;
     let model = tokenizer
         .get("model")
         .ok_or("tokenizer.json has no model")?;
-    let vocab_map: BTreeMap<String, u32> = model
-        .get("vocab")
-        .and_then(serde_json::Value::as_object)
-        .ok_or("tokenizer.json has no vocab")?
-        .iter()
-        .map(|(token, id)| {
-            let id = id.as_u64().unwrap_or_default() as u32;
-            (token.clone(), id)
-        })
-        .collect();
+    let vocab_map = run_prep::vocab_map(model)?;
 
     let mut vocab: Vec<TokenEntry> = vocab_map
         .iter()
@@ -888,167 +882,58 @@ fn write_tokenizer(
         "decoder",
     )?;
 
-    // A merge-less tokenizer (tiny-gemma-dev) leaves this empty, which makes
-    // the merge pass a no-op: with no rule to extend a pending piece, every
-    // piece is emitted as it arrives — exactly what merge-less BPE does.
-    let merges: Vec<BpeMerge> = model
-        .get("merges")
-        .and_then(serde_json::Value::as_array)
-        .map(|merges| {
-            merges
-                .iter()
-                .enumerate()
-                .filter_map(|(rank, entry)| parse_merge(rank as u32, entry))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    println!(
-        "tokenizer: {} entries, {} merges",
-        vocab.len(),
-        merges.len()
-    );
-    println!("tokenizer: {} terminal id(s)", eos_ids.len());
-
-    let (vocab_bucket_count, vocab_buckets) = bucket_vocab(vocab);
-    let (merge_bucket_count, merge_buckets) = bucket_merges(merges);
-
     let tokenizer_commitment = write_external(
-        &PromptTokenizer {
-            vocab_bucket_count,
-            merge_bucket_count,
-            vocab_buckets: vocab_buckets.into(),
-            merge_buckets: merge_buckets.into(),
-        },
+        &prepared_tokenizer,
         layout,
         "raster-stages/prompt-prepare",
         "tokenizer",
     )?;
+    // Run preparation supplies the prompt-specific merged_pieces binding.
     write_stage_fixtures(
         "raster-stages/prompt-prepare",
         layout,
         &[("tokenizer", "tokenizer", &tokenizer_commitment)],
     )?;
-
+    let tokenizer_line = external_line(
+        "tokenizer",
+        layout,
+        "raster-stages/prompt-prepare",
+        "tokenizer",
+        &tokenizer_commitment,
+    );
+    let pieces_line = external_line(
+        "initial_pieces",
+        layout,
+        "target/raster-inference/run-prompt-placeholder",
+        "initial_pieces",
+        INITIAL_PIECES_PLACEHOLDER_COMMITMENT,
+    );
     stages.push(format!(
-        concat!(
-            "[[chain.stage]]\n",
-            "name = \"prompt_prepare\"\n",
-            "project = \"raster-stages/prompt-prepare\"\n",
-            "{}",
-            "{}"
-        ),
-        external_line(
-            "tokenizer",
-            layout,
-            "raster-stages/prompt-prepare",
-            "tokenizer",
-            &tokenizer_commitment
-        ),
-        external_line(
-            "initial_pieces",
-            layout,
-            "target/raster-inference/run-prompt-placeholder",
-            "initial_pieces",
-            INITIAL_PIECES_PLACEHOLDER_COMMITMENT
-        ),
+        r#"[[chain.stage]]
+name = "prompt_merge_seed"
+project = "raster-stages/prompt-merge"
+{tokenizer_line}{pieces_line}
+[[chain.repeat]]
+name = "tokenize"
+index = "b"
+count = 0
+
+[[chain.repeat.stage]]
+name = "prompt_merge_b{{b}}"
+project = "raster-stages/prompt-merge"
+inputs.initial_pieces = {{ from = "prompt_merge_b{{b-1}}", first = "prompt_merge_seed" }}
+{tokenizer_line}
+[chain.repeat.exports.pieces]
+stage = "prompt_merge_b{{b}}"
+entry = "prompt_merge_seed"
+
+[[chain.stage]]
+name = "prompt_prepare"
+project = "raster-stages/prompt-prepare"
+inputs.merged_pieces = {{ from = "tokenize.pieces" }}
+{tokenizer_line}"#
     ));
     Ok(decoder_commitment)
-}
-
-/// Entries per bucket to aim for.
-///
-/// This is the knob that trades index size against scan length, and both are
-/// cheap here: each lookup costs one dynamic-index selection plus this many
-/// recur iterations, so 4 keeps a lookup under ~10 replay units while adding
-/// only `len / 4` bucket nodes to the index.
-const TARGET_BUCKET_LOAD: usize = 4;
-
-/// Bucket count for `len` keys: at least one, so the modulus is never zero and
-/// a computed index always has a bucket to land in.
-fn bucket_count_for(len: usize) -> u32 {
-    (len / TARGET_BUCKET_LOAD).max(1) as u32
-}
-
-/// Reports how evenly a bucketing came out — the number the lookup cost is
-/// actually proportional to is the *max*, not the mean.
-fn report_buckets(label: &str, count: u32, sizes: impl Iterator<Item = usize>) {
-    let (mut max, mut used, mut total) = (0usize, 0usize, 0usize);
-    for size in sizes {
-        max = max.max(size);
-        total += size;
-        if size > 0 {
-            used += 1;
-        }
-    }
-    println!(
-        "{label}: {total} keys in {count} buckets · avg {:.1} · max {max} · {} empty",
-        total as f64 / count as f64,
-        count as usize - used,
-    );
-}
-
-fn bucket_vocab(vocab: Vec<TokenEntry>) -> (u32, Vec<VocabBucket>) {
-    let count = bucket_count_for(vocab.len());
-    let mut buckets: Vec<Vec<TokenEntry>> = vec![Vec::new(); count as usize];
-    for entry in vocab {
-        // The same call the tile makes, from the same crate.
-        buckets[vocab_bucket_of(&entry.token, count) as usize].push(entry);
-    }
-    report_buckets("vocab", count, buckets.iter().map(Vec::len));
-    (
-        count,
-        buckets
-            .into_iter()
-            .map(|entries| VocabBucket {
-                entries: entries.into(),
-            })
-            .collect(),
-    )
-}
-
-fn bucket_merges(merges: Vec<BpeMerge>) -> (u32, Vec<MergeBucket>) {
-    let count = bucket_count_for(merges.len());
-    let mut buckets: Vec<Vec<BpeMerge>> = vec![Vec::new(); count as usize];
-    for rule in merges {
-        buckets[merge_bucket_of(&rule.left, &rule.right, count) as usize].push(rule);
-    }
-    // Keep each bucket rank-ordered so the scan's "lowest rank wins" tie-break
-    // sees rules in the same order the flat table presented them.
-    for bucket in &mut buckets {
-        bucket.sort_by_key(|rule| rule.rank);
-    }
-    report_buckets("merges", count, buckets.iter().map(Vec::len));
-    (
-        count,
-        buckets
-            .into_iter()
-            .map(|rules| MergeBucket {
-                rules: rules.into(),
-            })
-            .collect(),
-    )
-}
-
-fn parse_merge(rank: u32, entry: &serde_json::Value) -> Option<BpeMerge> {
-    // HuggingFace writes merges either as "left right" or as ["left", "right"].
-    let (left, right) = match entry {
-        serde_json::Value::String(text) => {
-            let mut parts = text.splitn(2, ' ');
-            (parts.next()?.to_string(), parts.next()?.to_string())
-        }
-        serde_json::Value::Array(pair) if pair.len() == 2 => {
-            (pair[0].as_str()?.to_string(), pair[1].as_str()?.to_string())
-        }
-        _ => return None,
-    };
-    let merged = format!("{left}{right}");
-    Some(BpeMerge {
-        rank,
-        left,
-        right,
-        merged,
-    })
 }
 
 // ---------------------------------------------------------------------------

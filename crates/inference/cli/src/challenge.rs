@@ -438,10 +438,20 @@ fn load_claimed_input(input: &ChallengeInput) -> Result<ClaimedInput> {
 }
 
 fn read_prepared_run(path: &Path) -> Result<PreparedRun> {
-    inference_artifacts::read_json(path)
+    let value: serde_json::Value = inference_artifacts::read_json(path)?;
+    if value["version"].as_u64() != Some(inference_artifacts::PREPARED_RUN_VERSION as u64) {
+        bail!("incompatible frozen prepared-run version: expected ranked-BPE version {}; preserve this claim and use its original implementation for replay", inference_artifacts::PREPARED_RUN_VERSION);
+    }
+    serde_json::from_value(value).context("incompatible frozen ranked-BPE pieces")
 }
 
 fn verify_prepared_run(prepared: &PreparedRun) -> Result<()> {
+    if prepared.version != inference_artifacts::PREPARED_RUN_VERSION {
+        bail!(
+            "incompatible frozen prepared-run version {}",
+            prepared.version
+        );
+    }
     verify_file_sha256(
         &prepared.model_manifest_path,
         &prepared.model_manifest_sha256,
@@ -864,6 +874,21 @@ mod tests {
     }
 
     #[test]
+    fn legacy_frozen_runs_are_rejected_without_rewriting_them() {
+        let base = temp_dir("legacy-prepared");
+        fs::create_dir_all(&base).unwrap();
+        let path = base.join("prepared_run.json");
+        let legacy = br#"{"version":1,"prompt":{"initial_pieces":["h","</w>"]}}"#;
+        fs::write(&path, legacy).unwrap();
+        let error = read_prepared_run(&path).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("incompatible frozen prepared-run version"));
+        assert_eq!(fs::read(&path).unwrap(), legacy);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn prepared_run_hash_mismatch_is_rejected() {
         let base = temp_dir("prepared-hash");
         fs::create_dir_all(&base).unwrap();
@@ -875,14 +900,17 @@ mod tests {
         fs::write(&run_manifest, b"[chain]\nname = \"test\"\n").unwrap();
 
         let prepared = PreparedRun {
-            version: 1,
+            version: inference_artifacts::PREPARED_RUN_VERSION,
             run_spec_path: base.join("inference.toml"),
             model_manifest_path: model_manifest.clone(),
             model_manifest_sha256: format!("{:x}", sha2::Sha256::digest(b"model")),
             prompt: inference_artifacts::PreparedPrompt {
                 resolved_prompt: String::from("hello"),
                 rendered_prompt: String::from("hello"),
-                initial_pieces: vec![String::from("hello"), String::from("</w>")],
+                initial_pieces: vec![inference_artifacts::PreparedPiece {
+                    text: String::from("hello"),
+                    segment: 0,
+                }],
                 eos_token_ids: Vec::new(),
             },
             tokens: 1,

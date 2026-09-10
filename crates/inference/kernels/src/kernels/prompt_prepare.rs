@@ -1,18 +1,115 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use prompt_prepare::input::{
-    merge_bucket_of, vocab_bucket_of, BpePieces, MergeMatch, MergeStep, PromptTokenization,
-    PromptTokenizer, UNK_TOKEN_ID,
+    merge_bucket_of, vocab_bucket_of, BpePiece, BpePieces, MergeCandidate, PromptTokenization,
+    PromptTokenizer,
 };
 use raster::List;
 
-const MERGE_ROUNDS: usize = 8;
-const TERMINATOR: &str = "</w>";
+pub const MERGES_PER_BATCH: usize = 8;
 
 pub struct PromptPrepareDirectInputs<'a> {
     pub tokenizer: &'a PromptTokenizer,
     pub initial_pieces: &'a BpePieces,
 }
 
+pub fn best_merge(pieces: &[BpePiece], tokenizer: &PromptTokenizer) -> Result<MergeCandidate> {
+    ensure!(
+        tokenizer.merge_bucket_count as usize == tokenizer.merge_buckets.len()
+            && tokenizer.merge_bucket_count > 0,
+        "invalid merge bucket count"
+    );
+    let mut best = MergeCandidate::default();
+    for (left, pair) in pieces.windows(2).enumerate() {
+        if pair[0].segment != pair[1].segment {
+            continue;
+        }
+        let index =
+            merge_bucket_of(&pair[0].text, &pair[1].text, tokenizer.merge_bucket_count) as usize;
+        for rule in tokenizer.merge_buckets[index].rules.iter() {
+            if rule.left == pair[0].text
+                && rule.right == pair[1].text
+                && (!best.matched || rule.rank < best.rank)
+            {
+                best = MergeCandidate {
+                    matched: true,
+                    rank: rule.rank,
+                    left: left as u64,
+                    merged: rule.merged.clone(),
+                };
+            }
+        }
+    }
+    Ok(best)
+}
+
+fn apply(pieces: &mut Vec<BpePiece>, best: MergeCandidate) {
+    let left = best.left as usize;
+    pieces[left].text = best.merged;
+    pieces.remove(left + 1);
+}
+
+pub fn run_merge_batch(inputs: PromptPrepareDirectInputs<'_>) -> Result<BpePieces> {
+    let mut pieces = inputs
+        .initial_pieces
+        .pieces
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for _ in 0..MERGES_PER_BATCH {
+        let best = best_merge(&pieces, inputs.tokenizer)?;
+        if !best.matched {
+            break;
+        }
+        apply(&mut pieces, best);
+    }
+    Ok(BpePieces {
+        pieces: List::from(pieces),
+    })
+}
+
+pub fn finalize_prompt(inputs: PromptPrepareDirectInputs<'_>) -> Result<PromptTokenization> {
+    let pieces = inputs
+        .initial_pieces
+        .pieces
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let best = best_merge(&pieces, inputs.tokenizer)?;
+    if best.matched {
+        bail!(
+            "tokenization budget exhausted: eligible merge at position {} (rank {})",
+            best.left,
+            best.rank
+        );
+    }
+    ensure!(
+        inputs.tokenizer.vocab_bucket_count > 0
+            && inputs.tokenizer.vocab_bucket_count as usize == inputs.tokenizer.vocab_buckets.len(),
+        "invalid vocabulary bucket count"
+    );
+    let token_ids = pieces
+        .iter()
+        .map(|piece| {
+            let index = vocab_bucket_of(&piece.text, inputs.tokenizer.vocab_bucket_count) as usize;
+            inputs.tokenizer.vocab_buckets[index]
+                .entries
+                .iter()
+                .find(|entry| entry.token == piece.text)
+                .map(|entry| entry.id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "prepared or merged piece is absent from vocabulary: {:?}",
+                        piece.text
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PromptTokenization {
+        token_ids: List::from(token_ids),
+    })
+}
+
+/// Direct inference has no checkpoint budget, but obeys the same ranked ordering.
 pub fn run_prompt_prepare_direct(
     inputs: PromptPrepareDirectInputs<'_>,
 ) -> Result<PromptTokenization> {
@@ -22,122 +119,17 @@ pub fn run_prompt_prepare_direct(
         .iter()
         .cloned()
         .collect::<Vec<_>>();
-
-    for _ in 0..MERGE_ROUNDS {
-        pieces = merge_round(&pieces, inputs.tokenizer)?;
+    loop {
+        let best = best_merge(&pieces, inputs.tokenizer)?;
+        if !best.matched {
+            break;
+        }
+        apply(&mut pieces, best);
     }
-
-    let remaining = count_remaining_merges(&pieces, inputs.tokenizer)?;
-    if remaining != 0 {
-        bail!(
-            "{remaining} adjacent pair(s) would still merge after the last round; \
-             the merge unroll in `main` is too short for this prompt"
-        );
-    }
-
-    let token_ids = pieces
-        .iter()
-        .filter(|piece| piece.as_str() != TERMINATOR)
-        .map(|piece| resolve_piece_token(piece, inputs.tokenizer))
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok(PromptTokenization {
-        token_ids: List::from(token_ids),
+    finalize_prompt(PromptPrepareDirectInputs {
+        tokenizer: inputs.tokenizer,
+        initial_pieces: &BpePieces {
+            pieces: pieces.into(),
+        },
     })
-}
-
-fn merge_round(pieces: &[String], tokenizer: &PromptTokenizer) -> Result<Vec<String>> {
-    let mut output = Vec::new();
-    let mut pending = String::new();
-    let mut has_pending = false;
-
-    for piece in pieces {
-        let step = MergeStep {
-            pending: pending.clone(),
-            has_pending,
-            piece: piece.clone(),
-        };
-        let hit = find_merge(&step, tokenizer)?;
-
-        if step.has_pending && !hit.matched {
-            output.push(step.pending.clone());
-        }
-        if step.piece == TERMINATOR {
-            output.push(step.piece.clone());
-        }
-
-        if hit.matched {
-            pending = hit.merged;
-        } else {
-            pending = step.piece;
-        }
-        has_pending = true;
-    }
-
-    Ok(output)
-}
-
-fn count_remaining_merges(pieces: &[String], tokenizer: &PromptTokenizer) -> Result<u32> {
-    let mut previous = String::new();
-    let mut has_previous = false;
-    let mut remaining = 0_u32;
-
-    for piece in pieces {
-        let step = MergeStep {
-            pending: previous,
-            has_pending: has_previous,
-            piece: piece.clone(),
-        };
-        let hit = find_merge(&step, tokenizer)?;
-        remaining = remaining.saturating_add(if hit.matched { 1 } else { 0 });
-        previous = step.piece;
-        has_previous = true;
-    }
-
-    Ok(remaining)
-}
-
-fn find_merge(step: &MergeStep, tokenizer: &PromptTokenizer) -> Result<MergeMatch> {
-    let mut hit = MergeMatch {
-        matched: false,
-        rank: 0,
-        merged: String::new(),
-    };
-    if !step.has_pending {
-        return Ok(hit);
-    }
-
-    let bucket_idx =
-        merge_bucket_of(&step.pending, &step.piece, tokenizer.merge_bucket_count) as usize;
-    let bucket = tokenizer.merge_buckets.get(bucket_idx).ok_or_else(|| {
-        anyhow::anyhow!(
-            "merge bucket index {bucket_idx} is out of range for {} buckets",
-            tokenizer.merge_buckets.len()
-        )
-    })?;
-    for rule in bucket.rules.iter() {
-        let applies = rule.left == step.pending && rule.right == step.piece;
-        if applies && (!hit.matched || rule.rank < hit.rank) {
-            hit.matched = true;
-            hit.rank = rule.rank;
-            hit.merged = rule.merged.clone();
-        }
-    }
-    Ok(hit)
-}
-
-fn resolve_piece_token(piece: &str, tokenizer: &PromptTokenizer) -> Result<u32> {
-    let bucket_idx = vocab_bucket_of(piece, tokenizer.vocab_bucket_count) as usize;
-    let bucket = tokenizer.vocab_buckets.get(bucket_idx).ok_or_else(|| {
-        anyhow::anyhow!(
-            "vocab bucket index {bucket_idx} is out of range for {} buckets",
-            tokenizer.vocab_buckets.len()
-        )
-    })?;
-    Ok(bucket
-        .entries
-        .iter()
-        .find(|entry| entry.token == piece)
-        .map(|entry| entry.id)
-        .unwrap_or(UNK_TOKEN_ID))
 }

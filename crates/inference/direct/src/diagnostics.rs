@@ -98,7 +98,7 @@ impl DirectTrace {
         self.print || self.collect
     }
 
-    pub fn configure(&mut self, layers: u32, tokens: u32) -> Result<()> {
+    pub fn configure(&mut self, layers: u32, tokens: u32, tokenizer_repeats: u32) -> Result<()> {
         if !self.enabled() {
             return Ok(());
         }
@@ -108,6 +108,8 @@ impl DirectTrace {
             // selection. It must be present in the reference, but direct mode
             // must not execute it just to satisfy diagnostics.
             let mut reference_names = self.required.clone();
+            reference_names.insert("prompt_merge_seed".into());
+            reference_names.extend((0..tokenizer_repeats).map(|b| format!("prompt_merge_b{b}")));
             if tokens > 0 {
                 reference_names.extend(decode_pass_names(layers, tokens - 1));
             }
@@ -192,20 +194,21 @@ mod tests {
         assert_eq!(names.len(), 91);
         names.extend(decode_pass_names(4, 7));
         assert_eq!(names.len(), 101);
+        names.push("prompt_merge_seed".into());
         trace.expected = Some(
             names
                 .into_iter()
                 .map(|name| (name, String::new()))
                 .collect(),
         );
-        trace.configure(4, 8).unwrap();
+        trace.configure(4, 8, 0).unwrap();
         trace
             .expected
             .as_mut()
             .unwrap()
             .remove("decode_range_t6_l3");
         assert!(trace
-            .configure(4, 8)
+            .configure(4, 8, 0)
             .unwrap_err()
             .to_string()
             .contains("missing reference"));
@@ -214,7 +217,7 @@ mod tests {
     #[test]
     fn missing_duplicate_unexpected_and_mismatched_boundaries_fail() {
         let mut trace = trace();
-        trace.configure(4, 1).unwrap();
+        trace.configure(4, 1, 0).unwrap();
         assert!(trace.finish().is_err());
         assert!(trace.record("unknown", &1u32).is_err());
         trace.record("prompt_prepare", &1u32).unwrap();
@@ -231,6 +234,6 @@ mod tests {
     fn empty_reference_is_not_a_disabled_comparison() {
         let mut trace = trace();
         trace.expected = Some(BTreeMap::new());
-        assert!(trace.configure(4, 1).is_err());
+        assert!(trace.configure(4, 1, 0).is_err());
     }
 }

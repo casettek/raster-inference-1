@@ -65,17 +65,9 @@ pub struct PromptTokenizer {
     pub merge_buckets: List<MergeBucket>,
 }
 
-/// The bucket hashes, re-exported from the stage's own `no_std` library.
-///
-/// Deliberately *not* reimplemented here. A wrong bucket does not fail loudly —
-/// the lookup simply misses and the piece tokenizes to UNK — so the only safe
-/// arrangement is one definition, compiled into both the fixture writer and the
-/// tile that replays in the guest.
-pub use prompt_prepare::input::{merge_bucket_of, vocab_bucket_of};
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
 pub struct BpePieces {
-    pub pieces: List<String>,
+    pub pieces: List<prompt_prepare::input::BpePiece>,
 }
 
 // --- output-finalize -------------------------------------------------------

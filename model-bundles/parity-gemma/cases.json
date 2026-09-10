@@ -5,7 +5,7 @@
     "raw_prompt": true,
     "tokens": 1,
     "input_token_ids": [
-      360,
+      362,
       21,
       8,
       9,
@@ -14,13 +14,12 @@
   },
   {
     "name": "near-window",
-    "prompt": "abcdefghijklm?!",
+    "prompt": "abcdefghijklmn?!",
     "raw_prompt": true,
     "tokens": 8,
     "input_token_ids": [
       74,
-      75,
-      76,
+      360,
       77,
       78,
       79,
@@ -31,6 +30,7 @@
       84,
       85,
       86,
+      87,
       40,
       10
     ]
@@ -48,7 +48,7 @@
       78,
       91,
       7,
-      360,
+      362,
       21,
       8,
       8,
@@ -63,7 +63,7 @@
       257,
       234,
       7,
-      365,
+      367,
       40,
       4,
       7,

@@ -272,7 +272,11 @@ fn run_case(
             .as_str()
             .context("missing native chain directory")?,
     );
-    let names = staged_names(model.shape.num_hidden_layers, case.tokens);
+    let names = staged_names(
+        model.shape.num_hidden_layers,
+        case.tokens,
+        run_prep::tokenizer_repeat_count(prepared.prepared_run.prompt.initial_pieces.len())?,
+    );
     let direct_names =
         direct_infer::diagnostics::boundary_names(model.shape.num_hidden_layers, case.tokens);
     let raster_outputs =

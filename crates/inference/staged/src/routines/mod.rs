@@ -16,11 +16,13 @@ pub mod output_finalize;
 pub mod prefill_finalize;
 pub mod prefill_prepare_aux;
 pub mod prefill_range;
+pub mod prompt_merge;
 pub mod prompt_prepare;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StageKind {
     PromptPrepare,
+    PromptMerge,
     InputEmbedding,
     PrefillPrepareAux { layer: usize },
     PrefillRange { layer: usize },
@@ -53,7 +55,8 @@ pub struct DirectCachedOutput {
 #[derive(Clone, Copy, Default)]
 pub struct RoutineRunCaches<'a> {
     pub materializations: Option<&'a MaterializationCache>,
-    pub prefill_range_weights: Option<&'a inference_kernels::prefill_range::PrefillRangeWeightCache>,
+    pub prefill_range_weights:
+        Option<&'a inference_kernels::prefill_range::PrefillRangeWeightCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +70,9 @@ pub struct DirectTimings {
 impl StageKind {
     pub fn from_stage_spec(project: &str, name: &str) -> Result<Self> {
         match project_basename(project) {
+            "prompt-merge" if name == "prompt_merge_seed" || name.starts_with("prompt_merge_b") => {
+                Ok(Self::PromptMerge)
+            }
             "prompt-prepare" if name == "prompt_prepare" => Ok(Self::PromptPrepare),
             "input-embedding" if name == "input_embedding" => Ok(Self::InputEmbedding),
             "prefill-prepare-aux" => Ok(Self::PrefillPrepareAux {
@@ -104,6 +110,8 @@ impl StageKind {
 
     pub fn from_stage_name(name: &str) -> Result<Self> {
         match name {
+            "prompt_merge_seed" | "prompt_merge" => Ok(Self::PromptMerge),
+            _ if name.starts_with("prompt_merge_b") => Ok(Self::PromptMerge),
             "prompt_prepare" => Ok(Self::PromptPrepare),
             "input_embedding" => Ok(Self::InputEmbedding),
             "prefill_finalize" => Ok(Self::PrefillFinalize),
@@ -133,6 +141,7 @@ impl StageKind {
     pub fn project(&self) -> &'static str {
         match self {
             Self::PromptPrepare => "prompt-prepare",
+            Self::PromptMerge => "prompt-merge",
             Self::InputEmbedding => "input-embedding",
             Self::PrefillPrepareAux { .. } => "prefill-prepare-aux",
             Self::PrefillRange { .. } => "prefill-range",
@@ -147,6 +156,7 @@ impl StageKind {
     pub fn routine(&self) -> &'static str {
         match self {
             Self::PromptPrepare => "prompt_prepare",
+            Self::PromptMerge => "prompt_merge",
             Self::InputEmbedding => "input_embedding",
             Self::PrefillPrepareAux { .. } => "prefill_prepare_aux",
             Self::PrefillRange { .. } => "prefill_range",
@@ -162,6 +172,7 @@ impl StageKind {
         match self {
             Self::PrefillPrepareAux { layer } | Self::PrefillRange { layer } => Some(*layer),
             Self::PromptPrepare
+            | Self::PromptMerge
             | Self::InputEmbedding
             | Self::PrefillFinalize
             | Self::DecodeInit
@@ -178,6 +189,11 @@ pub fn run_for_compare(kind: &StageKind) -> Result<DirectCompareOutput> {
             prompt_prepare::load_inputs_from_args,
             prompt_prepare::run_direct,
             "prompt_prepare",
+        ),
+        StageKind::PromptMerge => compare(
+            prompt_merge::load_inputs_from_args,
+            prompt_merge::run_direct,
+            "prompt_merge",
         ),
         StageKind::InputEmbedding => compare(
             input_embedding::load_inputs_from_args,
@@ -229,6 +245,12 @@ pub fn run_and_publish(kind: &StageKind) -> Result<DirectPublishOutput> {
             prompt_prepare::run_direct,
             "prompt_prepare",
             CachedStageValue::PromptTokenization,
+        ),
+        StageKind::PromptMerge => publish(
+            prompt_merge::load_inputs_from_args,
+            prompt_merge::run_direct,
+            "prompt_merge",
+            CachedStageValue::BpePieces,
         ),
         StageKind::InputEmbedding => publish(
             input_embedding::load_inputs_from_args,
@@ -299,6 +321,12 @@ pub fn run_and_publish_from_paths(
             prompt_prepare::run_direct,
             "prompt_prepare",
             CachedStageValue::PromptTokenization,
+        ),
+        StageKind::PromptMerge => publish(
+            || prompt_merge::load_inputs_from_paths(input_path, input_manifest_path, cached_inputs),
+            prompt_merge::run_direct,
+            "prompt_merge",
+            CachedStageValue::BpePieces,
         ),
         StageKind::InputEmbedding => publish(
             || {
@@ -421,6 +449,12 @@ pub fn run_cached_from_paths_with_caches(
             prompt_prepare::run_direct,
             "prompt_prepare",
             CachedStageValue::PromptTokenization,
+        ),
+        StageKind::PromptMerge => cache(
+            || prompt_merge::load_inputs_from_paths(input_path, input_manifest_path, cached_inputs),
+            prompt_merge::run_direct,
+            "prompt_merge",
+            CachedStageValue::BpePieces,
         ),
         StageKind::InputEmbedding => cache(
             || {

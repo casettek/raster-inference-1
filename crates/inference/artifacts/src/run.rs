@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub const INFERENCE_RUN_SPEC_TOML: &str = "inference.toml";
 pub const PREPARED_RUN_JSON: &str = "prepared_run.json";
+pub const PREPARED_RUN_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InferenceRunSpec {
@@ -38,8 +39,16 @@ pub struct PreparedRun {
 pub struct PreparedPrompt {
     pub resolved_prompt: String,
     pub rendered_prompt: String,
-    pub initial_pieces: Vec<String>,
+    pub initial_pieces: Vec<PreparedPiece>,
     pub eos_token_ids: Vec<u32>,
+}
+
+/// Frozen normalization/segmentation output. Old sentinel-based inputs cannot
+/// deserialize as this shape and must be prepared again under the new identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreparedPiece {
+    pub text: String,
+    pub segment: u32,
 }
 
 pub fn read_run_spec(path: &Path) -> Result<InferenceRunSpec> {

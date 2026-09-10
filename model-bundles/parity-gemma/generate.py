@@ -82,13 +82,19 @@ def build():
     words = specials + ["</w>", "\n", "▁", "é"]
     words += [chr(i) for i in range(33, 127)]
     words += [f"<0x{i:02X}>" for i in range(256)]
-    merges = [["H", "i"], ["R", "a"], ["Ra", "s"], ["Ras", "t"], ["Rast", "e"], ["Raste", "r"]]
+    merges = [["b", "c"], ["a", "b"], ["H", "i"], ["R", "a"], ["Ra", "s"], ["Ras", "t"], ["Rast", "e"], ["Raste", "r"]]
     words += [a + b for a, b in merges]
     words += [f"word{i}" for i in range(512 - len(words))]
     vocab = {word: i for i, word in enumerate(words)}
     assert len(vocab) == 512
-    tokenizer = {"model": {"type": "BPE", "vocab": vocab, "merges": merges},
-                 "added_tokens": [{"id": vocab[word], "content": word, "special": True}
+    tokenizer = {"version": "1.0", "truncation": None, "padding": None,
+                 "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "▁"},
+                 "pre_tokenizer": None, "post_processor": None, "decoder": None,
+                 "model": {"type": "BPE", "vocab": vocab, "merges": merges, "dropout": None,
+                           "unk_token": "<unk>", "continuing_subword_prefix": None,
+                           "end_of_word_suffix": None, "fuse_unk": True, "byte_fallback": True, "ignore_merges": False},
+                 "added_tokens": [{"id": vocab[word], "content": word, "special": True,
+                                   "single_word": False, "lstrip": False, "rstrip": False, "normalized": False}
                                   for word in specials]}
     config = {"text_config": {
         "hidden_size": 128, "intermediate_size": 512, "num_hidden_layers": 4,
@@ -107,7 +113,7 @@ def build():
             prompt = "<bos><|turn>user\n" + prompt.strip() + "<turn|>\n<|turn>model\n"
         pieces = []
         while prompt:
-            special = next((s for s in specials if not raw and prompt.startswith(s)), None)
+            special = next((s for s in specials if prompt.startswith(s)), None)
             if special:
                 pieces.append(special)
                 prompt = prompt[len(special):]
@@ -115,28 +121,21 @@ def build():
                 ch, prompt = prompt[0], prompt[1:]
                 ch = "▁" if ch == " " else ch
                 pieces.extend([ch] if ch in vocab else [f"<0x{b:02X}>" for b in ch.encode()])
-        rules = {tuple(pair): "".join(pair) for pair in merges}
-        # These rules have no competing merges; fully reduce each left-to-right
-        # pass independently of production bucket layout and unroll count.
+        rules = {tuple(pair): (rank, "".join(pair)) for rank, pair in enumerate(merges)}
+        # Independent exhaustive oracle: choose globally by (rank, position).
         while True:
-            merged = []
-            i = 0
-            while i < len(pieces):
-                pair = tuple(pieces[i:i + 2])
-                if pair in rules:
-                    merged.append(rules[pair])
-                    i += 2
-                else:
-                    merged.append(pieces[i])
-                    i += 1
-            if merged == pieces:
+            candidates = [(rules[tuple(pieces[i:i+2])][0], i, rules[tuple(pieces[i:i+2])][1])
+                          for i in range(len(pieces)-1) if tuple(pieces[i:i+2]) in rules
+                          and pieces[i] not in specials and pieces[i+1] not in specials]
+            if not candidates:
                 return [vocab[p] for p in pieces]
-            pieces = merged
+            _, i, merged = min(candidates)
+            pieces[i:i+2] = [merged]
 
     cases = []
     for name, prompt, raw, tokens in [
         ("short", "Hi, é!", True, 1),
-        ("near-window", "abcdefghijklm?!", True, 8),
+        ("near-window", "abcdefghijklmn?!", True, 8),
         ("over-window", "Hi,  café! 🙂\nRaster?", False, 8),
     ]:
         cases.append({"name": name, "prompt": prompt, "raw_prompt": raw,

@@ -8,6 +8,7 @@ Start with the workflow docs when you want to run the repo, and the internals do
 - [Infer](workflows/infer.md)
 - [Claim build](workflows/claim-build.md)
 - [Challenge build](workflows/challenge-build.md)
+- [Three-path parity](workflows/test-parity.md)
 
 ## Internals
 
@@ -19,5 +20,7 @@ Start with the workflow docs when you want to run the repo, and the internals do
 
 - [Issues](issues/README.md)
 - [Proposals](proposals/)
-- [Ranked BPE tokenizer proposal](proposals/ranked-bpe-tokenizer.md): correctness
-  gap, candidate Raster stage decomposition, and chain integration/validation cost.
+- [Ranked BPE tokenizer](proposals/ranked-bpe-tokenizer.md): implemented fixed-count
+  staging, input preparation, and replay contract.
+- [Ranked BPE validation](validation/ranked-bpe-2026-09-10.md): reference and parity
+  results, authenticated tokenizer audits, costs, and the remaining full-chain blocker.

@@ -5,3 +5,4 @@
 # Raster
 *.rastered
 *.rindex
+/runtime/prompt-fixtures/

@@ -218,7 +218,10 @@ fn prompt_prepare_resolves_vocab_bucket() {
             merge_buckets: List::from(vec![MergeBucket { rules: List::new() }]),
         },
         initial_pieces: BpePieces {
-            pieces: List::from(vec!["hello".to_string(), "</w>".to_string()]),
+            pieces: List::from(vec![prompt_prepare::input::BpePiece {
+                text: "hello".to_string(),
+                segment: 0,
+            }]),
         },
     };
     let output = routines::prompt_prepare::run_direct(&inputs).unwrap();

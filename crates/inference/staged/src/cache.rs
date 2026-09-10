@@ -21,6 +21,7 @@ use prompt_prepare::input as prompt_input;
 #[derive(Clone, Debug)]
 pub enum CachedStageValue {
     PromptTokenization(prompt_input::PromptTokenization),
+    BpePieces(prompt_input::BpePieces),
     EmbeddedActivations(embedding_input::ActivationSequence),
     PleLayerInputs(aux_input::PleLayerInputs),
     RangeActivations(range_input::ActivationSequence),
@@ -215,6 +216,13 @@ impl StageOutputCache {
 }
 
 impl CachedStageValue {
+    pub fn as_bpe_pieces(&self) -> Result<prompt_input::BpePieces> {
+        match self {
+            Self::BpePieces(value) => Ok(value.clone()),
+            _ => bail!("cached value is not BPE pieces"),
+        }
+    }
+
     pub fn as_embedding_prompt(&self) -> Result<embedding_input::PromptTokenization> {
         match self {
             Self::PromptTokenization(value) => Ok(embedding_input::PromptTokenization {

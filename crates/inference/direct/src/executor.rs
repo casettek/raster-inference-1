@@ -69,10 +69,14 @@ impl DirectInferenceExecutor {
         let model = DirectInferenceModel::load(&model_manifest_path)
             .context("failed to load direct-infer model")?;
         timings.push(phase_timing("load_direct_model", load_started.elapsed()));
-        trace.configure(model.shape().num_hidden_layers, run_spec.tokens)?;
 
         let prompt_started = Instant::now();
         let prepared_prompt = model.prepare_prompt(run_spec_dir, &run_spec)?;
+        trace.configure(
+            model.shape().num_hidden_layers,
+            run_spec.tokens,
+            run_prep::tokenizer_repeat_count(prepared_prompt.initial_pieces.len())?,
+        )?;
         let prompt = model.prompt_inputs(&prepared_prompt)?;
         trace.record("prompt_prepare", &prompt)?;
         timings.push(phase_timing("prompt_prepare", prompt_started.elapsed()));
